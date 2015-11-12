@@ -1,0 +1,20 @@
+
+REPEATING   :: 0x1;
+
+file := cast (*Compiler_Message_File) message;
+#import "test2.jtoy";
+
+Vector2 :: struct
+{
+	x : float;
+	y : float;
+};
+
+main :: ()
+{
+	i := 0;
+	
+	while i < 10	printf("\"i = %d\"\n", i);
+
+	return;
+}

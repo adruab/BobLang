@@ -1,0 +1,31 @@
+{
+	"build_systems":
+	[
+		{
+			"cmd": "./build.sh",
+			"file_regex": "^\\.\\./([^:]*):(\\d*)",
+			"name": "JtoyBuild",
+			"variants":
+			[
+				{
+					"cmd":
+					[
+						"./build/jtoy",
+						"test.jtoy"
+					],
+					"file_regex": "^\\.\\./([^:]*):(\\d*)",
+					"name": "Run"
+				}
+			]
+		}
+	],
+	"folders":
+	[
+		{
+			"path": "."
+		},
+		{
+			"path": "/usr/local/Cellar/libffi/3.0.13/lib/libffi-3.0.13"
+		}
+	]
+}

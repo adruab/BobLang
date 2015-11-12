@@ -1,0 +1,28 @@
+# Jtoy grammar file
+
+root: (import_directive|statement)*
+import_directive:
+
+statement: simple_statement | 
+		   block |
+		   while_statement |
+		   if_statement |
+		   for_statement
+simple_statement: (using_definition | definition | expression);
+block: { statement* }
+
+using_expression: using expression
+using_definition: using definition
+definition: ident : type = expession |
+			ident := expression |
+			ident[, ident] := expression |
+			ident :: const_definition
+const_definition: struct [AOS|SOA] block |
+				  (arguments) [-> returns] block |
+				  expression // ?? separate constant expression? e.g. literal or identifier?
+arguments: argument[, argument]*
+argument: using_definition | definition
+returns: return[, return]*
+return: definition // excludes struct, procedure definitions
+
+expression: 

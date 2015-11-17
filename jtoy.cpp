@@ -17,12 +17,16 @@
 #include <intrin.h>
 #endif
 
-// Compilation phases
+// Compilation phases:
 // Parse to AST, no types
-// Typecheck and generate bytecode, recursing into whatever needs resolving
-//  1. When entering a scope, collect all local definitions with no types.
-//  2. Choose something to evaluate (e.g. top down).
-//  3. While evaluating that resolve types, and possibly code gen for remaining requirements.
+// Recursively parse #import directives
+// Recursive typecheck, code gen, execution.
+//  1. Seed declaration table with all top level declarations unresolved.
+//  2. Pick one off the list to compile. Need to pick top level #run directives first?
+//  3. Typecheck amending AST, then generate code for it.  
+//	   May require recursing to later unresolved declarations.  If we try and resolve an declaration that's in progress, error.
+//     ??? Recursion can include typecheck, code gen and compile time execution.
+//  4. Seed the list with unresolved top level functions.
 
 #if WIN32
 #define BREAK_ALWAYS() __debugbreak()
@@ -40,6 +44,7 @@
     PUSH_MSVC_WARNING_DISABLE(4127) \
     do { \
   		if (!(f)) { \
+  			fflush(stdout); \
   			fprintf(stderr, "%s:%d assert failed: ", __FILE__, __LINE__); \
   			fprintf(stderr, __VA_ARGS__); \
   			fprintf(stderr, "\n"); \
@@ -56,11 +61,37 @@
 #define ClearStruct(p) memset(p, 0, sizeof(*p))
 #define DIM(a) (sizeof(a)/sizeof(a[0]))
 
+struct SIntIter
+{
+	void operator ++() { ++i; }
+	bool operator != (const SIntIter & iter) { return i != iter.i; }
+	int operator *() { return i; }
+
+	int i;
+};
+
+struct SIntRange
+{
+	SIntIter begin() const { return SIntIter{iMic}; }
+	SIntIter end() const { return SIntIter{iMac}; }
+
+	int iMic;
+	int iMac;
+};
+
+SIntRange IterCount(int c)
+{
+	return SIntRange{0, c};
+}
+
+
 
 void ShowErrVa(const char * pChzFormat, va_list va)
 {
+  	fflush(stdout);
 	vfprintf(stderr, pChzFormat, va);
 	fprintf(stderr, "\n");
+	fflush(stderr);
 
 	exit(-1);
 }
@@ -180,27 +211,37 @@ enum KEYWORD
 	KEYWORD_Invalid,
 
 	KEYWORD_If,
+	KEYWORD_Then, // BB (adrianb) Totally pointless?
 	KEYWORD_Else,
 	KEYWORD_While,
 	KEYWORD_For,
+
+	KEYWORD_Continue,
+	KEYWORD_Break,
+	KEYWORD_Return,
 
 	KEYWORD_Struct,
 	KEYWORD_Enum,
 
 	KEYWORD_Using,
 	KEYWORD_Cast,
+	KEYWORD_AutoCast,
 	KEYWORD_Defer,
 
 	KEYWORD_New,
 	KEYWORD_Delete,
 	KEYWORD_Remove, // BB (adrianb) This seems pretty terrible to be removing from normal usage...
+	KEYWORD_Inline, // BB (adrianb) Is this INLINE_DIRECTIVE in compiler node?
+	KEYWORD_PushContext,
 
-	KEYWORD_Return,
+	KEYWORD_Null,
 
 	KEYWORD_ImportDirective,
 	KEYWORD_RunDirective,
 	KEYWORD_CharDirective,
 	KEYWORD_ForeignDirective,
+	KEYWORD_ForeignLibraryDirective,
+	KEYWORD_TypeDirective,
 	
 	KEYWORD_Max
 };
@@ -211,23 +252,32 @@ const char * PchzFromKeyword(KEYWORD keyword)
 	{
 		"<invalid>",
 		"if",
+		"then",
 		"else",
 		"while",
 		"for",
+		"continue",
+		"break",
+		"return",
 		"struct",
 		"enum",
 		"using",
 		"cast",
+		"xx", // BB (adrianb) Not very readable
 		"defer",
 		"new",
 		"delete",
-		"remove",
-		"return",
+		"remove", // BB (adrianb) add is not a keyword but remove is? Yuck.
+		"inline",
+		"push_context",
+		"null",
 
 		"#import", // BB (adrianb) Are these really keywords?
 		"#run",
 		"#char",
 		"#foreign",
+		"#foreign_library",
+		"#type",
 	};
 	CASSERT(DIM(s_mpKeywordPchz) == KEYWORD_Max);
 	ASSERT(keyword >= 0 && keyword < KEYWORD_Max);
@@ -264,6 +314,7 @@ struct SErrorInfo
 
 void ShowErr(const SErrorInfo & errinfo, const char * pChzFormat, ...)
 {
+	fflush(stdout);
 	fprintf(stderr, "%s:%d:%d : error: ", errinfo.pChzFile, errinfo.nLine, errinfo.nCol);
 
 	va_list va;
@@ -725,6 +776,15 @@ struct SToken
 	SErrorInfo errinfo;
 };
 
+struct SAstBlock;
+struct SModule
+{
+	const char * pChzFile; // BB (adrianb) Add full path?
+	SAstBlock * pAstblockRoot;
+
+	// BB (adrianb) Get access to the other modules' namespaces explicitly ala python.
+};
+
 struct SParser
 {
 	SPagedAlloc pagealloc;
@@ -750,14 +810,100 @@ void Init(SParser * pParser)
 	Init(&pParser->pagealloc, 64 * 1024);
 }
 
+struct SStringWithLength
+{
+	const char * pCh;
+	int cCh;
+};
+
+uint32_t HvFromKey(const char * pCh, int cCh)
+{
+	uint32_t hv = 0;
+
+	for (int iCh = 0; iCh < cCh && pCh[iCh]; ++iCh)
+	{
+		hv = hv * 2339 + pCh[iCh] * 251;
+	}
+
+	return hv;
+}
+
+bool FIsKeyEqual(const char * pChz, const SStringWithLength & strwl)
+{
+	return strncmp(pChz, strwl.pCh, strwl.cCh) == 0 && pChz[strwl.cCh] == 0;
+}
+
+const char * PchzCopy(SParser * pParser, const char * pCh, int64_t cCh)
+{
+	// NOTE (adrianb) Inlining PtLookupImpl to avoid making copy of the string up front.
+	//  Have a LookupOther and pass pChz,cBStr?
+
+	uint32_t hv = HvFromKey(pCh, cCh);
+	SStringWithLength strwl = { pCh, int(cCh) };
+	const char * const * ppChz = PtLookupImpl(&pParser->setpChz, hv, strwl);
+	if (ppChz)
+		return *ppChz;
+
+	char * pChz = static_cast<char *>(PvAlloc(&pParser->pagealloc, cCh + 1, 1));
+	memcpy(pChz, pCh, cCh);
+	pChz[cCh] = '\0';
+
+	EnsureCount(&pParser->setpChz, pParser->setpChz.c + 1);
+	AddImpl<const char *>(&pParser->setpChz, hv, pChz);
+
+	return pChz;
+}
+
+// BB (adrianb) pParser is just for the paged alloc.  Just malloc instead?
+
+void AddFile(SParser * pParser, const char * pChzFile, SArray<SModule> * paryModule)
+{
+	// BB (adrianb) Deal with full paths with working directory?
+	// BB (adrianb) Just use _split_path and _make_path?
+
+	char aChzFile[256];
+	{
+		int cCh = strlen(pChzFile);
+		ASSERT(DIM(aChzFile) > cCh + 4);
+		memcpy(aChzFile, pChzFile, cCh);
+		for (int iCh = 0;; ++iCh)
+		{
+			if (!(iCh < 10 && iCh < cCh))
+			{
+				memcpy(aChzFile + cCh, ".jai", 4);
+				cCh += 4;
+				break;
+			}
+			
+			if (aChzFile[cCh - 1 - iCh] == '.')
+				break;
+		}
+
+		aChzFile[cCh] = '\0';
+	}
+
+	for (const SModule & module : *paryModule)
+	{
+		if (strcmp(module.pChzFile, aChzFile) == 0)
+			return;
+	}
+
+	PtAppendNew(paryModule)->pChzFile = PchzCopy(pParser, aChzFile, strlen(aChzFile));
+}
+
 void StartNewFile(SParser * pParser, const char * pChzFile, const char * pChzContents)
 {
-	pParser->errinfo.pChzLine = pChzFile;
+	ASSERT(pParser->aryTokNext.c == 0);
+	ASSERT(!pParser->fInToken && pParser->cPeek == 0);
+
+	ClearStruct(&pParser->errinfo);
+	pParser->errinfo.pChzLine = pChzContents;
 	pParser->errinfo.pChzFile = pChzFile;
 	pParser->errinfo.nLine = 1;
 	pParser->errinfo.nCol = 1;
 	pParser->pChzCurrent = pChzContents;
 	pParser->fBeginLine = true;
+	pParser->cSpace = 0;
 }
 
 inline char Ch(const SParser * pParser, int iCh = 0)
@@ -807,50 +953,6 @@ inline void EndToken(SToken * pTok, SParser * pParser)
 	{
 		pTok->errinfo.iChMac = pParser->pChzCurrent - pParser->errinfo.pChzLine;
 	}
-}
-
-struct SStringWithLength
-{
-	const char * pCh;
-	int cCh;
-};
-
-uint32_t HvFromKey(const char * pCh, int cCh)
-{
-	uint32_t hv = 0;
-
-	for (int iCh = 0; iCh < cCh && pCh[iCh]; ++iCh)
-	{
-		hv = hv * 2339 + pCh[iCh] * 251;
-	}
-
-	return hv;
-}
-
-bool FIsKeyEqual(const char * pChz, const SStringWithLength & strwl)
-{
-	return strncmp(pChz, strwl.pCh, strwl.cCh) == 0 && pChz[strwl.cCh] == 0;
-}
-
-inline const char * PchzCopy(SParser * pParser, const char * pCh, int64_t cCh)
-{
-	// NOTE (adrianb) Inlining PtLookupImpl to avoid making copy of the string up front.
-	//  Have a LookupOther and pass pChz,cBStr?
-
-	uint32_t hv = HvFromKey(pCh, cCh);
-	SStringWithLength strwl = { pCh, int(cCh) };
-	const char * const * ppChz = PtLookupImpl(&pParser->setpChz, hv, strwl);
-	if (ppChz)
-		return *ppChz;
-
-	char * pChz = static_cast<char *>(PvAlloc(&pParser->pagealloc, cCh + 1, 1));
-	memcpy(pChz, pCh, cCh);
-	pChz[cCh] = '\0';
-
-	EnsureCount(&pParser->setpChz, pParser->setpChz.c + 1);
-	AddImpl<const char *>(&pParser->setpChz, hv, pChz);
-
-	return pChz;
 }
 
 void AdvanceChar(SParser * pParser)
@@ -1451,65 +1553,11 @@ bool FTryConsumeKeyword(SParser * pParser, KEYWORD keyword, SToken * pTok = null
 
 
 
-enum ASTTYPEK
-{
-	ASTTYPEK_Identifier, 	// Could be basic type or struct or similar
-	ASTTYPEK_Pointer,		// *
-	ASTTYPEK_Array,			// []
-	ASTTYPEK_Procedure,		// () or (arg) or (arg) -> ret or (arg, arg...) -> ret, ret... etc.
-	ASTTYPEK_Namespace,		// namespace.name
-
-	// !!! Procedure type specification error: (func: (A,B)->B, name: A)
-	//  Is B,name the return value or just B and , denotes next argument
-};
-
-struct SAstType
-{
-	ASTTYPEK asttypek;
-};
-
-struct SAstTypeIdentifier : public SAstType
-{
-	const char * pChzName; // Could be basic type struct or similar
-};
-
-struct SAstTypePointer : public SAstType
-{
-	SAstType * pAtypeInner;
-	bool fSoa;
-};
-
-struct SAst;
-
-struct SAstTypeArray : public SAstType
-{
-	SAst * pAstSize; 		// Int literal, identifier, namespace qualified value // BB (adrianb) Extend to statically evaluatable expressions?
-	bool fDynamicallySized;	// Size of ..
-	bool fSoa;
-
-	SAstType * pAtypeInner;
-};
-
-struct SAstDeclaration;
-
-struct SAstTypeProcedure : public SAstType
-{
-	SArray<SAstDeclaration> aryAdeclArg;
-	SArray<SAstDeclaration> aryAdeclRet;
-};
-
-struct SAstTypeNamespace : public SAstType
-{
-	const char * pChzNamespace;
-	SAstType * pAtypeInner;
-};
-
-
 #if 0 // in Compiler...
 BLOCK     : 1,
-LITERAL   : 2,
+LITERAL   : 2, // TODO literals morph into multiple types (e.g. small int, larger int, float).  Probably need an optional actual type in case we cast them.
 IDENT     : 3,
-STATEMENT : 4,
+PSTATEMENT : 4,
 
 OPERATOR_EXPRESSION : 5,
 // 6 is currently unused.
@@ -1517,45 +1565,45 @@ PROCEDURE_CALL  : 7,
 ARRAY_SUBSCRIPT : 8,
 WHILE     : 9,
 IF        : 10,
-LOOP_CONTROL : 11, ??? for loop?
+LOOP_CONTROL : 11, ???
 // 12 is currently unused.
 REMOVE    : 13, looks like a way to mark that you've removed an entry in a for loop, ew :/
 RETURN    : 14,
-EACH      : 15, ??? for i : ...?
+EACH      : 15, ... aka for blah
 
-TYPE_DEFINITION : 16, ???
-TYPE_INSTANTIATION : 17, ???
+TYPE_DEFINITION : 16, #type
+TYPE_INSTANTIATION : 17, ??? ...
 ENUM : 18,
 
 PROCEDURE : 19,
 STRUCT : 20,
-COMMA_SEPARATED_ARGUMENTS : 21, these are embedded in function call and procedure right?
-EXTRACT : 22, ??? Is this the a,b,c := multifunc()?
+COMMA_SEPARATED_ARGUMENTS : 21, ???
+EXTRACT : 22, ??? Is this the a,b,c := multifunc()?  With separate definitions for each?
 SEQUENCE : 23, ??? a..b?
 
 NEW_OR_DELETE : 24, ? Why is this one thing?
 
-DECLARATION : 25,
+DECLARATION : 25, 
 
 CAST_EXPRESSION : 26,
-USING : 27,
+USING : 27, // for using an external global variable?
 DIRECTIVE_INLINE : 28, // So we haven't performed any inlining yet?
 
 DIRECTIVE_IMPORT : 29,
-DIRECTIVE_LOAD : 30,
+DIRECTIVE_LOAD : 30, ???
 
 DIRECTIVE_RUN : 31,
-DIRECTIVE_CHECK_CALL : 32,
-DIRECTIVE_ASSERT : 33,
-DIRECTIVE_IF_DEFINED : 34,
-DIRECTIVE_BAKE : 35,
-DIRECTIVE_MODIFY : 36,
-DIRECTIVE_FOREIGN_LIBRARY : 37,
+DIRECTIVE_CHECK_CALL : 32, #run but compile error if the result didn't succeed (BB better to error from the routine itself? In which case just #run?)
+DIRECTIVE_ASSERT : 33, ??? Compile time assert? How is this different from CHECK_CALL?
+DIRECTIVE_IF_DEFINED : 34, ??? Is there a way to define symbols from the command line or dynamically?  Or is this just so if you import something you can tell if its there?
+DIRECTIVE_BAKE : 35, ???
+DIRECTIVE_MODIFY : 36, For restricting 
+DIRECTIVE_FOREIGN_LIBRARY : 37, For loading a dll with some functions from it
 
-SIZE_OR_TYPE_INFO : 38,
-CONTEXT_OR_PUSH   : 39,
+SIZE_OR_TYPE_INFO : 38, ??? 
+CONTEXT_OR_PUSH   : 39, ??? Implicit context demo?
 
-NOTE : 40,
+NOTE : 40, ??? annotations is some demo somewhere?
 #endif
 
 enum ASTK
@@ -1568,6 +1616,8 @@ enum ASTK
 	ASTK_IntLiteral,
 	ASTK_FloatLiteral,
 	ASTK_BoolLiteral,
+	ASTK_Null,
+	ASTK_UninitializedValue,
 	
 	// Constructs
 
@@ -1579,13 +1629,16 @@ enum ASTK
 	ASTK_If,
 	ASTK_While,
 	ASTK_For,
+	ASTK_LoopControl,
 
 	ASTK_Using,
 	ASTK_Cast,
 	ASTK_New,
 	ASTK_Delete,
-	ASTK_Remove,
+	ASTK_Remove, // yuck, use #remove instead? Not compile time...
 	ASTK_Defer,
+	ASTK_Inline,
+	ASTK_PushContext,
 
 	ASTK_ArrayIndex,
 	ASTK_Call,
@@ -1595,15 +1648,28 @@ enum ASTK
 
 	ASTK_DeclareSingle,
 	ASTK_DeclareMulti,
+	ASTK_AssignMulti,
 
 	ASTK_Struct,
 	ASTK_Enum,
 	ASTK_Procedure,
+	ASTK_TypeDefinition,
+
+	// Type definitions
+
+	ASTK_TypePointer,		// *
+	ASTK_TypeArray,			// []
+	ASTK_TypeProcedure,		// () or (arg) or (arg) -> ret or (arg, arg...) -> ret, ret... etc.
+	ASTK_TypeMember,		// parent.name
+	ASTK_TypePolymorphic,	// $identifier
+	ASTK_TypeVararg,		// ..
 
 	// Directives
 
 	ASTK_ImportDirective,
 	ASTK_RunDirective,
+	ASTK_ForeignLibraryDirective,
+	// TODO a bunch of others?
 
 	ASTK_Max,
 };
@@ -1618,6 +1684,8 @@ const char * PchzFromAstk(ASTK astk)
 		"IntLiteral",
 		"FloatLiteral",
 		"BoolLiteral",
+		"Null",
+		"UninitializedValue",
 
 		"Block",
 		"EmptyStatement",
@@ -1627,6 +1695,7 @@ const char * PchzFromAstk(ASTK astk)
 		"If",
 		"While",
 		"For",
+		"LoopControl",
 
 		"Using",
 		"Cast",
@@ -1634,6 +1703,8 @@ const char * PchzFromAstk(ASTK astk)
 		"Delete",
 		"Remove",
 		"Defer",
+		"Inline",
+		"PushContext",
 
 		"ArrayIndex",
 		"Call",
@@ -1641,13 +1712,23 @@ const char * PchzFromAstk(ASTK astk)
 
 		"DeclareSingle",
 		"DeclareMulti",
+		"AssignMulti",
 
 		"Struct",
 		"Enum",
 		"Procedure",
+		"TypeDefinition",
+
+		"TypePointer",
+		"TypeArray",
+		"TypeProcedure",
+		"TypeMember",
+		"TypePolymorphic",
+		"TypeVararg",
 
 		"ImportDirective",
 		"RunDirective",
+		"ForeignLibraryDirective",
 	};
 
 	CASSERT(DIM(s_mpAstkPchz) == ASTK_Max);
@@ -1656,10 +1737,13 @@ const char * PchzFromAstk(ASTK astk)
 	return s_mpAstkPchz[astk];
 }
 
+struct SType;
+
 struct SAst
 {
 	ASTK astk;
 	SErrorInfo errinfo;
+	SType *	pType; 		// Resolved during typecheck time
 };
 
 template <typename T>
@@ -1676,6 +1760,20 @@ const T * AstCast(const SAst * pAst)
 	return static_cast<const T *>(pAst);
 }
 
+// BB (adrianb) Can/should we move type check time stuff to a side data structure?
+//  E.g. pType in decl/ast, arypDeclResolved in ident.
+
+struct SDeclaration // tag = decl
+{
+	const char * pChzName;
+	SErrorInfo errinfo;
+	SAst * pAstType;	// Optional explicit type (though one or more of these must be set)
+	SAst * pAstValue;	// Optional initial value
+	SAst * pAstMulti;	// Optional Multi declaration needs whole thing resolved at once
+	bool fUsing;
+	bool fIsConstant;
+};
+
 struct SAstStringLiteral : public SAst
 {
 	static const ASTK s_astk = ASTK_StringLiteral;
@@ -1686,6 +1784,7 @@ struct SAstIntLiteral : public SAst
 {
 	static const ASTK s_astk = ASTK_IntLiteral;
 	int64_t n;
+	// BB (adrianb) Allow or disallow specifying bit count explicitly?
 	int cBit;
 	bool fSigned;
 };
@@ -1710,6 +1809,7 @@ struct SAstBlock : public SAst
 	SArray<SAst *> arypAst;
 };
 
+// NOTE (adrianb) Allowing empty statements instead of wrapping all statements in a statement node
 struct SAstEmptyStatement : public SAst
 {
 	static const ASTK s_astk = ASTK_EmptyStatement;
@@ -1726,8 +1826,8 @@ struct SAstOperator : public SAst
 	static const ASTK s_astk = ASTK_Operator;
 	
 	const char * pChzOp;
-	SAst * pAstBefore; // If nullptr, we're a prefix operator
-	SAst * pAstAfter;
+	SAst * pAstLeft; // If nullptr, we're a prefix operator
+	SAst * pAstRight;
 };
 
 struct SAstIf : public SAst
@@ -1759,16 +1859,11 @@ struct SAstFor : public SAst
 	// BB (adrianb) Add declaration for iteration variable? 
 };
 
-struct SAstDeclaration // tag = adecl
+struct SAstLoopControl : public SAst
 {
-	const char * pChzName;
-	SErrorInfo errinfo;
-	bool fUsing;
-	bool fVariable;
-	SAstType * pAtype;
-	SAst * pAstValue;
-
-	// TODO Resolved type info?
+	static const ASTK s_astk = ASTK_LoopControl;
+	bool fContinue;
+	bool fBreak;
 };
 
 struct SAstArrayIndex : public SAst
@@ -1803,14 +1898,17 @@ struct SAstUsing : public SAst
 struct SAstCast : public SAst
 {
 	static const ASTK s_astk = ASTK_Cast;
-	SAstType * pAtype;
+	bool fIsAuto; 		// Do simple conversions to other types as aggressively as C++
+	SAst * pAstType;
 	SAst * pAstExpr;
 };
+
+// BB (adrianb) Should we reduce the struct variety here?  E.g. all things with 1 expression get a simple ast node?
 
 struct SAstNew : public SAst
 {
 	static const ASTK s_astk = ASTK_New;
-	SAstType * pAtype;
+	SAst * pAstType;
 	// BB (adrianb) For some reason some cases have call e.g. new Mutex("sound").
 	//  AFAICT this doesn't do anything.  In the parse it will run a Call operation by default, which seems wrong.
 };
@@ -1833,25 +1931,41 @@ struct SAstDefer : public SAst
 	SAst * pAstStmt;
 };
 
+struct SAstInline : public SAst
+{
+	static const ASTK s_astk = ASTK_Inline;
+	SAst * pAstExpr; // BB (adrianb) Only ever a procedure call?
+};
+
+struct SAstPushContext : public SAst
+{
+	static const ASTK s_astk = ASTK_PushContext;
+	const char * pChzContext;
+	SAstBlock * pAstblock;
+};
+
 struct SAstDeclareSingle : public SAst
 {
 	static const ASTK s_astk = ASTK_DeclareSingle;
-	SAstDeclaration adecl;
+	SDeclaration decl;
 };
 
 struct SAstDeclareMulti : public SAst
 {
 	static const ASTK s_astk = ASTK_DeclareMulti;
 
-	struct SIdent
-	{
-		const char * pChzName;
-		SErrorInfo errinfo;
-	};
+	SArray<SDeclaration> aryDecl;
+	// BB (adrianb) Shove this into declaration? How to avoid recursing to it multiple times?
+	SAst * pAstType; 	// Optional explicit type, probably should have either type or value
+	SAst * pAstValue;	// Value to unpack
+};
 
-	bool fVariable;
-	SArray<SIdent> aryIdent;
-	SAst * pAstValue;
+struct SAstAssignMulti : public SAst
+{
+	static const ASTK s_astk = ASTK_AssignMulti;
+
+	SArray<const char *> arypChzName;
+	SAst * pAstValue;	// Value to unpack
 };
 
 struct SAstStruct : public SAst
@@ -1859,8 +1973,7 @@ struct SAstStruct : public SAst
 	static const ASTK s_astk = ASTK_Struct;
 
 	const char * pChzName;
-	SArray<SAstDeclaration> aryAdecl;
-	SArray<SAst *> arypAstComplexDecl;
+	SArray<SAst *> arypAstDecl;
 };
 
 struct SAstEnum : public SAst
@@ -1874,7 +1987,7 @@ struct SAstEnum : public SAst
 	};
 
 	const char * pChzName;
-	SAstType * pAtypeInternal;
+	SAst * pAstTypeInternal;
 	SArray<SValue> aryValue;
 };
 
@@ -1883,13 +1996,58 @@ struct SAstProcedure : public SAst
 	static const ASTK s_astk = ASTK_Procedure;
 
 	const char * pChzName;
-	SArray<SAstDeclaration> aryAdeclArg;
-	SArray<SAstDeclaration> aryAdeclRet;
+	SArray<SDeclaration> aryDeclArg;
+	SArray<SDeclaration> aryDeclRet;
 
+	bool fIsInline;
 	bool fIsForeign;
 	const char * pChzForeign;
 
 	SAstBlock * pAstblock;
+};
+
+struct SAstTypeDefinition : public SAst
+{
+	static const ASTK s_astk = ASTK_TypeDefinition;
+	SAst * pAstType;
+};
+
+struct SAstTypePointer : public SAst
+{
+	static const ASTK s_astk = ASTK_TypePointer;
+
+	SAst * pAstTypeInner;
+	bool fSoa;
+};
+
+struct SAstTypeArray : public SAst
+{
+	static const ASTK s_astk = ASTK_TypeArray;
+
+	SAst * pAstSize; 		// Int literal, identifier, namespace qualified value // BB (adrianb) Extend to statically evaluatable expressions?
+	bool fDynamicallySized;	// Size of ..
+	bool fSoa;
+
+	SAst * pAstTypeInner;
+};
+
+struct SDeclaration;
+
+struct SAstTypeProcedure : public SAst
+{
+	static const ASTK s_astk = ASTK_TypeProcedure;
+
+	SArray<SDeclaration> aryDeclArg;
+	SArray<SDeclaration> aryDeclRet;
+};
+
+struct SAstTypePolymorphic : public SAst
+{
+	// BB (adrianb) Just merge this with SAstTypeIdentifier
+
+	static const ASTK s_astk = ASTK_TypePolymorphic;
+
+	const char * pChzName; // Just a name for now
 };
 
 struct SAstImportDirective : public SAst
@@ -1904,43 +2062,55 @@ struct SAstRunDirective : public SAst
 	SAst * pAstExpr;
 };
 
+struct SAstForeignLibraryDirective : public SAst
+{
+	static const ASTK s_astk = ASTK_ForeignLibraryDirective;
+	const char * pChz;
+};
+
 template <typename T>
-T * PastCreate(const SErrorInfo & errinfo)
+T * PastCreateManual(SParser * pParser, ASTK astk, const SErrorInfo & errinfo)
 {
 	T * pAst = static_cast<T *>(calloc(sizeof(T), 1));
-	pAst->astk = T::s_astk;
+	pAst->astk = astk;
 	pAst->errinfo = errinfo;
 	return pAst;
 }
 
-SAst * PastCreate(const SToken & tok)
+template <typename T>
+T * PastCreate(SParser * pParser, const SErrorInfo & errinfo)
+{
+	return PastCreateManual<T>(pParser, T::s_astk, errinfo);
+}
+
+SAst * PastCreate(SParser * pParser, const SToken & tok)
 {
 	switch (tok.tokk)
 	{
 	case TOKK_Identifier:
 		{
-			SAstIdentifier * pAstident = PastCreate<SAstIdentifier>(tok.errinfo);
+			SAstIdentifier * pAstident = PastCreate<SAstIdentifier>(pParser, tok.errinfo);
 			pAstident->pChz = tok.ident.pChz;
 			return pAstident;
 		}
 
 	case TOKK_StringLiteral:
 		{
-			SAstStringLiteral * pAststrlit = PastCreate<SAstStringLiteral>(tok.errinfo);
+			SAstStringLiteral * pAststrlit = PastCreate<SAstStringLiteral>(pParser, tok.errinfo);
 			pAststrlit->pChz = tok.strlit.pChz;
 			return pAststrlit;
 		}
 
 	case TOKK_BoolLiteral:
 		{
-			SAstBoolLiteral * pAstboollit = PastCreate<SAstBoolLiteral>(tok.errinfo);
+			SAstBoolLiteral * pAstboollit = PastCreate<SAstBoolLiteral>(pParser, tok.errinfo);
 			pAstboollit->f = tok.intlit.n != 0;
 			return pAstboollit;
 		}
 
 	case TOKK_IntLiteral:
 		{
-			SAstIntLiteral * pAstintlit = PastCreate<SAstIntLiteral>(tok.errinfo);
+			SAstIntLiteral * pAstintlit = PastCreate<SAstIntLiteral>(pParser, tok.errinfo);
 			pAstintlit->n = tok.intlit.n;
 			pAstintlit->cBit = tok.intlit.cBit;
 			pAstintlit->fSigned = tok.intlit.fSigned;
@@ -1949,7 +2119,7 @@ SAst * PastCreate(const SToken & tok)
 
 	case TOKK_FloatLiteral:
 		{
-			SAstFloatLiteral * pAstfltlit = PastCreate<SAstFloatLiteral>(tok.errinfo);
+			SAstFloatLiteral * pAstfltlit = PastCreate<SAstFloatLiteral>(pParser, tok.errinfo);
 			pAstfltlit->g = tok.fltlit.g;
 			pAstfltlit->cBit = tok.fltlit.cBit;
 			return pAstfltlit;
@@ -1964,8 +2134,8 @@ SAst * PastCreate(const SToken & tok)
 SAst * PastParseStatement(SParser * pParser);
 SAst * PastTryParseExpression(SParser * pParser);
 SAstBlock * PastParseBlock(SParser * pParser);
-SAstDeclaration AdeclParseOptionalName(SParser * pParser);
-SAstType * PatypeParse(SParser * pParser);
+SDeclaration DeclParseOptionalName(SParser * pParser);
+SAst * PastParseType(SParser * pParser);
 SAst * PastTryParsePrimary(SParser * pParser);
 
 SAst * PastTryParseAtom(SParser * pParser)
@@ -1980,7 +2150,7 @@ SAst * PastTryParseAtom(SParser * pParser)
 		case TOKK_BoolLiteral:
 		case TOKK_FloatLiteral:
 			ConsumeToken(pParser);
-			return PastCreate(tok);
+			return PastCreate(pParser, tok);
 
 		default:
 			return nullptr;
@@ -2020,38 +2190,48 @@ SAst * PastTryParseSimplePrimary(SParser * pParser)
 		ConsumeExpectedToken(pParser, TOKK_CloseParen);
 		return pAst;
 	}
-	else if (FTryConsumeKeyword(pParser, KEYWORD_Cast, &tok))
+	else if (FTryConsumeKeyword(pParser, KEYWORD_Null, &tok))
 	{
-		auto pAstcast = PastCreate<SAstCast>(tok.errinfo);
-		ConsumeExpectedToken(pParser, TOKK_OpenParen);
-		pAstcast->pAtype = PatypeParse(pParser);
-		ConsumeExpectedToken(pParser, TOKK_CloseParen);
-		SToken tokNext = TokPeek(pParser);
+		return PastCreateManual<SAst>(pParser, ASTK_Null, tok.errinfo);
+	}
+	else if (FTryConsumeKeyword(pParser, KEYWORD_Cast, &tok) ||
+			 FTryConsumeKeyword(pParser, KEYWORD_AutoCast, &tok))
+	{
+		auto pAstcast = PastCreate<SAstCast>(pParser, tok.errinfo);
+		pAstcast->fIsAuto = (tok.keyword == KEYWORD_AutoCast);
+		if (!pAstcast->fIsAuto)
+		{
+			ConsumeExpectedToken(pParser, TOKK_OpenParen);
+			pAstcast->pAstType = PastParseType(pParser);
+			ConsumeExpectedToken(pParser, TOKK_CloseParen);
+		}
+		
 		pAstcast->pAstExpr = PastParsePrimary(pParser);
+
 		return pAstcast;
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_New, &tok))
 	{
-		auto pAstnew = PastCreate<SAstNew>(tok.errinfo);
-		pAstnew->pAtype = PatypeParse(pParser);
+		auto pAstnew = PastCreate<SAstNew>(pParser, tok.errinfo);
+		pAstnew->pAstType = PastParseType(pParser);
 		return pAstnew;
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_Delete, &tok))
 	{
-		auto pAstdelete = PastCreate<SAstDelete>(tok.errinfo);
+		auto pAstdelete = PastCreate<SAstDelete>(pParser, tok.errinfo);
 		pAstdelete->pAstExpr = PastParsePrimary(pParser);
 		return pAstdelete;
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_Remove, &tok))
 	{
-		auto pAstremove = PastCreate<SAstRemove>(tok.errinfo);
+		auto pAstremove = PastCreate<SAstRemove>(pParser, tok.errinfo);
 		pAstremove->pAstExpr = PastParsePrimary(pParser);
 		return pAstremove;
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_CharDirective, &tok))
 	{
 		// BB (adrianb) Make a different type for char?
-		auto pAstintlit = PastCreate<SAstIntLiteral>(tok.errinfo);
+		auto pAstintlit = PastCreate<SAstIntLiteral>(pParser, tok.errinfo);
 		pAstintlit->cBit = 8;
 		pAstintlit->fSigned = true; // BB (adrianb) Should char be signed or unsigned?
 
@@ -2075,10 +2255,10 @@ SAst * PastTryParsePrimary(SParser * pParser)
 	SToken tok = {};
 	while (FTryConsumeToken(pParser, TOKK_Operator, &tok))
 	{
-		auto pAstop = PastCreate<SAstOperator>(tok.errinfo);
+		auto pAstop = PastCreate<SAstOperator>(pParser, tok.errinfo);
 		pAstop->pChzOp = tok.op.pChz;
 		*ppAst = pAstop;
-		ppAst = &pAstop->pAstAfter;
+		ppAst = &pAstop->pAstRight;
 	}
 
 	*ppAst = PastTryParseSimplePrimary(pParser);
@@ -2095,7 +2275,7 @@ SAst * PastTryParsePrimary(SParser * pParser)
 		// TODO inline, other?
 		// BB (adrianb) Try to point the error info at something other than the openning paren?
 
-		auto pAstcall = PastCreate<SAstCall>(tok.errinfo);
+		auto pAstcall = PastCreate<SAstCall>(pParser, tok.errinfo);
 		pAstcall->pAstFunc = *ppAst;
 		*ppAst = pAstcall; // Function call has higher precidence so take the last thing and call on that
 
@@ -2113,7 +2293,7 @@ SAst * PastTryParsePrimary(SParser * pParser)
 	}
 	else if (FTryConsumeToken(pParser, TOKK_OpenBracket, &tok))
 	{
-		auto pAstarrayindex = PastCreate<SAstArrayIndex>(tok.errinfo);
+		auto pAstarrayindex = PastCreate<SAstArrayIndex>(pParser, tok.errinfo);
 		pAstarrayindex->pAstArray = *ppAst;
 		*ppAst = pAstarrayindex;
 
@@ -2162,10 +2342,10 @@ SAst * PastTryParseBinaryOperator(SParser * pParser, int iOperator)
 			return nullptr;
 		}
 
-		auto pAstop = PastCreate<SAstOperator>(tok.errinfo);
+		auto pAstop = PastCreate<SAstOperator>(pParser, tok.errinfo);
 		pAstop->pChzOp = tok.op.pChz;
-		pAstop->pAstBefore = pAstLeft;
-		pAstop->pAstAfter = pAstRight;
+		pAstop->pAstLeft = pAstLeft;
+		pAstop->pAstRight = pAstRight;
 
 		// Left associative
 
@@ -2180,7 +2360,7 @@ SAst * PastTryParseExpression(SParser * pParser)
 	SToken tok = {};
 	if (FTryConsumeKeyword(pParser, KEYWORD_RunDirective, &tok))
 	{
-		auto pAstrun = PastCreate<SAstRunDirective>(tok.errinfo);
+		auto pAstrun = PastCreate<SAstRunDirective>(pParser, tok.errinfo);
 		SToken tokNext = TokPeek(pParser);
 		if (tokNext.tokk == TOKK_OpenBrace)
 		{
@@ -2192,19 +2372,32 @@ SAst * PastTryParseExpression(SParser * pParser)
 		}
 		return pAstrun;
 	}
+	else if (FTryConsumeKeyword(pParser, KEYWORD_Inline, &tok))
+	{
+		auto pAstinline = PastCreate<SAstInline>(pParser, tok.errinfo);
+		pAstinline->pAstExpr = PastParseExpression(pParser);
+		return pAstinline;
+	}
+	else if (FTryConsumeKeyword(pParser, KEYWORD_Continue, &tok) ||
+			 FTryConsumeKeyword(pParser, KEYWORD_Break, &tok))
+	{
+		auto pAstloopctrl = PastCreate<SAstLoopControl>(pParser, tok.errinfo);
+		pAstloopctrl->fContinue = tok.keyword == KEYWORD_Continue;
+		pAstloopctrl->fBreak = tok.keyword == KEYWORD_Break;
+		return pAstloopctrl;
+	}
+	else if (FTryConsumeOperator(pParser, "---", &tok))
+	{
+		// BB (adrianb) Make operators all manual so we don't have special case here?  
+		//  Can't manually define operators then though.
+
+		return PastCreateManual<SAst>(pParser, ASTK_UninitializedValue, tok.errinfo);
+	}
 
 	return PastTryParseBinaryOperator(pParser, 0);
 }
 
-template <typename T>
-T * PatypeCreate(ASTTYPEK asttypek)
-{
-	T * pT = static_cast<T *>(calloc(sizeof(T), 1));
-	pT->asttypek = asttypek;
-	return pT;
-}
-
-void ParseReturnValues(SParser * pParser, SArray<SAstDeclaration> * paryAdecl)
+void ParseReturnValues(SParser * pParser, SArray<SDeclaration> * paryDecl)
 {
 	// BB (adrianb) Special case void so we don't have to check for it later?
 
@@ -2217,19 +2410,28 @@ void ParseReturnValues(SParser * pParser, SArray<SAstDeclaration> * paryAdecl)
 	
 	for (;;)
 	{
-		*PtAppendNew(paryAdecl) = AdeclParseOptionalName(pParser);
+		*PtAppendNew(paryDecl) = DeclParseOptionalName(pParser);
 		if (!FTryConsumeToken(pParser, TOKK_Comma))
 			break;
 	}
 }
 
-SAstType * PatypeParse(SParser * pParser)
+SAst * PastParseType(SParser * pParser)
 {
     SToken tok = {};
 
-	if (FTryConsumeOperator(pParser, "*"))
+    if (FTryConsumeOperator(pParser, "$"))
 	{
-		SAstTypePointer * pAtypepointer = PatypeCreate<SAstTypePointer>(ASTTYPEK_Pointer);
+		// BB (adrianb) Can this have $T.S somehow?
+
+		ConsumeExpectedToken(pParser, TOKK_Identifier, &tok);
+		auto pAtypepoly = PastCreate<SAstTypePolymorphic>(pParser, tok.errinfo);
+		pAtypepoly->pChzName = tok.ident.pChz;
+		return pAtypepoly;
+	}
+	else if (FTryConsumeOperator(pParser, "*", &tok))
+	{
+		SAstTypePointer * pAtypepointer = PastCreate<SAstTypePointer>(pParser, tok.errinfo);
 
 		SToken tokSoa = TokPeek(pParser);
 		if (tokSoa.tokk == TOKK_Identifier && strcmp(tokSoa.ident.pChz, "SOA") == 0)
@@ -2238,12 +2440,14 @@ SAstType * PatypeParse(SParser * pParser)
 			pAtypepointer->fSoa = true;
 		}
 
-		pAtypepointer->pAtypeInner = PatypeParse(pParser);
+		pAtypepointer->pAstTypeInner = PastParseType(pParser);
 		return pAtypepointer;
 	}
-	else if (FTryConsumeToken(pParser, TOKK_OpenBracket))
+	else if (FTryConsumeToken(pParser, TOKK_OpenBracket, &tok))
 	{
-		auto pAtypearray = PatypeCreate<SAstTypeArray>(ASTTYPEK_Array);
+		// BB (adrianb) Would like it to span until close bracket?
+
+		auto pAtypearray = PastCreate<SAstTypeArray>(pParser, tok.errinfo);
 
 		if (TokPeek(pParser).tokk != TOKK_CloseBracket)
 		{
@@ -2265,52 +2469,70 @@ SAstType * PatypeParse(SParser * pParser)
 			pAtypearray->fSoa = true;
 		}
 
-		pAtypearray->pAtypeInner = PatypeParse(pParser);
+		pAtypearray->pAstTypeInner = PastParseType(pParser);
 
 		return pAtypearray;
 	}
-	else if (FTryConsumeToken(pParser, TOKK_OpenParen))
+	else if (FTryConsumeToken(pParser, TOKK_OpenParen, &tok))
 	{
-		auto pAtypproc = PatypeCreate<SAstTypeProcedure>(ASTTYPEK_Procedure);
+		auto pAtypproc = PastCreate<SAstTypeProcedure>(pParser, tok.errinfo);
 
 		for (;;)
 		{
-			*PtAppendNew(&pAtypproc->aryAdeclArg) = AdeclParseOptionalName(pParser);
+			*PtAppendNew(&pAtypproc->aryDeclArg) = DeclParseOptionalName(pParser);
 			if (!FTryConsumeToken(pParser, TOKK_Comma))
 				break;
 		}
+        
+        ConsumeExpectedToken(pParser, TOKK_CloseParen);
 
 		if (FTryConsumeOperator(pParser, "->"))
 		{
-			ParseReturnValues(pParser, &pAtypproc->aryAdeclRet);
+			ParseReturnValues(pParser, &pAtypproc->aryDeclRet);
 		}
 
 		return pAtypproc;
 	}
 	else if (FTryConsumeToken(pParser, TOKK_Identifier, &tok))
 	{
-		if (FTryConsumeOperator(pParser, "."))
+		// BB (adrianb) Can you have something other than a.b.c once you hit an identifier?
+
+		auto pAstident = PastCreate<SAstIdentifier>(pParser, tok.errinfo);
+		pAstident->pChz = tok.ident.pChz;
+
+		// If we have any '.'s, transform a.b.c into (. (. a b) c)
+
+		SAst * pAstType = pAstident;
+
+		while (FTryConsumeOperator(pParser, ".", &tok))
 		{
-			auto pAtypns = PatypeCreate<SAstTypeNamespace>(ASTTYPEK_Namespace);
-			pAtypns->pChzNamespace = tok.ident.pChz;
-			pAtypns->pAtypeInner = PatypeParse(pParser);
-			return pAtypns;
+			auto pAstop = PastCreate<SAstOperator>(pParser, tok.errinfo);
+
+			pAstop->pChzOp = tok.op.pChz;
+			pAstop->pAstLeft = pAstType;
+
+			ConsumeExpectedToken(pParser, TOKK_Identifier, &tok);
+			auto pAstidentRight = PastCreate<SAstIdentifier>(pParser, tok.errinfo);
+			pAstidentRight->pChz = tok.ident.pChz;
+
+			pAstop->pAstRight = pAstidentRight;
+			pAstType = pAstop;
 		}
-		else
-		{
-			SAstTypeIdentifier * pAtypeident = PatypeCreate<SAstTypeIdentifier>(ASTTYPEK_Identifier);
-			pAtypeident->pChzName = tok.ident.pChz;
-			return pAtypeident;
-		}
+
+		return pAstType;
+	}
+	else if (FTryConsumeOperator(pParser, "..", &tok))
+	{
+		return PastCreateManual<SAst>(pParser, ASTK_TypeVararg, tok.errinfo);
 	}
 	
 	ShowErr(tok.errinfo, "Unexpected token for type declaration");
 	return nullptr;
 }
 
-SAstDeclaration AdeclParseSimple(SParser * pParser)
+SDeclaration DeclParseSimple(SParser * pParser)
 {
-	SAstDeclaration adecl = {};
+	SDeclaration decl = {};
 
 	// BB (adrianb) Makes no sense for structs, procs kinda if we pass context.
 
@@ -2319,7 +2541,7 @@ SAstDeclaration AdeclParseSimple(SParser * pParser)
 	if (tokIdent.tokk == TOKK_Keyword && tokIdent.keyword == KEYWORD_Using)
 	{
 		ConsumeToken(pParser);
-		adecl.fUsing = true;
+		decl.fUsing = true;
 		tokIdent = TokPeek(pParser);
 	}
 
@@ -2333,26 +2555,25 @@ SAstDeclaration AdeclParseSimple(SParser * pParser)
 
 	ConsumeToken(pParser, 2);
 
-	adecl.pChzName = tokIdent.ident.pChz;
+	decl.pChzName = tokIdent.ident.pChz;
 
 	const char * pChzColonOp = tokDefineOp.op.pChz;
 	if (strcmp(pChzColonOp, ":") == 0)
 	{
 		// ident : type = value;
 
-		adecl.fVariable = true;
-		adecl.pAtype = PatypeParse(pParser);
+		decl.pAstType = PastParseType(pParser);
 
 		if (FTryConsumeOperator(pParser, "="))
 		{
-			adecl.pAstValue = PastParseExpression(pParser);
+			decl.pAstValue = PastParseExpression(pParser);
 		}
 		else if (FTryConsumeOperator(pParser, ":"))
 		{
 			// BB (adrianb) Does this syntax even make sense?
 
-			adecl.fVariable = false;
-			adecl.pAstValue = PastParseExpression(pParser);
+			decl.fIsConstant = false;
+			decl.pAstValue = PastParseExpression(pParser);
 		}
 	}
 	else if (strcmp(pChzColonOp, ":=") == 0 ||
@@ -2360,18 +2581,28 @@ SAstDeclaration AdeclParseSimple(SParser * pParser)
 	{
 		// ident := value
 
-		adecl.fVariable = strcmp(pChzColonOp, ":=") == 0;
-		adecl.pAstValue = PastParseExpression(pParser);
+		decl.fIsConstant = strcmp(pChzColonOp, ":=") != 0;
+
+		if (decl.fIsConstant && FTryConsumeKeyword(pParser, KEYWORD_TypeDirective))
+		{
+			// BB (adrianb) May need to wrap this in ast node to signify its actually a type.
+			
+			decl.pAstValue = PastParseType(pParser);
+		}
+		else
+		{
+			decl.pAstValue = PastParseExpression(pParser);
+		}
 	}
 	else
 	{
 		ShowErr(tokDefineOp.errinfo, "Unknown define operator");
 	}
 
-	return adecl;
+	return decl;
 }
 
-SAstDeclaration AdeclParseOptionalName(SParser * pParser)
+SDeclaration DeclParseOptionalName(SParser * pParser)
 {
 	// If we don't have ident : just check for a type
 
@@ -2380,43 +2611,70 @@ SAstDeclaration AdeclParseOptionalName(SParser * pParser)
 
 	if (tokIdent.tokk != TOKK_Identifier || tokDefine.tokk != TOKK_Operator)
 	{
-		SAstDeclaration adecl = {};
-		adecl.fVariable = true;
-		adecl.pAtype = PatypeParse(pParser);
-		return adecl;
+		SDeclaration decl = {};
+		decl.pAstType = PastParseType(pParser);
+		return decl;
 	}	
 
-	return AdeclParseSimple(pParser);
+	return DeclParseSimple(pParser);
 }
 
-SAst * PastParseMultiDeclaration(SParser * pParser)
+SAst * PastParseMultiDeclarationOrAssign(SParser * pParser)
 {
-	auto pAstdecmul = PastCreate<SAstDeclareMulti>(TokPeek(pParser).errinfo); // BB (adrianb) Want the error info for all the identifiers?
+	SToken aTokIdent[16] = {};
+	int cTokIdent = 0;
 
 	for (;;)
 	{
-		SToken tokIdent;
-		ConsumeExpectedToken(pParser, TOKK_Identifier, &tokIdent);
-
-		auto pIdent = PtAppendNew(&pAstdecmul->aryIdent);
-		pIdent->pChzName = tokIdent.ident.pChz;
-		pIdent->errinfo = tokIdent.errinfo;
-
+		ASSERT(cTokIdent < DIM(aTokIdent));
+		ConsumeExpectedToken(pParser, TOKK_Identifier, &aTokIdent[cTokIdent++]);
+		
 		if (!FTryConsumeToken(pParser, TOKK_Comma))
 			break;
 	}
 
-	if (!FTryConsumeOperator(pParser, "::"))
+	SToken tok = TokPeek(pParser);
+	bool fIsConstant = false;
+	if (FTryConsumeOperator(pParser, ":", &tok) || 
+		FTryConsumeOperator(pParser, "::", &tok) || 
+		FTryConsumeOperator(pParser, ":=", &tok))
 	{
-		pAstdecmul->pAstValue = PastParseExpression(pParser);
+		auto pAstdecmul = PastCreate<SAstDeclareMulti>(pParser, tok.errinfo); // BB (adrianb) Want the error info for all the identifiers?
+
+		SAst * pAstType = nullptr;
+		bool fHasType = (strcmp(tok.op.pChz, ":") == 0);
+		if (fHasType)
+		{
+			pAstType = PastParseType(pParser);
+		}
+
+		fIsConstant = (strcmp(tok.op.pChz, "::") == 0);
+
+		for (int iTok : IterCount(cTokIdent))
+		{
+			const SToken & tokIdent = aTokIdent[iTok];
+			auto pDecl = PtAppendNew(&pAstdecmul->aryDecl);
+			pDecl->pChzName = tokIdent.ident.pChz;
+			pDecl->errinfo = tokIdent.errinfo;
+			pDecl->pAstMulti = pAstdecmul; // BB (adrianb)
+		}
+
+		if (!fHasType || FTryConsumeOperator(pParser, "="))
+		{
+			pAstdecmul->pAstValue = PastParseExpression(pParser);
+		}
+
+		return pAstdecmul;
 	}
-	else if (!FTryConsumeOperator(pParser, ":="))
+	else if (FTryConsumeOperator(pParser, "=", &tok))
 	{
-		pAstdecmul->fVariable = true;
-		pAstdecmul->pAstValue = PastParseExpression(pParser);
+		auto pAstassignmul = PastCreate<SAstAssignMulti>(pParser, tok.errinfo);
+		pAstassignmul->pAstValue = PastParseExpression(pParser);
+		return pAstassignmul;
 	}
 
-	return pAstdecmul;
+	ShowErr(tok.errinfo, "Expected :: or := to do multiple declaration assignment");
+	return nullptr;
 }
 
 SAst * PastTryParseDeclaration(SParser * pParser)
@@ -2435,12 +2693,14 @@ SAst * PastTryParseDeclaration(SParser * pParser)
 	SToken tokDefine = TokPeek(pParser, iTok + 1);
 	if (tokDefine.tokk == TOKK_Comma)
 	{
-		return PastParseMultiDeclaration(pParser);
+		// BB (adrianb) Could probably be multi assign too.
+
+		return PastParseMultiDeclarationOrAssign(pParser);
 	}
 	else if (tokDefine.tokk == TOKK_Operator && *tokDefine.op.pChz == ':') // BB (adrianb) Check for exact set of operators?
 	{
-		auto pAstdec = PastCreate<SAstDeclareSingle>(tokDefine.errinfo);
-		pAstdec->adecl = AdeclParseSimple(pParser);
+		auto pAstdec = PastCreate<SAstDeclareSingle>(pParser, tokDefine.errinfo);
+		pAstdec->decl = DeclParseSimple(pParser);
 		return pAstdec;
 	}
 	else
@@ -2459,20 +2719,30 @@ SAst * PastTryParseStructOrProcedureDeclaration(SParser * pParser)
 		if (strcmp(tokDefineOp.op.pChz, "::") == 0)
 		{
 			// ident :: declare-value
+            
+            // BB (adrianb) Determining if its a procedure seems messy.
+            //  Couldn't we have a :: (5 + 3); or b := (5 + 3);  They wouldn't be easily distinguishable from
+            //  a procedure definition without looking at the contents or for a block after the close paren.
+            //  I suppose we could do that but ew.  Plus there's a #modify and other junk that can go in between.
+            //  Requiring a keyword like struct would work but would be heavy.
 
 			SToken tokValue = TokPeek(pParser, 2);
-			if (tokValue.tokk == TOKK_OpenParen) // procedure
+            bool fInline = (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Inline);
+			if (tokValue.tokk == TOKK_OpenParen || (fInline  && TokPeek(pParser, 3).tokk == TOKK_OpenParen)) // procedure
 			{
 				ConsumeToken(pParser, 3);
+                if (fInline)
+                    ConsumeExpectedToken(pParser, TOKK_OpenParen);
 
-				auto pAstproc = PastCreate<SAstProcedure>(tokIdent.errinfo);
+				auto pAstproc = PastCreate<SAstProcedure>(pParser, tokIdent.errinfo);
 				pAstproc->pChzName = tokIdent.ident.pChz;
+				pAstproc->fIsInline = fInline;
 
 				if (TokPeek(pParser).tokk != TOKK_CloseParen)
 				{
 					for (;;)
 					{
-						*PtAppendNew(&pAstproc->aryAdeclArg) = AdeclParseSimple(pParser);
+						*PtAppendNew(&pAstproc->aryDeclArg) = DeclParseSimple(pParser);
 						if (!FTryConsumeToken(pParser, TOKK_Comma))
 							break;
 					}
@@ -2482,7 +2752,7 @@ SAst * PastTryParseStructOrProcedureDeclaration(SParser * pParser)
 
 				if (FTryConsumeOperator(pParser, "->"))
 				{
-					ParseReturnValues(pParser, &pAstproc->aryAdeclRet);
+					ParseReturnValues(pParser, &pAstproc->aryDeclRet);
 				}
 
 				if (FTryConsumeKeyword(pParser, KEYWORD_ForeignDirective))
@@ -2506,7 +2776,7 @@ SAst * PastTryParseStructOrProcedureDeclaration(SParser * pParser)
 			{
 				ConsumeToken(pParser, 3);
 
-				auto pAststruct = PastCreate<SAstStruct>(tokIdent.errinfo);
+				auto pAststruct = PastCreate<SAstStruct>(pParser, tokIdent.errinfo);
 				pAststruct->pChzName = tokIdent.ident.pChz;
 
 				// TODO: AOS, SOA.
@@ -2516,15 +2786,21 @@ SAst * PastTryParseStructOrProcedureDeclaration(SParser * pParser)
 				while (!FTryConsumeToken(pParser, TOKK_CloseBrace))
 				{
 					SAst * pAst = PastTryParseStructOrProcedureDeclaration(pParser);
-					if (pAst)
+					if (!pAst)
 					{
-						*PtAppendNew(&pAststruct->arypAstComplexDecl) = pAst;
+						pAst = PastTryParseDeclaration(pParser);
+						if (pAst)
+						{
+							ConsumeExpectedToken(pParser, TOKK_Semicolon);
+						}
+						else
+						{
+							SToken tokErr = TokPeek(pParser);
+							ShowErr(tokErr.errinfo, "Expected declaration");
+						}
 					}
-					else
-					{
-						*PtAppendNew(&pAststruct->aryAdecl) = AdeclParseSimple(pParser);
-					}
-					ConsumeExpectedToken(pParser, TOKK_Semicolon);
+					
+					*PtAppendNew(&pAststruct->arypAstDecl) = pAst;
 				}
 
 				return pAststruct;
@@ -2533,13 +2809,13 @@ SAst * PastTryParseStructOrProcedureDeclaration(SParser * pParser)
 			{
 				ConsumeToken(pParser, 3);
 
-				auto pAstenum = PastCreate<SAstEnum>(tokIdent.errinfo);
+				auto pAstenum = PastCreate<SAstEnum>(pParser, tokIdent.errinfo);
 				pAstenum->pChzName = tokIdent.ident.pChz;
 
 				SToken tokType = TokPeek(pParser);
 				if (tokType.tokk != TOKK_OpenBrace)
 				{
-					pAstenum->pAtypeInternal = PatypeParse(pParser);
+					pAstenum->pAstTypeInternal = PastParseType(pParser);
 				}
 
 				ConsumeExpectedToken(pParser, TOKK_OpenBrace);
@@ -2586,8 +2862,11 @@ SAst * PastTryParseStatement(SParser * pParser)
 
 	if (FTryConsumeKeyword(pParser, KEYWORD_If, &tok))
 	{
-		auto pAstif = PastCreate<SAstIf>(tok.errinfo);
+		auto pAstif = PastCreate<SAstIf>(pParser, tok.errinfo);
 		pAstif->pAstCondition = PastParseExpression(pParser);
+
+		(void) FTryConsumeKeyword(pParser, KEYWORD_Then);
+
 		pAstif->pAstPass = PastParseStatement(pParser);
 
 		if (FTryConsumeKeyword(pParser, KEYWORD_Else, &tok))
@@ -2599,20 +2878,20 @@ SAst * PastTryParseStatement(SParser * pParser)
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_While, &tok))
 	{
-		auto pAstwhile = PastCreate<SAstWhile>(tok.errinfo);
+		auto pAstwhile = PastCreate<SAstWhile>(pParser, tok.errinfo);
 		pAstwhile->pAstCondition = PastParseExpression(pParser);
 		pAstwhile->pAstLoop = PastParseStatement(pParser);
 		return pAstwhile;
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_For, &tok))
 	{
-		auto pAstfor = PastCreate<SAstFor>(tok.errinfo);
+		auto pAstfor = PastCreate<SAstFor>(pParser, tok.errinfo);
 
 		SToken tokIdent = TokPeek(pParser);
 		SToken tokColon = TokPeek(pParser, 1);
 		if (tokIdent.tokk == TOKK_Identifier && FIsOperator(tokColon, ":"))
 		{
-			pAstfor->pAstIter = PastCreate(tokIdent);
+			pAstfor->pAstIter = PastCreate(pParser, tokIdent);
 		}
 
 		pAstfor->pAstIterRight = PastParseExpression(pParser);
@@ -2622,7 +2901,7 @@ SAst * PastTryParseStatement(SParser * pParser)
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_Return, &tok))
 	{
-		auto pAstret = PastCreate<SAstReturn>(tok.errinfo);
+		auto pAstret = PastCreate<SAstReturn>(pParser, tok.errinfo);
 
 		SAst * pAstRet = PastTryParseExpression(pParser);
 		if (pAstRet)
@@ -2643,9 +2922,17 @@ SAst * PastTryParseStatement(SParser * pParser)
 	}
 	else if (FTryConsumeKeyword(pParser, KEYWORD_Defer, &tok))
 	{
-		auto pAstdefer = PastCreate<SAstDefer>(tok.errinfo);
+		auto pAstdefer = PastCreate<SAstDefer>(pParser, tok.errinfo);
 		pAstdefer->pAstStmt = PastParseStatement(pParser);
 		return pAstdefer;
+	}
+	else if (FTryConsumeKeyword(pParser, KEYWORD_PushContext, &tok))
+	{
+		auto pAstpushctx = PastCreate<SAstPushContext>(pParser, tok.errinfo);
+		ConsumeExpectedToken(pParser, TOKK_Identifier, &tok);
+		pAstpushctx->pChzContext = tok.ident.pChz;
+		pAstpushctx->pAstblock = PastParseBlock(pParser);
+		return pAstpushctx;
 	}
 
 	// TODO Recongize definition with ident(, ident)* followed by a := too.
@@ -2662,7 +2949,7 @@ SAst * PastTryParseStatement(SParser * pParser)
 	// Check for using expr (e.g. using Enum.members) after d
 	if (!pAst && FTryConsumeKeyword(pParser, KEYWORD_Using, &tok))
 	{
-		auto pAstusing = PastCreate<SAstUsing>(tok.errinfo);
+		auto pAstusing = PastCreate<SAstUsing>(pParser, tok.errinfo);
 		pAstusing->pAstExpr = PastParseExpression(pParser);
 		pAst = pAstusing;
 	}
@@ -2678,7 +2965,7 @@ SAst * PastTryParseStatement(SParser * pParser)
 	
 	if (FTryConsumeToken(pParser, TOKK_Semicolon, &tok))
 	{
-		return PastCreate<SAstEmptyStatement>(tok.errinfo);
+		return PastCreate<SAstEmptyStatement>(pParser, tok.errinfo);
 	}
 
 	return nullptr;
@@ -2698,7 +2985,7 @@ SAstBlock * PastParseBlock(SParser * pParser)
 	SToken tokOpen;
 	ConsumeExpectedToken(pParser, TOKK_OpenBrace, &tokOpen);
 
-	SAstBlock * pAstblock = PastCreate<SAstBlock>(tokOpen.errinfo);
+	SAstBlock * pAstblock = PastCreate<SAstBlock>(pParser, tokOpen.errinfo);
 
 	for (;;)
 	{
@@ -2713,28 +3000,41 @@ SAstBlock * PastParseBlock(SParser * pParser)
 	return pAstblock;
 }
 
-SAst * PastParseRoot(SParser * pParser)
+SAstBlock * PastblockParseRoot(SParser * pParser)
 {
 	// BB (adrianb) Do we want a root scope?
 
 	SToken tokScope = TokPeek(pParser);
-	SAstBlock * pAstblock = PastCreate<SAstBlock>(tokScope.errinfo);
+	SAstBlock * pAstblock = PastCreate<SAstBlock>(pParser, tokScope.errinfo);
 
 	for (;;)
 	{
 		SToken tok = {};
 		if (FTryConsumeKeyword(pParser, KEYWORD_ImportDirective, &tok))
 		{
-			auto pAstimport = PastCreate<SAstImportDirective>(tokScope.errinfo);
+			auto pAstimport = PastCreate<SAstImportDirective>(pParser, tokScope.errinfo);
 			SToken tokString;
 			ConsumeExpectedToken(pParser, TOKK_StringLiteral, &tokString);
-			ConsumeExpectedToken(pParser, TOKK_Semicolon);
+			//ConsumeExpectedToken(pParser, TOKK_Semicolon);
 
 			pAstimport->pChzImport = tokString.strlit.pChz;
 			
 			// BB (adrianb) Verify this all happens on one line.
 			
 			*PtAppendNew(&pAstblock->arypAst) = pAstimport;
+			continue;
+		}
+		else if (FTryConsumeKeyword(pParser, KEYWORD_ForeignLibraryDirective, &tok))
+		{
+			auto pAstlib = PastCreate<SAstForeignLibraryDirective>(pParser, tokScope.errinfo);
+			SToken tokString;
+			ConsumeExpectedToken(pParser, TOKK_StringLiteral, &tokString);
+			
+			pAstlib->pChz = tokString.strlit.pChz;
+			
+			// BB (adrianb) Verify this all happens on one line.
+			
+			*PtAppendNew(&pAstblock->arypAst) = pAstlib;
 			continue;
 		}
 		else if (TokPeek(pParser).tokk == TOKK_EndOfFile)
@@ -2754,8 +3054,50 @@ SAst * PastParseRoot(SParser * pParser)
 	{
 		ShowErr(tok.errinfo, "Unexpected token %s", PchzFromTokk(tok.tokk));
 	}
+	else
+	{
+		ConsumeToken(pParser);
+	}
 
 	return pAstblock;
+}
+
+void PrintAst(int cScope, const SAst * pAst);
+void ParseAll(SParser * pParser, SArray<SModule> * paryModule)
+{
+	for (int iModule = 0; iModule < paryModule->c; ++iModule)
+	{
+		SModule * pModule = &(*paryModule)[iModule];
+		const char * pChzFile = pModule->pChzFile;
+		const char * pChzContents = PchzLoadWholeFile(pChzFile);
+		if (pChzContents == nullptr)
+	    {
+  			fflush(stdout);
+	        fprintf(stderr, "Could read file %s\n", pChzFile);
+	        fflush(stderr);
+			exit(-1);
+	    }
+	    
+		StartNewFile(pParser, pChzFile, pChzContents);
+		pModule->pAstblockRoot = PastblockParseRoot(pParser);
+
+		printf("\nParsed file %s\n", pChzFile);
+		PrintAst(0, pModule->pAstblockRoot);
+		
+		// Collect and add any imported files
+
+		// NOTE (adrianb) Do not reference pModule after this point as it may have moved.
+
+		auto pAstblock = pModule->pAstblockRoot;
+		for (SAst * pAst : pAstblock->arypAst)
+		{
+			if (pAst->astk != ASTK_ImportDirective)
+				continue;
+
+			auto pAstimport = AstCast<SAstImportDirective>(pAst);
+			AddFile(pParser, pAstimport->pChzImport, paryModule);
+		}
+	}
 }
 
 
@@ -2782,11 +3124,39 @@ void PrintEscapedString(const char * pChz)
 	}
 }
 
-void PrintSimpleInlineAst(const SAst * pAst)
+// BB (adrianb) Basically a simplified PrintAst which allows no printing of new lines. 
+//  Is this important? Combine? Or drop?
+
+void PrintInlineAst(const SAst * pAst);
+
+void PrintInlineDeclaration(const SDeclaration & decl)
 {
-	switch (pAst->astk)
+	printf("%s", (decl.fUsing) ? "using " : "");
+	if (decl.pChzName)
+		printf("%s :", decl.pChzName);
+
+	if (decl.pAstType)
 	{
-	case ASTK_StringLiteral:
+		if (decl.pChzName) 
+			printf(" ");
+		PrintInlineAst(decl.pAstType);
+	}
+
+	// BB (adrianb) Print AST on a new line? if it's got any complexity that'd be ugly.
+	if (decl.pAstValue)
+	{
+		if (decl.pAstType)
+			printf(" ");
+		printf("%s", decl.fIsConstant ? ":" : "=");
+		PrintInlineAst(decl.pAstValue);
+	}
+}
+
+void PrintInlineAst(const SAst * pAst)
+{
+    switch (pAst->astk) 
+    {
+    case ASTK_StringLiteral:
 		PrintEscapedString(AstCast<SAstStringLiteral>(pAst)->pChz);
 		break;
 
@@ -2808,91 +3178,102 @@ void PrintSimpleInlineAst(const SAst * pAst)
 
 	case ASTK_Operator:
 		{
+			// BB (adrianb) Add any space?
 			auto pAstop = AstCast<SAstOperator>(pAst);
-			if (pAstop->pAstBefore)
-				PrintSimpleInlineAst(pAstop->pAstBefore);
+			if (pAstop->pAstLeft)
+				PrintInlineAst(pAstop->pAstLeft);
 			printf("%s", pAstop->pChzOp);
-			PrintSimpleInlineAst(pAstop->pAstAfter);
+			PrintInlineAst(pAstop->pAstRight);
+		}
+		break;
+
+	case ASTK_TypePointer:
+		{
+			printf("* ");
+			PrintInlineAst(AstCast<SAstTypePointer>(pAst)->pAstTypeInner);
+		}
+		break;
+
+	case ASTK_TypeArray:
+		{
+			auto pAtypearray = AstCast<SAstTypeArray>(pAst);
+			if (pAtypearray->fDynamicallySized)
+			{
+				printf("[..] ");
+			}
+			else
+			{
+				printf("[");
+				if (pAtypearray->pAstSize)
+					PrintInlineAst(pAtypearray->pAstSize);
+				printf("] ");
+			}
+			PrintInlineAst(AstCast<SAstTypeArray>(pAst)->pAstTypeInner);
+		}
+		break;
+
+	case ASTK_TypeProcedure:
+		{
+			auto pAtypeproc = AstCast<SAstTypeProcedure>(pAst);
+			printf("(");
+			for (int iDecl : IterCount(pAtypeproc->aryDeclArg.c))
+			{
+				printf("%s", (iDecl > 0) ? ", " : "");
+				PrintInlineDeclaration(pAtypeproc->aryDeclArg[iDecl]);
+			}
+			printf(")");
+
+			if (pAtypeproc->aryDeclRet.c > 0)
+			{
+				printf(" -> ");
+				for (int iDecl : IterCount(pAtypeproc->aryDeclRet.c))
+				{
+					printf("%s", (iDecl > 0) ? ", " : "");
+					PrintInlineDeclaration(pAtypeproc->aryDeclRet[iDecl]);
+				}
+			}
+		}
+		break;
+
+	case ASTK_TypePolymorphic:
+		{
+			printf("$%s", AstCast<SAstTypePolymorphic>(pAst)->pChzName);
+		}
+		break;
+
+	case ASTK_TypeVararg:
+		{
+			printf("..");
 		}
 		break;
 
 	default:
 		ASSERTCHZ(false, "Unhandled type in inline printer %s (%d)", PchzFromAstk(pAst->astk), pAst->astk);
 		break;
-	}
-}
-
-void PrintType(const SAstType * pAtype)
-{
-    switch (pAtype->asttypek) 
-    {
-	case ASTTYPEK_Identifier:
-		{
-			auto pAtypeident = static_cast<const SAstTypeIdentifier *>(pAtype);
-			printf("%s", pAtypeident->pChzName);
-		}
-		break;
-
-	case ASTTYPEK_Pointer:
-		{
-			printf("* ");
-			PrintType(static_cast<const SAstTypePointer *>(pAtype)->pAtypeInner);
-		}
-		break;
-
-	case ASTTYPEK_Array:
-		{
-			auto pAtypearray = static_cast<const SAstTypeArray *>(pAtype);
-			if (pAtypearray->fDynamicallySized)
-			{
-				printf("[..]");
-			}
-			else
-			{
-				printf("[");
-				if (pAtypearray->pAstSize)
-					PrintSimpleInlineAst(pAtypearray->pAstSize);
-				printf("] ");
-			}
-			PrintType(static_cast<const SAstTypeArray *>(pAtype)->pAtypeInner);
-		}
-		break;
-
-	case ASTTYPEK_Namespace:
-		{
-			auto pAtypens = static_cast<const SAstTypeNamespace *>(pAtype);
-			printf("%s.", pAtypens->pChzNamespace);
-			PrintType(pAtypens->pAtypeInner);
-		}
-		break;
-
-    default:
-    	ASSERT(false);
-        break;
     }
 }
 
 void PrintAst(int cScope, const SAst * pAst);
 
-void PrintDeclaration(int cScopeValue, const SAstDeclaration & adecl)
+void PrintDeclaration(int cScopeValue, const SDeclaration & decl)
 {
-	printf("%*s%s", cScopeValue * 2, "", (adecl.fUsing) ? "using " : "");
-	if (adecl.pChzName)
-		printf("%s :", adecl.pChzName);
+	printf("%*s%s", cScopeValue * 2, "", (decl.fUsing) ? "using " : "");
+	if (decl.pChzName)
+		printf("%s :", decl.pChzName);
 
-	if (adecl.pAtype)
+	if (decl.pAstType)
 	{
-		if (adecl.pChzName) 
+		if (decl.pChzName) 
 			printf(" ");
-		PrintType(adecl.pAtype);
+		PrintInlineAst(decl.pAstType);
 		printf(" ");
 	}
 
 	// BB (adrianb) Print AST on a new line? if it's got any complexity that'd be ugly.
-	if (adecl.pAstValue)
+	if (decl.pAstValue)
 	{
-		printf("%s\n", adecl.fVariable ? "=" : ":");
-		PrintAst(cScopeValue + 1, adecl.pAstValue);
+		printf("%s\n", decl.fIsConstant ? ":" : "=");
+		PrintAst(cScopeValue + 1, decl.pAstValue);
 	}
 	else
 	{
@@ -2939,6 +3320,11 @@ void PrintAst(int cScope, const SAst * pAst)
 		printf(": %s\n", (AstCast<SAstBoolLiteral>(pAst)->f) ? "true" : "false");
 		break;
 
+	case ASTK_Null:
+	case ASTK_UninitializedValue:
+		printf("\n");
+		break;
+
 	case ASTK_Block:
 		{
 			auto pAstblock = AstCast<SAstBlock>(pAst);
@@ -2962,10 +3348,10 @@ void PrintAst(int cScope, const SAst * pAst)
 		{
 			auto pAstop = AstCast<SAstOperator>(pAst);
 			printf(": %s\n", pAstop->pChzOp);
-			if (pAstop->pAstBefore)
-				PrintAst(cScope + 1, pAstop->pAstBefore);
-			ASSERT(pAstop->pAstAfter);
-			PrintAst(cScope + 1, pAstop->pAstAfter);
+			if (pAstop->pAstLeft)
+				PrintAst(cScope + 1, pAstop->pAstLeft);
+			ASSERT(pAstop->pAstRight);
+			PrintAst(cScope + 1, pAstop->pAstRight);
 		}
 		break;
 
@@ -3011,6 +3397,13 @@ void PrintAst(int cScope, const SAst * pAst)
 		}
 		break;
 
+	case ASTK_LoopControl:
+		{
+			auto pAstloopctrl = AstCast<SAstLoopControl>(pAst);
+			printf(": %s\n", pAstloopctrl->fContinue ? "continue" : "break");
+		}
+		break;
+
 	case ASTK_Using:
 		{
 			auto pAstusing = AstCast<SAstUsing>(pAst);
@@ -3023,7 +3416,10 @@ void PrintAst(int cScope, const SAst * pAst)
 		{
 			auto pAstcast = AstCast<SAstCast>(pAst);
 			printf(": ");
-			PrintType(pAstcast->pAtype);
+            if (pAstcast->fIsAuto)
+                printf("auto");
+            else
+                PrintInlineAst(pAstcast->pAstType);
 			printf("\n%*sexpression:\n", cChSpace + 1, "");
 			PrintAst(cScope + 1, pAstcast->pAstExpr);
 		}
@@ -3033,7 +3429,7 @@ void PrintAst(int cScope, const SAst * pAst)
 		{
 			auto pAstnew = AstCast<SAstNew>(pAst);
 			printf(": ");
-			PrintType(pAstnew->pAtype);
+			PrintInlineAst(pAstnew->pAstType);
 			printf("\n");
 		}
 		break;
@@ -3056,6 +3452,21 @@ void PrintAst(int cScope, const SAst * pAst)
 		{
 			printf("\n");
 			PrintAst(cScope + 1, AstCast<SAstDefer>(pAst)->pAstStmt);
+		}
+		break;
+
+	case ASTK_Inline:
+		{
+			printf(" ");
+			PrintAst(cScope + 1, AstCast<SAstInline>(pAst)->pAstExpr);
+		}
+		break;
+
+	case ASTK_PushContext:
+		{
+			auto pAstpushctx = AstCast<SAstPushContext>(pAst);
+			printf(": %s\n", pAstpushctx->pChzContext);
+			PrintAst(cScope + 1, pAstpushctx->pAstblock);
 		}
 		break;
 
@@ -3099,21 +3510,48 @@ void PrintAst(int cScope, const SAst * pAst)
 	case ASTK_DeclareSingle:
 		{
 			printf("\n");
-			PrintDeclaration(cScope + 1, AstCast<SAstDeclareSingle>(pAst)->adecl);
+			PrintDeclaration(cScope + 1, AstCast<SAstDeclareSingle>(pAst)->decl);
 		}
 		break;
 
 	case ASTK_DeclareMulti:
 		{
-			auto pAstdeclmul = AstCast<SAstDeclareMulti>(pAst);
-			printf(": variables: ");
-			for (int iIdent = 0; iIdent < pAstdeclmul->aryIdent.c; ++iIdent)
+			auto pAstdecmul = AstCast<SAstDeclareMulti>(pAst);
+			printf(": ");
+			for (int iDecl = 0; iDecl < pAstdecmul->aryDecl.c; ++iDecl)
 			{
-				printf("%s%s", (iIdent > 0) ? ", " : "", pAstdeclmul->aryIdent[iIdent].pChzName);
+				printf("%s%s", (iDecl > 0) ? ", " : "", pAstdecmul->aryDecl[iDecl].pChzName);
 			}
-			//printf("\n%*sexpression:\n", cChSpace + 1, "");
-			printf("\n");
-			PrintAst(cScope + 1, pAstdeclmul->pAstValue);
+			
+			if (pAstdecmul->pAstType)
+			{
+				printf(" : ");
+				PrintInlineAst(pAstdecmul->pAstType);
+				if (pAstdecmul->pAstValue)
+				{
+					printf(" =\n");
+					PrintAst(cScope + 1, pAstdecmul->pAstValue);
+				}
+			}
+			else
+			{
+				printf(" %s\n", pAstdecmul->aryDecl[0].fIsConstant ? "::" : ":=");
+				PrintAst(cScope + 1, pAstdecmul->pAstValue);
+			}
+		}
+		break;
+
+	case ASTK_AssignMulti:
+		{
+			auto pAstassignmul = AstCast<SAstAssignMulti>(pAst);
+			printf(": ");
+			for (int ipChz = 0; ipChz < pAstassignmul->arypChzName.c; ++ipChz)
+			{
+				printf("%s%s", (ipChz > 0) ? ", " : "", pAstassignmul->arypChzName[ipChz]);
+			}
+			
+			printf(" =\n");
+			PrintAst(cScope + 1, pAstassignmul->pAstValue);
 		}
 		break;
 
@@ -3121,9 +3559,9 @@ void PrintAst(int cScope, const SAst * pAst)
 		{
 			auto pAststruct = AstCast<SAstStruct>(pAst);
 			printf(": %s\n", pAststruct->pChzName);
-			for (auto adecl : pAststruct->aryAdecl)
+			for (auto pAst : pAststruct->arypAstDecl)
 			{
-				PrintDeclaration(cScope + 1, adecl);
+				PrintAst(cScope + 1, pAst);
 			}
 		}
 		break;
@@ -3132,10 +3570,10 @@ void PrintAst(int cScope, const SAst * pAst)
 		{
 			auto pAstenum = AstCast<SAstEnum>(pAst);
 			printf(": %s", pAstenum->pChzName);
-			if (pAstenum->pAtypeInternal)
+			if (pAstenum->pAstTypeInternal)
 			{
 				printf(" ");
-				PrintType(pAstenum->pAtypeInternal);
+				PrintInlineAst(pAstenum->pAstTypeInternal);
 			}
 			printf("\n");
 
@@ -3145,7 +3583,7 @@ void PrintAst(int cScope, const SAst * pAst)
 				if (value.pAstValue)
 				{
 					printf(" : ");
-					PrintSimpleInlineAst(value.pAstValue);
+					PrintInlineAst(value.pAstValue);
 				}
 				printf("\n");
 			}
@@ -3157,25 +3595,48 @@ void PrintAst(int cScope, const SAst * pAst)
 			auto pAstproc = AstCast<SAstProcedure>(pAst);
 			printf(": %s%s %s\n", pAstproc->pChzName, pAstproc->fIsForeign ? " #foreign" : "", 
 				   pAstproc->pChzForeign ? pAstproc->pChzForeign : "");
-			if (pAstproc->aryAdeclArg.c)
+			if (pAstproc->aryDeclArg.c)
 			{
 				printf("%*sargs:\n", cChSpace + 1, "");
-				for (int iAdecl = 0; iAdecl < pAstproc->aryAdeclArg.c; ++iAdecl)
+				for (int iDecl = 0; iDecl < pAstproc->aryDeclArg.c; ++iDecl)
 				{
-					PrintDeclaration(cScope + 1, pAstproc->aryAdeclArg[iAdecl]);
+					PrintDeclaration(cScope + 1, pAstproc->aryDeclArg[iDecl]);
 				}
 			}
 
-			if (pAstproc->aryAdeclRet.c)
+			if (pAstproc->aryDeclRet.c)
 			{
 				printf("%*sreturns:\n", cChSpace + 1, "");
-				for (int iAdecl = 0; iAdecl < pAstproc->aryAdeclRet.c; ++iAdecl)
+				for (int iDecl = 0; iDecl < pAstproc->aryDeclRet.c; ++iDecl)
 				{
-					PrintDeclaration(cScope + 1, pAstproc->aryAdeclRet[iAdecl]);
+					PrintDeclaration(cScope + 1, pAstproc->aryDeclRet[iDecl]);
 				}
 			}
 
 			PrintAst(cScope + 1, pAstproc->pAstblock);
+		}
+		break;
+
+	case ASTK_TypeProcedure:
+		{
+			auto pAtypeproc = AstCast<SAstTypeProcedure>(pAst);
+			printf("(");
+			for (int iDecl : IterCount(pAtypeproc->aryDeclArg.c))
+			{
+				printf("%s", (iDecl >= 0) ? ", " : "");
+				PrintInlineDeclaration(pAtypeproc->aryDeclArg[iDecl]);
+			}
+			printf(")");
+
+			if (pAtypeproc->aryDeclRet.c > 0)
+			{
+				printf(" -> ");
+				for (int iDecl : IterCount(pAtypeproc->aryDeclRet.c))
+				{
+					printf("%s", (iDecl >= 0) ? ", " : "");
+					PrintInlineDeclaration(pAtypeproc->aryDeclRet[iDecl]);
+				}
+			}
 		}
 		break;
 
@@ -3186,6 +3647,10 @@ void PrintAst(int cScope, const SAst * pAst)
 	case ASTK_RunDirective:
 		printf("\n");
 		PrintAst(cScope + 1, AstCast<SAstRunDirective>(pAst)->pAstExpr);
+		break;
+
+	case ASTK_ForeignLibraryDirective:
+		printf("\n");
 		break;
 
 	default:
@@ -3236,7 +3701,6 @@ const char * PchzFromTypek(TYPEK typek)
 	return s_mpTypekPchz[typek];
 }
 
-
 struct SType
 {
 	TYPEK typek;
@@ -3256,7 +3720,7 @@ struct STypeFloat : public SType
 
 struct STypePointer : public SType
 {
-	SType * pTypePointedTo;
+	const SType * pTypePointedTo;
 	bool fSoa;				// BB (adrianb) Extend this to: -1 means no SOA. 0 means no size limit. >0 is AOSOA of that chunk size.
 };
 
@@ -3267,7 +3731,7 @@ struct STypeArray : public SType
 
 	bool fSoa;				// BB (adrianb) Extend this to: -1 means no SOA. 0 means no size limit. >0 is AOSOA of that chunk size.
 
-    SType * pTypeElement;
+    const SType * pTypeElement;
 };
 
 struct STypeProcedure : public SType
@@ -3302,8 +3766,8 @@ struct STypeStruct : public SType
 
 struct STypeEnum : public SType
 {
-	SType * pTypeInternal;
-	STypeStruct * pTypestructForEnum;
+	const SType * pTypeInternal;
+	const STypeStruct * pTypestructForEnum;
 };
 
 void PrintType(const SType * pType)
@@ -3565,7 +4029,7 @@ T * PtAlloc(SPagedAlloc * pPagealloc, int cT = 1)
 }
 
 template <class T>
-T * PtClone(SPagedAlloc * pPagealloc, const T * aTIn, int cT)
+T * PtClone(SPagedAlloc * pPagealloc, const T * aTIn, int cT = 1)
 {
 	T * aT = PtAlloc<T>(pPagealloc, cT);
 	memcpy(aT, aTIn, cT * sizeof(T));
@@ -3818,41 +4282,6 @@ struct SFunction // tag = func
 	SArray<int> aryiBytecodeLabel;
 };
 
-enum DECLK
-{
-	DECLK_Type,
-	DECLK_StackVariable,
-	DECLK_Function,
-	DECLK_GlobalVariable,
-
-	DECLK_Max
-};
-
-struct SDeclaration
-{
-	DECLK declk;
-	const char * pChzName;
-	const SType * pType;
-
-	union
-	{
-		struct
-		{
-			int iB;
-		} stack;
-
-		struct
-		{
-			SFunction * pFunc;
-		} function;
-
-		struct
-		{
-			int iB;
-		} global;
-	};
-};
-
 struct SFuncContext
 {
 	SFunction * pFuncCur;
@@ -3863,83 +4292,142 @@ struct SFuncContext
 	int iBStack;
 	int iDeclFuncMic;
 };
+#endif
 
-// BB (adrianb) Combine parse and compile phases and output bytecode directly?
-//  Could do a second pass to uniquify types, but then would have use general equality
-//  during compile.  
-// BB (adrianb) Could flatten structs and functions to global level?  The handling 
-//  recursive types would be easy.
+// BB (adrianb) Modules can only see stuff in things they #import? 
+//  Fixes the overloading issue also potentially adds some separate compilation?
+
+struct SNamespace
+{
+	SArray<SDeclaration *> arypDecl;
+
+	SNamespace * pNamespaceParent;
+	bool fIsParentConstantOnly; // Local scopes have non-constant namespace inheritance everything else is constant only
+};
+
+// Each identifier AST needs to know what namespace it belongs to allow resolution during type checking.
 
 struct SCompiler // tag = compiler
 {
 	SPagedAlloc pagealloc;			// Non-freeing linear allocator
-	SSet<const SType *> setpType;	// Type uniquification
+	SSet<const SType *> setpType;	// Unique types
 
-	SArray<SDeclaration> aryDecl; 	// Current namespace
+	SNamespace namespaceRoot;
+	SArray<SDeclaration *> arypDeclProgress; // Current stack of declaration evaluation
+	//SArray<uint8_t> aryBGlobal;
 
-	SArray<uint8_t> aryBGlobal;
-
-	SFuncContext funcctx;
+	//SFuncContext funcctx;
 };
 
-const SType * PtypeEnsure(SCompiler * pCompiler, const SType & type)
+template <class T>
+T * PtypeClone(SCompiler * pCompiler, const T * pTIn, SType ** ppType)
 {
-	uint32_t hv = HvFromType(type);
-    
-    const SType * const * ppType = PtLookupImpl(&pCompiler->setpType, hv, type);
-    
-	if (ppType)
-		return *ppType;
+	T * pT = PtAlloc<T>(&pCompiler->pagealloc);
+	memcpy(pT, pTIn, sizeof(T));
+	*ppType = pT;
+	return pT;
+}
 
-	SType * pType = PtAlloc<SType>(&pCompiler->pagealloc);
+void SetType(SCompiler * pCompiler, const SType * pType)
+{
+	// BB (adrianb) Duplicating Hv calculation for PtypeEnsure.
 
-	*pType = type;
-	switch (type.typek)
+	uint32_t hv = HvFromType(*pType);
+
+	if (PtLookupImpl(&pCompiler->setpType, hv, *pType))
 	{
-	case TYPEK_Bool:
-	case TYPEK_Int:
-	case TYPEK_Float:
-	case TYPEK_String:
-	case TYPEK_Void:
-	case TYPEK_Pointer:
-		break;
-
-	case TYPEK_Procedure:
-		{
-			int cpTypeArg = type.function.cpTypeArg;
-			pType->function.apTypeArg = PtClone<const SType *>(&pCompiler->pagealloc, type.function.apTypeArg, cpTypeArg);
-			pType->function.apChzArg = PtClone<const char *>(&pCompiler->pagealloc, type.function.apChzArg, cpTypeArg);
-		}
-		break;
-
-	default:
-		ASSERT(false);
-		break;
+		PrintType(pType);
+		fprintf(stderr, "Duplicate type added to compiler, compiler needs to detect this earlier.\n");
+		exit(1);
 	}
 
 	EnsureCount(&pCompiler->setpType, pCompiler->setpType.c + 1);
 
 	AddImpl(&pCompiler->setpType, hv, static_cast<const SType *>(pType));
+}
+
+const SType * PtypeEnsure(SCompiler * pCompiler, const SType * const pTypeTry)
+{
+	uint32_t hv = HvFromType(*pTypeTry);
+	const SType * const * ppType = PtLookupImpl(&pCompiler->setpType, hv, *pTypeTry);
+    
+	if (ppType)
+		return *ppType;
+
+	// BB (adrianb) Don't need to inter sub-types?
+
+	SType * pType = nullptr;
+	switch (pTypeTry->typek)
+	{
+	case TYPEK_Void:
+	case TYPEK_Bool:
+	case TYPEK_String:
+	case TYPEK_Null:
+	case TYPEK_Any:
+		PtypeClone(pCompiler, pTypeTry, &pType);
+		break;
+
+	case TYPEK_Int:
+		PtypeClone(pCompiler, static_cast<const STypeInt *>(pTypeTry), &pType);
+		break;
+
+	case TYPEK_Float:
+		PtypeClone(pCompiler, static_cast<const STypeFloat *>(pTypeTry), &pType);
+		break;
+
+	case TYPEK_Pointer:
+		{
+			auto pTypepointer = PtypeClone(pCompiler, static_cast<const STypePointer *>(pTypeTry), &pType);
+			pTypepointer->pTypePointedTo = PtypeEnsure(pCompiler, pTypepointer->pTypePointedTo);
+		}
+		break;
+
+	case TYPEK_Array:
+		{
+			auto pTypearray = PtypeClone(pCompiler, static_cast<const STypeArray *>(pTypeTry), &pType);
+			pTypearray->pTypeElement = PtypeEnsure(pCompiler, pTypearray->pTypeElement);
+		}
+		break;
+
+	case TYPEK_Procedure:
+		{
+			auto pTypeproc = PtypeClone(pCompiler, static_cast<const STypeProcedure *>(pTypeTry), &pType);
+			pTypeproc->apTypeArg = PtClone<const SType *>(&pCompiler->pagealloc, pTypeproc->apTypeArg, pTypeproc->cpTypeArg);
+			pTypeproc->apTypeRet = PtClone<const SType *>(&pCompiler->pagealloc, pTypeproc->apTypeRet, pTypeproc->cpTypeRet);
+			for (int ipType : IterCount(pTypeproc->cpTypeArg))
+			{
+				pTypeproc->apTypeArg[ipType] = PtypeEnsure(pCompiler, pTypeproc->apTypeArg[ipType]);
+			}
+			for (int ipType : IterCount(pTypeproc->cpTypeRet))
+			{
+				pTypeproc->apTypeRet[ipType] = PtypeEnsure(pCompiler, pTypeproc->apTypeRet[ipType]);
+			}
+		}
+		break;
+
+	default:
+		ASSERTCHZ(false, "Don't support uniquifying typek %d", pTypeTry->typek);
+		break;
+	}
+
+	SetType(pCompiler, pType);
 
 	return pType;
 }
 
-const SDeclaration * PdeclLookup(SCompiler * pCompiler, const char * pChz)
+#if 0
+
+void ResolveName(SCompiler * pCompiler, SNamespace * pNamespace, const char * pChz, bool fConstantOnly)
 {
-	// BB (adrianb) Use a hash instead?
+	// BB (adrianb) Use a hash instead.  Would allow us to check that we don't collide with parent names multiple times.
 
-	for (int iDecl = 0; iDecl < pCompiler->aryDecl.c; ++iDecl)
+	for (auto pDecl : pNamespace->arypDecl)
 	{
-		const SDeclaration & decl = pCompiler->aryDecl.a[iDecl];
-
-		// Skip any non-globally relevant scopes
-		
-		if (decl.declk == DECLK_StackVariable && iDecl < pCompiler->funcctx.iDeclFuncMic)
-			continue;
-
-		if (strcmp(decl.pChzName, pChz) == 0)
-			return &decl;
+		if (strcmp(pDecl->pChzName, pChz) == 0)
+			return pDecl;
 	}
+
+	// TODO look at parent scopes for constant declarations (including functions and structs)
 
 	return nullptr;
 }
@@ -3951,7 +4439,33 @@ const SType * PtypeLookupByName(SCompiler * pCompiler, const char * pChz)
 	return (pDecl && pDecl->declk == DECLK_Type) ? pDecl->pType : nullptr;
 }
 
-const SType * PtypeEnsure(SCompiler * pCompiler, SAst * pAst)
+void TypeCheck(SCompiler * pCompiler, SDeclaration * pDecl)
+{
+	for (int ipDecl = 0; ipDecl < pCompiler->arypDeclProgress.c; ++ipDecl)
+	{
+		if (pCompiler->arypDeclProgress[ipDecl] != pDecl)
+			continue;
+
+		fprintf(stderr, "Loop in type checking:\n");
+
+		ShowErr(...);
+	}
+
+	*PtAppendNew(&pCopiler->arypDeclProgress) = pDecl;
+
+	SAst * pAstType;	// Optional explicit type (though one or more of these must be set)
+	SAst * pAstValue;	// Optional initial value
+	SAst * pAstMulti;	// Optional Multi declaration needs whole thing resolved at once
+	bool fUsing;
+	bool fIsConstant;
+
+	SType * pType;		// Resolved during type checking
+
+	ASSERT(Tail(&pCopiler->arypDeclProgress) == pDecl);
+	Pop(&pCompiler->arypDeclProgress);
+}
+
+void TypeCheck(SCompiler * pCompiler, SAst * pAst)
 {
 	switch (pAst->astk)
 	{
@@ -6600,19 +7114,12 @@ int main(int cpChzArg, const char * apChzArg[])
 	}
 
 	const char * pChzFile = apChzArg[1];
-	const char * pChzContents = PchzLoadWholeFile(pChzFile);
-	if (pChzContents == nullptr)
-    {
-        printf("why couldn't we read the file");
-		return -1;
-    }
 
+    SArray<SModule> aryModule = {};
 	SParser parser;
 	Init(&parser);
-	StartNewFile(&parser, pChzFile, pChzContents);
-	SAst * pAst = PastParseRoot(&parser);
-
-	PrintAst(0, pAst);
+	AddFile(&parser, pChzFile, &aryModule);
+	ParseAll(&parser, &aryModule);
 
 	// Test libffi
 
@@ -6706,7 +7213,16 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
-	- Type checking.  Translate AST with types ala JBLOW's solution?  Or do this as part of byte code generation?
+	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN
+	- Type checking.  Translate AST with types ala JBLOW's solution?
 	- Generate/execute byte code.  Foreign functions work pretty easily with FFI.
 	- Generate executable.  Translate to C or to LLVM?
+	- Expose typed compiler AST to compile time run procedures ala BANANAS demo.
+
+Problems:
+	- Procedure ambiguity
+		- Arguments vs multiple return values: (func: (A,B)->B, name: A) {...} 
+		- Determine if a definition is intended to use parentheses or be a function definition need to peek 2+ more operators
+			- x :: (a + b)
+			- y :: (a: int) {}
 #endif

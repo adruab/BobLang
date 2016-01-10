@@ -1,4 +1,5 @@
 
-do_nothing :: () 
+CLoop :: () -> float
 {
+	return 5;
 }

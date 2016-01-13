@@ -1,5 +1,5 @@
 
-CLoop :: () -> float
+CLoop :: () -> s16
 {
 	return 5;
 }

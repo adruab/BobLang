@@ -10,20 +10,28 @@ REPEATING :: 0x1;
 //file := cast (*Compiler_Message_File) message;
 #import "test2.jtoy";
 
-//Vector2 :: struct
-//{
-//    x : float;
-//    y : float;
-//};
+Vector2 :: struct
+{
+    x : float;
+    y : float;
+};
 
-//printf :: (format : * char, ..) -> int #foreign;
+printf :: (format : * char, ..) -> int #foreign;
 
 main :: ()
 {
 	i := 0;
-//    c := CLoop();
-	
-//	while i < c printf("\"i\" = %d\n", i);
+    c := CLoop();
+    a :: 2;
+    b := 900;
 
-//	return;
+    // BB (adrianb) Should error on i < c because types don't match...
+    
+	while i < c 
+    {
+        printf("\"i\" = %d\n", a + b + -i);
+        ++i;
+    }
+
+	return;
 }

@@ -44,6 +44,18 @@
 //     ??? Recursion can include typecheck, code gen and compile time execution.
 //  4. Seed the list with unresolved top level functions.
 
+// Some basic typedefs
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+
 #if WIN32
 #define BREAK_ALWAYS() __debugbreak()
 #define PUSH_MSVC_WARNING_DISABLE(n) \
@@ -76,6 +88,12 @@
 
 #define ClearStruct(p) memset(p, 0, sizeof(*p))
 #define DIM(a) (sizeof(a)/sizeof(a[0]))
+
+template <typename T>
+T min (T a, T b)
+{
+	return (b < a) ? b : a;
+}
 
 struct SIntIter
 {
@@ -3365,10 +3383,10 @@ void PrintEscapedString(const SPrintFuncImpl & print, const char * pChz)
 	}
 }
 
-void PrintType(SAstCtx * pAcx, const SType * pType);
-inline void PrintType(SAstCtx * pAcx, STypeId tid)
+void PrintSchemeType(SAstCtx * pAcx, const SType * pType);
+inline void PrintSchemeType(SAstCtx * pAcx, STypeId tid)
 {
-	PrintType(pAcx, tid.pType);
+	PrintSchemeType(pAcx, tid.pType);
 }
 
 void PrintSchemeAst(SAstCtx * pAcx, const SAst * pAst)
@@ -3481,13 +3499,13 @@ void PrintSchemeAst(SAstCtx * pAcx, const SAst * pAst)
 		case ASTK_TypeVararg:
 		case ASTK_ForeignLibraryDirective:
 			pAcx->fPrintedAnything = false;
-			PrintType(pAcx, pAst->tid);
+			PrintSchemeType(pAcx, pAst->tid);
 			break;
 
 		case ASTK_Operator:
 			{
 				auto pAstop = PastCast<SAstOperator>(pAst);
-				PrintType(pAcx, pAstop->tid);
+				PrintSchemeType(pAcx, pAstop->tid);
 				PrintSchemeAst(pAcx, pAstop->pAstLeft);
 				PrintSchemeAst(pAcx, pAstop->pAstRight);
 				print(")");
@@ -3506,7 +3524,7 @@ LNested:
 	print("(");
 	print("%s", PchzFromAstk(pAst->astk));
 	if (fPrintType)
-		PrintType(pAcx, pAst->tid);
+		PrintSchemeType(pAcx, pAst->tid);
 
 	pAcx->cScope += 1;
 
@@ -3939,8 +3957,16 @@ enum TYPEK
 {
 	TYPEK_Void,
 	TYPEK_Bool,
-	TYPEK_Int,
+	TYPEK_S8,
+	TYPEK_S16,
+	TYPEK_S32,
+	TYPEK_S64,
+	TYPEK_U8,
+	TYPEK_U16,
+	TYPEK_U32,
+	TYPEK_U64,
 	TYPEK_Float,
+	TYPEK_Double,
 	TYPEK_String,
 	TYPEK_Pointer,
 	TYPEK_Array,
@@ -3953,7 +3979,10 @@ enum TYPEK
 	TYPEK_Vararg,
 	//TYPEK_PolymorphicVariable, 
 
-	TYPEK_Max	
+	TYPEK_Max,
+
+	TYPEK_IntMic = TYPEK_S8,
+	TYPEK_IntMac = TYPEK_U64 + 1,
 };
 
 const char * PchzFromTypek(TYPEK typek)
@@ -3962,8 +3991,16 @@ const char * PchzFromTypek(TYPEK typek)
 	{
 		"void",
 		"bool",
-		"int",
+		"s8",
+		"s16",
+		"s32",
+		"s64",
+		"u8",
+		"u16",
+		"u32",
+		"u64",
 		"float",
+		"double",
 		"string",
 		"pointer",
 		"array",
@@ -4010,19 +4047,6 @@ inline uint32_t HvFromKey(const STypeId & tid)
 {
 	return HvFromKey(reinterpret_cast<intptr_t>(tid.pType));
 }
-
-struct STypeInt : public SType
-{
-	static const TYPEK s_typek = TYPEK_Int;
-	int cBit;
-	bool fSigned;
-};
-
-struct STypeFloat : public SType
-{
-	static const TYPEK s_typek = TYPEK_Float;
-	int cBit;
-};
 
 struct STypePointer : public SType
 {
@@ -4090,7 +4114,209 @@ struct STypeTypeOf : public SType
 	STypeId tid;
 };
 
-void PrintType(SAstCtx * pAcx, const SType * pType)
+bool FIsBuiltinType(TYPEK typek)
+{
+	switch (typek)
+	{
+	case TYPEK_Void:
+	case TYPEK_Bool:
+	case TYPEK_String:
+	case TYPEK_Any:
+	case TYPEK_Null:
+	case TYPEK_S8:
+	case TYPEK_S16:
+	case TYPEK_S32:
+	case TYPEK_S64:
+	case TYPEK_U8:
+	case TYPEK_U16:
+	case TYPEK_U32:
+	case TYPEK_U64:
+	case TYPEK_Float:
+	case TYPEK_Double:
+	case TYPEK_Vararg:
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+bool FSigned(TYPEK typek)
+{
+	switch (typek)
+	{
+	case TYPEK_S8:
+	case TYPEK_S16:
+	case TYPEK_S32:
+	case TYPEK_S64:
+		return true;
+
+	case TYPEK_U8:
+	case TYPEK_U16:
+	case TYPEK_U32:
+	case TYPEK_U64:
+		return false;
+
+	default:
+		ASSERT(false);
+		return false;
+	}
+}
+
+int CBit(TYPEK typek)
+{
+	switch (typek)
+	{
+	case TYPEK_S8:
+	case TYPEK_U8:
+		return 8;
+
+	case TYPEK_S16:
+	case TYPEK_U16:
+		return 16;
+
+	case TYPEK_S32:
+	case TYPEK_U32:
+		return 32;
+
+	case TYPEK_S64:
+	case TYPEK_U64:
+		return 64;
+
+	case TYPEK_Float:
+		return 32;
+
+	case TYPEK_Double:
+		return 64;
+
+	default:
+		ASSERT(false);
+		return 0;
+	}
+}
+
+struct STypeString
+{
+	// BB (adrianb) Having a ctor would be nice for this case.
+	char aChz[64];
+	uint32_t cCh;
+};
+
+void Print(STypeString * pTypestr, const char * pChzFormat, ...)
+{
+	if (pTypestr->cCh >= DIM(pTypestr->aChz))
+		return;
+
+	va_list varg;
+	va_start(varg, pChzFormat);
+
+	int cCh = vsnprintf(
+				pTypestr->aChz + pTypestr->cCh, 
+				DIM(pTypestr->aChz) - pTypestr->cCh,
+				pChzFormat,
+				varg);
+
+	pTypestr->cCh = min(size_t(pTypestr->cCh + cCh), DIM(pTypestr->aChz));
+	pTypestr->aChz[DIM(pTypestr->aChz) - 1] = 0;
+
+	va_end(varg);
+}
+
+void PrintFriendlyType(const SType * pType, STypeString * pTypestr)
+{
+	if (!pType)
+	{
+		Print(pTypestr, "<no-type>");
+		return;
+	}
+
+	TYPEK typek = pType->typek;
+	if (FIsBuiltinType(typek))
+	{
+		Print(pTypestr, "%s", PchzFromTypek(typek));
+		return;
+	}
+
+	switch (typek)
+	{
+	case TYPEK_Pointer:
+		{
+			auto pTypeptr = PtypeCast<STypePointer>(pType);
+			Print(pTypestr, "* %s", (pTypeptr->fSoa) ? "SOA ": "");
+			PrintFriendlyType(pTypeptr->tidPointedTo.pType, pTypestr);
+			return;
+		}
+
+	case TYPEK_Array:
+		{
+			auto pTypearray = PtypeCast<STypeArray>(pType);
+
+			if (pTypearray->fDynamicallySized)
+				Print(pTypestr, "[..] ");
+			else if (pTypearray->cSizeFixed >= 0)
+				Print(pTypestr, "[%d] ", pTypearray->cSizeFixed);
+			else
+				Print(pTypestr, "[] ");
+
+			if (pTypearray->fSoa)
+				Print(pTypestr, "SOA ");
+
+			PrintFriendlyType(pTypearray->tidElement.pType, pTypestr);
+			return;
+		}
+
+	case TYPEK_Procedure:
+		{
+			auto pTypeproc = PtypeCast<STypeProcedure>(pType);
+
+			Print(pTypestr, "(");
+			for (int iTid : IterCount(pTypeproc->cTidArg))
+			{
+				if (iTid > 0)
+					Print(pTypestr, ", ");
+				PrintFriendlyType(pTypeproc->aTidArg[iTid].pType, pTypestr);
+			}
+			Print(pTypestr, ")");
+
+			if (pTypeproc->cTidRet > 0)
+			{
+				Print(pTypestr, " -> ");
+				for (int iTid : IterCount(pTypeproc->cTidRet))
+				{
+					if (iTid > 0)
+						Print(pTypestr, ", ");
+					PrintFriendlyType(pTypeproc->aTidRet[iTid].pType, pTypestr);
+				}
+			}
+			return;
+		}
+
+	case TYPEK_Struct:
+		{
+			Print(pTypestr, "%s", PtypeCast<STypeStruct>(pType)->pChzName);
+			return;
+		}
+
+	case TYPEK_Enum:
+		{
+			PrintFriendlyType(PtypeCast<STypeEnum>(pType)->tidStructForEnum.pType, pTypestr);
+			return;
+		}
+
+	case TYPEK_TypeOf:
+		{
+			Print(pTypestr, "#type ");
+			PrintFriendlyType(PtypeCast<STypeTypeOf>(pType)->tid.pType, pTypestr);
+			return;
+		}
+
+	default:
+		ASSERTCHZ(false, "Can't print type %s(%d)", PchzFromTypek(typek), typek);
+		break;
+	}
+}
+
+void PrintSchemeType(SAstCtx * pAcx, const SType * pType)
 {
 	const SPrintFuncImpl & print = pAcx->print;
 
@@ -4117,17 +4343,23 @@ void PrintType(SAstCtx * pAcx, const SType * pType)
 		print("%s", PchzFromTypek(pType->typek));
 		break;
 
-	case TYPEK_Int:
+	case TYPEK_S8:
+	case TYPEK_S16:
+	case TYPEK_S32:
+	case TYPEK_S64:
+	case TYPEK_U8:
+	case TYPEK_U16:
+	case TYPEK_U32:
+	case TYPEK_U64:
 		{
-			const STypeInt * pTypeint = static_cast<const STypeInt *>(pType);
-			print("%s%d", (pTypeint->fSigned) ? "s" : "u", pTypeint->cBit);
+			print("%s%d", (FSigned(pType->typek)) ? "s" : "u", CBit(pType->typek));
 		}
 		break;
 
 	case TYPEK_Float:
+	case TYPEK_Double:
 		{
-			const STypeFloat * pTypeflt = static_cast<const STypeFloat *>(pType);
-			print("f%d", pTypeflt->cBit);
+			print("f%d", CBit(pType->typek));
 		}
 		break;
 
@@ -4176,7 +4408,7 @@ LNested:
 		{
 			auto pTypepointer = static_cast<const STypePointer *>(pType);
 			print("*%s", (pTypepointer->fSoa) ? " SOA" : "");
-			PrintType(pAcx, pTypepointer->tidPointedTo);
+			PrintSchemeType(pAcx, pTypepointer->tidPointedTo);
 		}
 		break;
 
@@ -4199,7 +4431,7 @@ LNested:
 			if (pTypearray->fSoa)
 				print(" SOA");
 
-			PrintType(pAcx, pTypearray->tidElement);
+			PrintSchemeType(pAcx, pTypearray->tidElement);
 		}
 		break;
 
@@ -4209,7 +4441,7 @@ LNested:
 			print("Proc");
 			for (int iTid = 0; iTid < pTypeproc->cTidArg; ++iTid)
 			{
-				PrintType(pAcx, pTypeproc->aTidArg[iTid]);
+				PrintSchemeType(pAcx, pTypeproc->aTidArg[iTid]);
 			}
 			
 			if (pTypeproc->cTidRet)
@@ -4217,7 +4449,7 @@ LNested:
 				print(" ->");
 				for (int iTid = 0; iTid < pTypeproc->cTidRet; ++iTid)
 				{
-					PrintType(pAcx, pTypeproc->aTidRet[iTid]);
+					PrintSchemeType(pAcx, pTypeproc->aTidRet[iTid]);
 				}
 			}
 		}
@@ -4227,7 +4459,7 @@ LNested:
 		{
 			// Distinguish type and not type?
 			print("Type");
-			PrintType(pAcx, static_cast<const STypeTypeOf *>(pType)->tid);
+			PrintSchemeType(pAcx, static_cast<const STypeTypeOf *>(pType)->tid);
 		}
 		break;
 
@@ -4247,30 +4479,11 @@ bool FAreSameType(const SType * pType0, const SType * pType1)
 	// BB (adrianb) Can we be sure dependent types are fully resolved?
 	//  If so just compare pointers for inner types.
 
-	switch (pType0->typek)
-	{
-	case TYPEK_Void:
-	case TYPEK_Bool:
-	case TYPEK_String:
-	case TYPEK_Any:
-	case TYPEK_Null:
+	if (FIsBuiltinType(pType0->typek))
 		return true;
 
-	case TYPEK_Int:
-		{
-			auto pTypeint0 = static_cast<const STypeInt *>(pType0);
-			auto pTypeint1 = static_cast<const STypeInt *>(pType1);
-			return pTypeint0->cBit == pTypeint1->cBit && 
-					pTypeint0->fSigned == pTypeint1->fSigned;
-		}
-
-	case TYPEK_Float:
-		{
-			auto pTypeflt0 = static_cast<const STypeFloat *>(pType0);
-			auto pTypeflt1 = static_cast<const STypeFloat *>(pType1);
-			return pTypeflt0->cBit == pTypeflt1->cBit;
-		}
-
+	switch (pType0->typek)
+	{
 	case TYPEK_Pointer:
 		{
 			auto pTypepointer0 = static_cast<const STypePointer *>(pType0);
@@ -4412,27 +4625,11 @@ uint32_t HvFromType(const SType & type)
 	// BB (adrianb) If internal types are already unique we could just hash their pointers (inconsistent hash order across runs).
 	// BB (adrianb) Better hash mechanism?
 
+	if (FIsBuiltinType(type.typek))
+		return hv;
+
 	switch (type.typek)
 	{
-	case TYPEK_Void:
-	case TYPEK_Bool:
-	case TYPEK_String:
-	case TYPEK_Any:
-	case TYPEK_Null:
-		break;
-
-	case TYPEK_Int:
-		{
-			auto pTypeint = static_cast<const STypeInt *>(&type);
-			hv = hv * 7901 + pTypeint->cBit;
-			hv = hv * 7901 + pTypeint->fSigned;
-		}
-		break;
-
-	case TYPEK_Float:
-		hv = hv * 7901 + static_cast<const STypeFloat *>(&type)->cBit;
-		break;
-
 	case TYPEK_Pointer:
 		{
 			auto pTypepointer = static_cast<const STypePointer *>(&type);
@@ -4516,7 +4713,7 @@ uint32_t HvFromType(const SType & type)
 		break;
 
 	default:
-		ASSERT(false);
+		ASSERTCHZ(false, "Unknown type %s(%d)", PchzFromTypek(type.typek), type.typek);
 		break;
 	}
 
@@ -4586,10 +4783,9 @@ void SetType(SWorkspace * pWork, STypeId tid)
 
 	if (PtLookupImpl(&pWork->setTid, hv, *tid.pType))
 	{
-		SAstCtx acx = {};
-		InitPrint(&acx.print, PrintFile, stderr);
-		PrintType(&acx, tid);
-		ASSERTCHZ(false, "Duplicate type added to compiler, compiler needs to detect this earlier.\n");
+		STypeString typestr = {};
+		PrintFriendlyType(tid.pType, &typestr);
+		ASSERTCHZ(false, "Duplicate type %s added to compiler, compiler needs to detect this earlier.\n", typestr.aChz);
 	}
 
 	EnsureCount(&pWork->setTid, pWork->setTid.c + 1);
@@ -4608,54 +4804,45 @@ STypeId TidEnsure(SWorkspace * pWork, const SType * const pTypeTry)
 	// BB (adrianb) Don't need to inter sub-types?
 
 	SType * pType = nullptr;
-	switch (pTypeTry->typek)
+
+	if (FIsBuiltinType(pTypeTry->typek))
 	{
-	case TYPEK_Void:
-	case TYPEK_Bool:
-	case TYPEK_String:
-	case TYPEK_Null:
-	case TYPEK_Any:
-    case TYPEK_Vararg:
 		PtypeClone(pWork, pTypeTry, &pType);
-		break;
-
-	case TYPEK_Int:
-		PtypeClone(pWork, static_cast<const STypeInt *>(pTypeTry), &pType);
-		break;
-
-	case TYPEK_Float:
-		PtypeClone(pWork, static_cast<const STypeFloat *>(pTypeTry), &pType);
-		break;
-
-	case TYPEK_Pointer:
+	}
+	else
+	{
+		switch (pTypeTry->typek)
 		{
-			PtypeClone(pWork, static_cast<const STypePointer *>(pTypeTry), &pType);
-		}
-		break;
+		case TYPEK_Pointer:
+			{
+				PtypeClone(pWork, static_cast<const STypePointer *>(pTypeTry), &pType);
+			}
+			break;
 
-	case TYPEK_Array:
-		{
-			PtypeClone(pWork, static_cast<const STypeArray *>(pTypeTry), &pType);
-		}
-		break;
+		case TYPEK_Array:
+			{
+				PtypeClone(pWork, static_cast<const STypeArray *>(pTypeTry), &pType);
+			}
+			break;
 
-	case TYPEK_Procedure:
-		{
-			auto pTypeproc = PtypeClone(pWork, static_cast<const STypeProcedure *>(pTypeTry), &pType);
-			pTypeproc->aTidArg = PtClone<STypeId>(&pWork->pagealloc, pTypeproc->aTidArg, pTypeproc->cTidArg);
-			pTypeproc->aTidRet = PtClone<STypeId>(&pWork->pagealloc, pTypeproc->aTidRet, pTypeproc->cTidRet);
-		}
-		break;
+		case TYPEK_Procedure:
+			{
+				auto pTypeproc = PtypeClone(pWork, static_cast<const STypeProcedure *>(pTypeTry), &pType);
+				pTypeproc->aTidArg = PtClone<STypeId>(&pWork->pagealloc, pTypeproc->aTidArg, pTypeproc->cTidArg);
+				pTypeproc->aTidRet = PtClone<STypeId>(&pWork->pagealloc, pTypeproc->aTidRet, pTypeproc->cTidRet);
+			}
+			break;
 
-	case TYPEK_TypeOf:
-		{
-			PtypeClone(pWork, static_cast<const STypeTypeOf *>(pTypeTry), &pType);
-		}
-		break;
+		case TYPEK_TypeOf:
+			{
+				PtypeClone(pWork, static_cast<const STypeTypeOf *>(pTypeTry), &pType);
+			}
+			break;
 
-	default:
-		ASSERTCHZ(false, "Don't support uniquifying typek %d", pTypeTry->typek);
-		break;
+		default:
+			ASSERTCHZ(false, "Don't support uniquifying typek %s(%d)", PchzFromTypek(pTypeTry->typek), pTypeTry->typek);
+			break;
+		}
 	}
 
 	STypeId tid = { pType };
@@ -4739,25 +4926,6 @@ void AddBuiltinType(SWorkspace * pWork, const char * pChzName, const SType & typ
 		*pTid = tid;
 }
 
-STypeInt TypeintCreate(int cBit, bool fSigned)
-{
-	STypeInt typeint = {};
-	typeint.typek = TYPEK_Int;
-	typeint.cBit = cBit;
-	typeint.fSigned = fSigned;
-	return typeint;
-}
-
-STypeFloat TypefloatCreate(int cBit)
-{
-	STypeFloat typefloat = {};
-	typefloat.typek = TYPEK_Float;
-	typefloat.cBit = cBit;
-	return typefloat;
-}
-
-
-
 void InitWorkspace(SWorkspace * pWork)
 {
 	ClearStruct(pWork);
@@ -4777,22 +4945,22 @@ void InitWorkspace(SWorkspace * pWork)
 	AddBuiltinType(pWork, "void", SType{TYPEK_Void}, &pWork->tidVoid);
 	AddBuiltinType(pWork, "bool", SType{TYPEK_Bool}, &pWork->tidBool);
 
-	AddBuiltinType(pWork, "s64", TypeintCreate(64, true));
-	AddBuiltinType(pWork, "u64", TypeintCreate(64, false));
-	AddBuiltinType(pWork, "s32", TypeintCreate(32, true));
-	AddBuiltinType(pWork, "u32", TypeintCreate(32, false));
-	AddBuiltinType(pWork, "s16", TypeintCreate(16, true));
-	AddBuiltinType(pWork, "u16", TypeintCreate(16, false));
-	AddBuiltinType(pWork, "s8", TypeintCreate(8, true));
-	AddBuiltinType(pWork, "u8", TypeintCreate(8, false));
+	AddBuiltinType(pWork, "s64", SType{TYPEK_S64});
+	AddBuiltinType(pWork, "u64", SType{TYPEK_U64});
+	AddBuiltinType(pWork, "s32", SType{TYPEK_S32});
+	AddBuiltinType(pWork, "u32", SType{TYPEK_U32});
+	AddBuiltinType(pWork, "s16", SType{TYPEK_S16});
+	AddBuiltinType(pWork, "u16", SType{TYPEK_U16});
+	AddBuiltinType(pWork, "s8", SType{TYPEK_S8});
+	AddBuiltinType(pWork, "u8", SType{TYPEK_U8});
 
-	AddBuiltinType(pWork, "int", TypeintCreate(32, true));
-	AddBuiltinType(pWork, "char", TypeintCreate(8, false));
+	AddBuiltinType(pWork, "int", SType{TYPEK_S32});
+	AddBuiltinType(pWork, "char", SType{TYPEK_U8});
 
-	AddBuiltinType(pWork, "float", TypefloatCreate(32));
-	AddBuiltinType(pWork, "double", TypefloatCreate(64));
-	AddBuiltinType(pWork, "f32", TypefloatCreate(32));
-	AddBuiltinType(pWork, "f64", TypefloatCreate(64));
+	AddBuiltinType(pWork, "float", SType{TYPEK_Float});
+	AddBuiltinType(pWork, "double", SType{TYPEK_Double});
+	AddBuiltinType(pWork, "f32", SType{TYPEK_Float});
+	AddBuiltinType(pWork, "f64", SType{TYPEK_Double});
 
 	// BB (adrianb) Just make these implicit structs? Or explicit structs?
 	AddBuiltinType(pWork, "string", SType{TYPEK_String});
@@ -5254,23 +5422,25 @@ STypeId TidWrapPointer(SWorkspace * pWork, STypeId tid)
 
 STypeId TidInferFromInt(SWorkspace * pWork, int64_t n)
 {
-	// BB (adrianb) Need some way to tell if this should be a u64.
+	// BB (adrianb) Need some way to tell if this should be a u64. Or unsigned types at all.
 
 	int64_t nAbs = (n > 0) ? n : -n;
-	int cBit;
+	TYPEK typek;
 	if (nAbs < (1ull << 8))
-		cBit = 8;
+		typek = TYPEK_S8;
 	else if (nAbs < (1ull << 16))
-		cBit = 16;
+		typek = TYPEK_S16;
 	else if (nAbs < (1ull << 32))
-		cBit = 32;
+		typek = TYPEK_S32;
 	else
-		cBit = 64;
+		typek = TYPEK_S64;
+
+	CASSERT(TYPEK_U8 - TYPEK_S8 == 4);
 
 	// BB (adrianb) Should we always be signed unless we have to be unsigned?
 	//  Could be unsigned unless negative.
 
-	return TidEnsure(pWork, TypeintCreate(cBit, true));
+	return TidEnsure(pWork, SType{typek});
 }
 
 STypeId TidFromLiteral(SWorkspace * pWork, const SLiteral & lit)
@@ -5280,170 +5450,373 @@ STypeId TidFromLiteral(SWorkspace * pWork, const SLiteral & lit)
 	{
 	case LITK_String: tid = TidEnsure(pWork, SType{TYPEK_String}); break;
 	case LITK_Int: tid = TidInferFromInt(pWork, lit.n); break;
-	case LITK_Float: tid = TidEnsure(pWork, TypefloatCreate(32)); break; // BB (adrianb) Any way to choose double?
+	case LITK_Float: tid = TidEnsure(pWork, SType{TYPEK_Float}); break; // BB (adrianb) Any way to choose double?
 	case LITK_Bool: tid = TidEnsure(pWork, SType{TYPEK_Bool});
 	default: ASSERT(false); break;
 	}
 	return tid;
 }
 
-void Coerce(SWorkspace * pWork, SAst ** ppAst, const STypeId & tid)
+void TryCoerceLit(SWorkspace * pWork, SAst * pAst)
 {
-	auto pAst = *ppAst;
-	if (pAst->tid == tid)
-		return;
-
-	auto pTypeFrom = pAst->tid.pType;
-	auto pTypeTo = tid.pType;
-
-	if (!pTypeFrom)
+	if (pAst->tid.pType == nullptr)
 	{
-		switch (pAst->astk)
+		if (pAst->astk != ASTK_Literal)
 		{
-		case ASTK_Literal:
+			ShowErr(pAst->errinfo, "Can't generate type for a non-literal");
+		}
+
+		pAst->tid = TidFromLiteral(pWork, PastCast<SAstLiteral>(pAst)->lit);
+	}
+}
+
+enum TFN 
+{
+	TFN_False = 0,
+	TFN_True = 1,
+
+	TFN_Nil = -1,
+};
+
+TFN TfnCanCoerce(SAst * pAst, TYPEK typek)
+{
+	if (pAst->astk == ASTK_Literal)
+	{
+		const SLiteral & lit = PastCast<SAstLiteral>(pAst)->lit;
+
+		switch(lit.litk)
+		{
+		case LITK_String:
+			if (typek == TYPEK_String)
+            {
+            	return TFN_True;
+            }
+            else if (typek == TYPEK_Pointer)
+            {
+            	// We may allow this for * u8
+
+            	return TFN_Nil;
+            }
+			break;
+
+		case LITK_Int:
 			{
-				auto pLit = &PastCast<SAstLiteral>(pAst)->lit;
-				switch(pLit->litk)
+				if (typek == TYPEK_S8 || typek == TYPEK_S16 ||
+					typek == TYPEK_S32 || typek == TYPEK_S64)
 				{
-				case LITK_String:
-					if (pTypeTo->typek == TYPEK_String)
-                    {
-                        pAst->tid = tid;
-                    }
-                    else if (pTypeTo->typek == TYPEK_Pointer)
-                    {
-                    	// Allowing literal to point to char * for easier C interop.
-
-                        auto pTypeptr = PtypeCast<STypePointer>(pTypeTo);
-
-                        // BB (adrianb) Do I care if it's SOA?
-
-                        auto pTypePointedTo = pTypeptr->tidPointedTo.pType;
-                        ASSERT(pTypePointedTo);
-
-                        if (!pTypeptr->fSoa && pTypePointedTo->typek == TYPEK_Int)
-                        {
-                        	auto pTypeint = PtypeCast<STypeInt>(pTypePointedTo);
-                        	if (!pTypeint->fSigned && pTypeint->cBit == 8)
-                        	{
-                        		pAst->tid = tid;
-                        	}
-                        }
-                    }
-					break;
-
-				case LITK_Int:
-					{
-						if (pTypeTo->typek == TYPEK_Int)
-						{
-							auto pTypeint = static_cast<const STypeInt *>(pTypeTo);
-							if (pTypeint->fSigned)
-							{
-								int64_t nPow2 = 1ll << (pTypeint->cBit - 1);
-								if (pLit->n < -nPow2 || pLit->n > nPow2 - 1)
-									break;
-							}
-							else
-							{
-								// BB (adrianb) Cover the u64 parse case?
-								uint64_t nMax = (1ull << pTypeint->cBit) - 1;
-								if (pLit->n < 0 || pLit->n > nMax)
-									break;
-							}
-
-							pAst->tid = tid;
-						}
-						else if (pTypeTo->typek == TYPEK_Float)
-						{
-							// BB (adrianb) Check and see if it will fit in a float
-
-							pLit->litk = LITK_Float;
-							pLit->g = static_cast<double>(pLit->n);
-							pAst->tid = tid;
-						}
-					}
-					break;
-
-				case LITK_Float:
-					{
-						// BB (adrianb) Just auto convert to float or double? Should we try and 
-						//  detect correct precision or just let user specify it?
-
-						if (pTypeTo->typek == TYPEK_Float)
-						{
-							pAst->tid = tid;
-						}
-					}
-					break;
-
-				default:
-					break;
+					int64_t nPow2 = 1ll << (CBit(typek) - 1);
+					return (lit.n >= -nPow2 && lit.n <= nPow2 - 1) ? TFN_True : TFN_False;
+				}
+				else if (typek == TYPEK_U8 || typek == TYPEK_U16 ||
+						 typek == TYPEK_U32 || typek == TYPEK_U64)
+				{
+					uint64_t nMax = (1ull << CBit(typek)) - 1;
+					return (lit.n >= 0 && lit.n <= nMax) ? TFN_True : TFN_False;
+				}
+				else if (typek == TYPEK_Float || typek == TYPEK_Double)
+				{
+					// Convert int literal to float
+					return TFN_True;
 				}
 			}
 			break;
 
-		case ASTK_Null:
-			if (pTypeTo->typek == TYPEK_Pointer)
+		case LITK_Float:
 			{
-				pAst->tid = tid;
+				// BB (adrianb) Just auto convert to float or double? Should we try and 
+				//  detect correct precision or just let user specify it?
+
+				return (typek == TYPEK_Float || typek == TYPEK_Double) ? TFN_True : TFN_False;
 			}
 			break;
 
-		case ASTK_UninitializedValue:
-			pAst->tid = tid; // Should we not set the type and allow it to continue?
-			return;
-
 		default:
-			ShowErr(pAst->errinfo, "Unexpected lack of type for coercion");
 			break;
 		}
 
-		// BB (adrianb) Print actual type.
-		if (pAst->tid.pType == nullptr)
-			ShowErr(pAst->errinfo, "Couldn't convert literal to type");
-
-		return;
+		return TFN_False;
 	}
-
-	// BB (adrianb) Literals could change types to accommodate.
-	// BB (adrianb) This is going to be a big function if we special case everything. 
-	//  Any more general way to look at it?
-
-	switch (pTypeFrom->typek)
+	else if (pAst->astk == ASTK_Null)
 	{
-	//case TYPEK_Void:
-	//TYPEK_Bool, To int allowed?
-	case TYPEK_Int: // To larger ints? Literals should auto convert in some cases?
-		break;
-	case TYPEK_Float: // To larger floats? Literals should auto convert?
-		break;
-	//TYPEK_String,
-	//TYPEK_Pointer, To void*?
-	//TYPEK_Array,
-	//TYPEK_Procedure, To other procedure pointers?
-	//TYPEK_Struct,
-	//case TYPEK_Null: Should be treated as a literal?
-	//TYPEK_Any,
-	//TYPEK_Enum, To combatible int types?
-	//TYPEK_TypeOf,
-	default:
-		break;
+		return (typek == TYPEK_Pointer) ? TFN_True : TFN_False;
+	}
+	else if (pAst->astk == ASTK_UninitializedValue)
+	{
+		// You can always leave something uninitialized
+		return TFN_True;
 	}
 
-	// BB (adrianb) Options:
+	// Allow coercing to larger integer type
+
+	ASSERT(pAst->tid.pType != nullptr);
+
+	TYPEK typekAst = pAst->tid.pType->typek;
+	
+	if (typekAst >= TYPEK_IntMic && typekAst < TYPEK_IntMac &&
+		typek >= TYPEK_IntMic && typek < TYPEK_IntMac)
+	{
+		// A signed type can only fit in an >= signed type
+
+		if (FSigned(typekAst))
+			return (FSigned(typek) && CBit(typek) >= CBit(typekAst)) ? TFN_True : TFN_False;
+		
+		// An unsigned type can fix in a >= unsigned type or > signed type
+
+		bool fCompatible = (!FSigned(typek)) ? CBit(typek) >= CBit(typekAst) : CBit(typek) > CBit(typekAst);
+		return (fCompatible) ? TFN_True : TFN_False;
+	}
+
+	// Don't know how to deal with this one
+
+	return TFN_Nil;
+}
+
+bool FCanCoerce(SAst * pAst, TYPEK typek)
+{
+	return TfnCanCoerce(pAst, typek) == TFN_True;
+}
+
+bool FCanCoerce(SAst * pAst, const STypeId & tidTo)
+{
+	// BB (adrianb) In most of these cases we can return false after knowing about this too
+
+	TFN tfn = TfnCanCoerce(pAst, tidTo.pType->typek);
+	if (tfn != TFN_Nil)
+		return tfn == TFN_True;
+
+	if (pAst->astk == ASTK_Literal)
+	{
+		auto pTypeTo = tidTo.pType;
+		const SLiteral & lit = PastCast<SAstLiteral>(pAst)->lit;
+		if (lit.litk == LITK_String && pTypeTo->typek == TYPEK_Pointer)
+		{
+			// Allowing literal to point to char * for easier C interop.
+
+			auto pTypeptr = PtypeCast<STypePointer>(pTypeTo);
+			auto pTypePointedTo = pTypeptr->tidPointedTo.pType;
+			ASSERT(pTypePointedTo);
+
+			// BB (adrianb) Do I care if it's SOA?
+
+    		return (!pTypeptr->fSoa && pTypePointedTo->typek == TYPEK_U8);
+    	}
+    }
+
+	// BB (adrianb) More conversions?
+	//  Non strict enum to builtin type
 	// + int to bigger int (same for u).
 	// + float to bigger float
 	//  Or stronger implicit coercion to bool if you're checking an if statement?
 
-	// BB (adrianb) Print conflicting types.
+	return tidTo == pAst->tid;
+}
 
-	ShowErr(pAst->errinfo, "Cannot convert types");
+void Coerce(SWorkspace * pWork, SAst ** ppAst, const STypeId & tid)
+{
+	auto pAst = *ppAst;
+	if (!FCanCoerce(pAst, tid))
+	{
+		// BB (adrianb) Print actual type!
+		ShowErr(pAst->errinfo, "Cannot convert to type");
+	}
+
+	auto pTypeTo = tid.pType;
+
+	switch (pAst->astk)
+	{
+	case ASTK_Literal:
+		{
+			auto pLit = &PastCast<SAstLiteral>(pAst)->lit;
+			if (pLit->litk == LITK_Int && (pTypeTo->typek == TYPEK_Float || pTypeTo->typek == TYPEK_Double))
+			{
+				pLit->litk = LITK_Float;
+				pLit->g = static_cast<double>(pLit->n);
+			}
+
+			pAst->tid = tid;
+			return;
+		}
+
+	case ASTK_Null:
+		{
+			pAst->tid = tid;
+			return;
+		}
+
+	case ASTK_UninitializedValue:
+		{
+			pAst->tid = tid;
+			return;
+		}
+
+	default:
+		break;
+	}
+
+	ASSERT(pAst->tid.pType != nullptr);
+
+	if (pAst->tid == tid)
+		return;
+
+	// Insert implicit cast
+
+	auto pAstcast = PastCreate<SAstCast>(pWork, pAst->errinfo);
+	pAstcast->tid = tid;
+	pAstcast->pAstExpr = pAst;
+
+	*ppAst = pAstcast;
+}
+
+enum FBOPI
+{
+	FBOPI_AllIntegers 	= 0x01,
+	FBOPI_AllFloats 	= 0x02,
+	FBOPI_Pointers	 	= 0x04,
+	FBOPI_PointerAndInt	= 0x08,
+
+	FBOPI_ReturnBool	= 0x100,
+};
+
+typedef uint32_t GRFBOPI;
+
+struct SBinaryOperatorInst
+{
+	const char * pChzOp;
+	GRFBOPI grfbopi;
+};
+
+static const SBinaryOperatorInst s_aBopi[] =
+{
+	{ "<", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_Pointers },
+	{ ">", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_Pointers },
+	{ "<=", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_Pointers },
+	{ ">=", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_Pointers },
+	{ "==", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_Pointers }, // Floats for == et al?
+	{ "!=", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_Pointers },
+	
+	{ "+", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_PointerAndInt }, // BB (adrianb) Reuse these with += et al?
+	{ "-", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_PointerAndInt },
+	{ "*", FBOPI_AllIntegers | FBOPI_AllFloats },
+	{ "/", FBOPI_AllIntegers | FBOPI_AllFloats },
+	{ "%", FBOPI_AllIntegers },
+};
+
+static const SBinaryOperatorInst s_aBopiAssign[] =
+{
+	{ "+=", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_PointerAndInt },
+	{ "-=", FBOPI_AllIntegers | FBOPI_AllFloats | FBOPI_PointerAndInt },
+	{ "*=", FBOPI_AllIntegers | FBOPI_AllFloats },
+	{ "/=", FBOPI_AllIntegers | FBOPI_AllFloats },
+	{ "%=", FBOPI_AllIntegers },
+};
+
+bool FTryCoerceOperatorArgs(SWorkspace * pWork, SAstOperator * pAstop, GRFBOPI grfbopi, STypeId * pTidRet)
+{
+	ClearStruct(pTidRet);
+
+	auto pAstLeft = pAstop->pAstLeft;
+	auto pAstRight = pAstop->pAstRight;
+
+	if (grfbopi & FBOPI_AllIntegers)
+	{
+		static const TYPEK s_aTypekInt[] =
+		{
+			TYPEK_S8,
+			TYPEK_U8,
+			TYPEK_S16,
+			TYPEK_U16,
+			TYPEK_S32,
+			TYPEK_U32,
+			TYPEK_S64,
+			TYPEK_U64,
+		};
+		CASSERT(DIM(s_aTypekInt) == TYPEK_IntMac - TYPEK_IntMic);
+
+		for (TYPEK typek : s_aTypekInt)
+		{
+			if (FCanCoerce(pAstLeft, typek) && FCanCoerce(pAstRight, typek))
+			{
+				auto tid = TidEnsure(pWork, SType{typek});
+				Coerce(pWork, &pAstop->pAstLeft, tid);
+				Coerce(pWork, &pAstop->pAstRight, tid);
+				*pTidRet = tid;
+				return true;
+			}
+		}
+	}
+
+	if (grfbopi & FBOPI_AllFloats)
+	{
+		for (TYPEK typek = TYPEK_Float; typek <= TYPEK_Double; typek = TYPEK(typek + 1))
+		{
+			if (FCanCoerce(pAstLeft, typek) && FCanCoerce(pAstRight, typek))
+			{
+				auto tid = TidEnsure(pWork, SType{typek});
+				Coerce(pWork, &pAstop->pAstLeft, tid);
+				Coerce(pWork, &pAstop->pAstRight, tid);
+				*pTidRet = tid;
+				return true;
+			}
+		}
+	}
+
+	if (grfbopi & FBOPI_Pointers)
+	{
+		auto pTypeLeft = pAstLeft->tid.pType;
+		auto pTypeRight = pAstRight->tid.pType;
+		if (pAstLeft->tid == pAstRight->tid && 
+			pTypeLeft && pTypeLeft->typek == TYPEK_Pointer &&
+			pTypeRight && pTypeRight->typek == TYPEK_Pointer)
+		{
+			*pTidRet = pAstLeft->tid;
+			return true;
+		}
+	}
+
+	if (grfbopi & FBOPI_PointerAndInt)
+	{
+		// BB (adrianb) Verify that pointer has a size we can increment by?
+
+		auto pTypeLeft = pAstLeft->tid.pType;
+		auto pTypeRight = pAstRight->tid.pType;
+		if (pTypeLeft && pTypeRight)
+		{
+			if (pTypeLeft->typek == TYPEK_Pointer && FCanCoerce(pAstRight, TYPEK_S64))
+			{
+				Coerce(pWork, &pAstop->pAstRight, TidEnsure(pWork, SType{TYPEK_S64}));
+				*pTidRet = pAstLeft->tid;
+				return true;
+			}
+			else if (pTypeLeft->typek == TYPEK_S64 && pTypeRight->typek == TYPEK_Pointer)
+			{
+				Coerce(pWork, &pAstop->pAstLeft, TidEnsure(pWork, SType{TYPEK_S64}));
+				*pTidRet = pAstRight->tid;
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+void TryCoerceOperator(SWorkspace * pWork, SAstOperator * pAstop, GRFBOPI grfbopi)
+{
+	if (FTryCoerceOperatorArgs(pWork, pAstop, grfbopi, &pAstop->tid))
+	{
+		if (grfbopi & FBOPI_ReturnBool)
+			pAstop->tid = pWork->tidBool;
+	}
 }
 
 struct STypeCheckSwitch // tag = tcswitch
 {
 	SResolve * pResolve;
 };
+
+bool FIsOperator(SAst * pAst, const char * pChz)
+{
+	return pAst->astk == ASTK_Operator && strcmp(PastCast<SAstOperator>(pAst)->pChzOp, pChz) == 0;
+}
 
 void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcswitch)
 {
@@ -5504,25 +5877,73 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 			auto pChzOp = pAstop->pChzOp;
 			if (pAstop->pAstLeft == nullptr)
 			{
-				ShowErr(pAstop->errinfo, "Operator %s can not be a prefix operator", pChzOp);
+				if (strcmp(pChzOp, "-") == 0)
+				{
+					TryCoerceLit(pWork, pAstop->pAstRight);
+					auto tid = pAstop->pAstRight->tid;
+					auto typek = tid.pType->typek;
+					if ((typek >= TYPEK_S8 && typek <= TYPEK_S64) || typek == TYPEK_Float)
+					{
+						pAstop->tid = tid;
+					}
+				}
+				else if (strcmp(pChzOp, "--") == 0 || strcmp(pChzOp, "++") == 0)
+				{
+					// BB (adrianb) Are prefix inc/dec a thing?
+
+					if (pAstop->pAstRight->astk == ASTK_Identifier || FIsOperator(pAstop->pAstRight, "."))
+					{
+						auto tid = pAstop->pAstRight->tid;
+						ASSERT(tid.pType != nullptr);
+						auto typek = tid.pType->typek;
+
+						// BB (adrianb) Verify declaration is not a constant expression?
+
+						if (typek < TYPEK_IntMic || typek >= TYPEK_IntMac)
+						{
+							STypeString typestr = {};
+							PrintFriendlyType(tid.pType, &typestr);
+							ShowErr(pAstop->errinfo, "Cannot operate on variable with type %s", typestr.aChz);
+						}
+
+						pAstop->tid = tid;
+					}
+					else
+					{
+						// BB (adrianb) Better way to say this.
+
+						ShowErr(pAst->errinfo, "Cannot modify without a storage location");
+					}
+				}
 			}
 			else
 			{
-				if (strcmp(pChzOp, "<") == 0 || strcmp(pChzOp, ">") == 0 || strcmp(pChzOp, "<=") == 0 || 
-					strcmp(pChzOp, ">=") == 0 || strcmp(pChzOp, "==") == 0 || strcmp(pChzOp, "!=") == 0)
-				{
-					// Check that arguments are the same
-					//Coerce(pWork, &pAstop->pAstLeft, );
+				// Run special case operator comparisons
+				// TODO: ., 
 
-					pAstop->tid = pWork->tidBool;
-
-				}
-				else
+				for (const auto & bopi : s_aBopi)
 				{
-					ShowErr(pAstop->errinfo, "Don't know how to type check binary operator %s", pAstop->pChzOp);
+					if (strcmp(bopi.pChzOp, pChzOp) == 0)
+					{
+						TryCoerceOperator(pWork, pAstop, bopi.grfbopi);
+						break;
+					}
 				}
 			}
 
+			if (pAstop->tid.pType == nullptr)
+			{
+				// BB (adrianb) Give indication if it's a type argument or completely unreconized operator?
+
+				STypeString typestrLeft = {};
+				STypeString typestrRight = {};
+
+				PrintFriendlyType(pAstop->pAstLeft->tid.pType, &typestrLeft);
+				PrintFriendlyType(pAstop->pAstRight->tid.pType, &typestrRight);
+
+				ShowErr(pAstop->errinfo, "Invalid operator %s given types %s and %s, cannot be typechecked.", 
+						pChzOp, typestrLeft.aChz, typestrRight.aChz);
+			}
 			// Use type determined from coerce.
 			// For ., treat like identifier resolve except use namespace from left side
 
@@ -5617,12 +6038,7 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 				// BB (adrianb) For built in functions will need to coerce to Any and build an array?
 				//  Anything necessary in type checking to do that?
 
-				auto pAst = pAstcall->arypAstArgs[ipAst];
-				if (pAst->tid.pType == nullptr)
-				{
-					auto pAstlit = PastCast<SAstLiteral>(pAst);
-					pAstlit->tid = TidFromLiteral(pWork, pAstlit->lit);
-				}
+				TryCoerceLit(pWork, pAstcall->arypAstArgs[ipAst]);
 			}
 		
 			if (pTypeproc->cTidRet > 0)
@@ -5847,6 +6263,11 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 		ASSERTCHZ(false, "Could typecheck node of type %s(%d)", PchzFromAstk(pAst->astk), pAst->astk);
 		break;
 	}
+
+	if (pTcswitch->pResolve == nullptr && pAst->astk != ASTK_Literal && pAst->tid.pType == nullptr)
+	{
+		ShowErr(pAst->errinfo, "Couldn't compute type");
+	}
 }
 
 struct STypeCheckEntry
@@ -6038,11 +6459,18 @@ void RunUnitTests()
 		"(DeclareSingle var a infer-type 'b)", 
 		"(DeclareSingle s32 infer-type s32)");
 
+	// BB (adrianb) More compact type printing model?
+
 	CompileAndCheckDeclaration("proc-simple", "a",
 		"a :: (b : int) { }",
 		"(DeclareSingle const a infer-type (Procedure (args (DeclareSingle var b 'int)) (Block)))", 
-		"(DeclareSingle (Proc s32) infer-type (Procedure (Proc s32) (args (DeclareSingle s32 (Type s32))) (Block void)))"); 
-		//"(DeclareSingle (Proc s32) infer-type (Procedure (Proc s32) (args (s32 s32))) (args (s32 s32)) (void))");
+		"(DeclareSingle (Proc s32) infer-type (Procedure (Proc s32) (args (DeclareSingle s32 (Type s32))) (Block void)))");
+
+	// Generate unit tests for:
+	// All operators for all types - on 2 literals, on 1 literal and one variable, on 2 variables with coercion.
+
+	// BB (adrianb) Unit tests for common errors? How? Error current calls exit, throw instead? Sandbox
+	//  allocation entirely within a custom malloc so we can just toss entire heap away?
 }
 
 int main(int cpChzArg, const char * apChzArg[])

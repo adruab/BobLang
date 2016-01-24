@@ -1,5 +1,5 @@
 
-CLoop :: () -> s16
+CLoop :: () -> s64
 {
 	return 5;
 }

@@ -12,26 +12,28 @@ REPEATING :: 0x1;
 
 Vector2 :: struct
 {
-    x : float;
-    y : float;
+    x : float = 1;
+    y : float = 2;
 };
 
 printf :: (format : * char, ..) -> int #foreign;
 
+Factorial :: (n : s64) -> s64 { if n == 0 return 1; return n * Factorial(n-1); }
+
 main :: ()
 {
-	i := 0;
+	i := 0; // BB (adrianb) What's the right type for this? s64?
     c := CLoop();
     a :: 2;
     b := 900;
 
     // BB (adrianb) Should error on i < c because types don't match...
-    
-	while i < c 
+
+	while i < c
     {
         printf("\"i\" = %d\n", a + b + -i);
         ++i;
     }
 
-	return;
+    printf("factorial(%ld) == %ld\n", CLoop(), Factorial(CLoop()));
 }

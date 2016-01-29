@@ -27,11 +27,14 @@ main :: ()
     a :: 2;
     b := 900;
 
+    pB := *b;
+    << pB = 400;
+
     // BB (adrianb) Should error on i < c because types don't match...
 
 	while i < c
     {
-        printf("\"i\" = %d\n", a + b + -i);
+        printf("\"i\" = %d\n", a + << pB + -i);
         ++i;
     }
 

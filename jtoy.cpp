@@ -891,7 +891,6 @@ const SOperator g_aOperator[] =
 	{"", "or xor"},
 	{"", "and"},
 	{"=<>!", "in notin is isnot not of"},
-	{".", nullptr},
 	{"&", nullptr},
 	{"+-|~", nullptr},
 	{"*/%", nullptr},
@@ -917,6 +916,13 @@ int NOperatorLevel(const char * pChzOp)
 	if (pChzOp[cChOp - 1] == '=' && strchr(pChzNonAssign, pChzOp[0]) == nullptr)
 	{
 		return 1;
+	}
+
+	// Dot is highest priority and handled specially
+
+	if (pChzOp[0] == '.')
+	{
+		return DIM(g_aOperator);
 	}
 
 	for (int iOperator = 0; iOperator < DIM(g_aOperator); ++iOperator)
@@ -1086,6 +1092,7 @@ struct SResolve;
 struct SAstProcedure;
 struct SAstDeclareSingle;
 struct SStorage;
+struct STypeStruct;
 
 struct SSymbolTable
 {
@@ -1094,6 +1101,7 @@ struct SSymbolTable
 	SArray<SResolve *> arypResolve; // Declarations, may be finished or unfinished if out of order
 
 	SAstProcedure * pAstproc; // Function for procedure symbol tables
+	STypeStruct * pTypestruct; // Function for procedure symbol tables
 };
 
 struct SWorkspace
@@ -1346,7 +1354,7 @@ const SSimpleTok g_aStok[] =
 	{ '}', TOKK_CloseBrace } ,
 	{ '[', TOKK_OpenBracket },
 	{ ']', TOKK_CloseBracket } ,
-	{ ',', TOKK_Comma }, 
+	{ ',', TOKK_Comma },
 };
 
 TOKK TokkCheckSimpleToken(SWorkspace * pWork)
@@ -2540,40 +2548,62 @@ SAst * PastTryParsePrimary(SWorkspace * pWork)
     if (!pAstTop)
         return nullptr;
 
-	// Parse post operations: function call, array index
-
-	if (FTryConsumeToken(pWork, TOKK_OpenParen, &tok))
+    for (;;)
 	{
-		// stuff(arg[, arg]*)
+		// Parse post operations: function call, array index, .ident
 
-		// TODO inline, other?
-		// BB (adrianb) Try to point the error info at something other than the openning paren?
-
-		auto pAstcall = PastCreate<SAstCall>(pWork, tok.errinfo);
-		pAstcall->pAstFunc = *ppAst;
-		*ppAst = pAstcall; // Function call has higher precidence so take the last thing and call on that
-
-		if (TokPeek(pWork).tokk != TOKK_CloseParen)
+		if (FTryConsumeToken(pWork, TOKK_OpenParen, &tok))
 		{
-			for (;;)
+			// stuff(arg[, arg]*)
+
+			// TODO inline, other?
+			// BB (adrianb) Try to point the error info at something other than the openning paren?
+
+			auto pAstcall = PastCreate<SAstCall>(pWork, tok.errinfo);
+			pAstcall->pAstFunc = *ppAst;
+			*ppAst = pAstcall; // Function call has higher precidence so take the last thing and call on that
+
+			if (TokPeek(pWork).tokk != TOKK_CloseParen)
 			{
-				Append(&pAstcall->arypAstArgs, PastParseExpression(pWork));
-				if (!FTryConsumeToken(pWork, TOKK_Comma))
-					break;
+				for (;;)
+				{
+					Append(&pAstcall->arypAstArgs, PastParseExpression(pWork));
+					if (!FTryConsumeToken(pWork, TOKK_Comma))
+						break;
+				}
 			}
+
+			ConsumeExpectedToken(pWork, TOKK_CloseParen);
 		}
+		else if (FTryConsumeToken(pWork, TOKK_OpenBracket, &tok))
+		{
+			auto pAstarrayindex = PastCreate<SAstArrayIndex>(pWork, tok.errinfo);
+			pAstarrayindex->pAstArray = *ppAst;
+			*ppAst = pAstarrayindex;
 
-		ConsumeExpectedToken(pWork, TOKK_CloseParen);
-	}
-	else if (FTryConsumeToken(pWork, TOKK_OpenBracket, &tok))
-	{
-		auto pAstarrayindex = PastCreate<SAstArrayIndex>(pWork, tok.errinfo);
-		pAstarrayindex->pAstArray = *ppAst;
-		*ppAst = pAstarrayindex;
+			pAstarrayindex->pAstIndex = PastParseExpression(pWork);
 
-		pAstarrayindex->pAstIndex = PastParseExpression(pWork);
+			ConsumeExpectedToken(pWork, TOKK_CloseBracket);
+		}
+		else if (FTryConsumeOperator(pWork, ".", &tok))
+		{
+			SToken tokIdent;
+			ConsumeExpectedToken(pWork, TOKK_Identifier, &tokIdent);
 
-		ConsumeExpectedToken(pWork, TOKK_CloseBracket);
+			auto pAstident = PastCreate<SAstIdentifier>(pWork, tokIdent.errinfo);
+			pAstident->pChz = tokIdent.ident.pChz;
+
+			auto pAstop = PastCreate<SAstOperator>(pWork, tok.errinfo);
+			pAstop->pChzOp = tok.op.pChz;
+			pAstop->pAstLeft = *ppAst;
+			pAstop->pAstRight = pAstident;
+
+			*ppAst = pAstop;
+		}
+		else
+		{
+			break;
+		}
 	}
 
 	return pAstTop;
@@ -2859,7 +2889,7 @@ SAstDeclareSingle * PastdeclParseSimple(SWorkspace * pWork)
 		{
 			// BB (adrianb) Does this syntax even make sense?
 
-			pAstdecl->fIsConstant = false;
+			pAstdecl->fIsConstant = true;
 			pAstdecl->pAstValue = PastParseExpression(pWork);
 		}
 	}
@@ -4161,15 +4191,7 @@ struct STypeStruct : public SType
 
 	struct SMember
 	{
-		const char * pChzName; // BB (adrianb) Not required for format equality?
-		STypeId tid;
-		s64 iBOffset;
-
-		bool fIsConstant;
-		bool fIsImported;
-		bool fIsUsing;
-
-		SErrorInfo errinfo;
+		SAstDeclareSingle * pAstdecl; // BB (adrianb) A little strange to point to AST in type.
 
 		// TODO annotations
 	};
@@ -4177,6 +4199,7 @@ struct STypeStruct : public SType
 	const char * pChzName; // BB (adrianb) Not required for format equality?
 	SMember * aMember;	// BB (adrianb) Filled in after type entered in name slot?
 	int cMember;
+	int cMemberMax;
 };
 
 struct STypeEnum : public SType
@@ -5553,7 +5576,8 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 		{
 			auto pAtypearray = PastCast<SAstTypeArray>(pAst);
 			RecurseTypeCheck(recx, &pAtypearray->pAstTypeInner);
-			RecurseTypeCheck(recx, &pAtypearray->pAstSize);
+			if (pAtypearray->pAstSize)
+				RecurseTypeCheck(recx, &pAtypearray->pAstSize);
 		}
 		break;
 
@@ -5674,6 +5698,8 @@ STypeId TidFromLiteral(SWorkspace * pWork, const SLiteral & lit)
 
 void TryCoerceLit(SWorkspace * pWork, SAst * pAst)
 {
+	// BB (adrianb) null -> void *?
+
 	if (pAst->tid.pType == nullptr)
 	{
 		if (pAst->astk != ASTK_Literal)
@@ -5682,6 +5708,42 @@ void TryCoerceLit(SWorkspace * pWork, SAst * pAst)
 		}
 
 		pAst->tid = TidFromLiteral(pWork, PastCast<SAstLiteral>(pAst)->lit);
+	}
+}
+
+void Coerce(SWorkspace * pWork, SAst ** ppAst, const STypeId & tid);
+void TryCoerceCVararg(SWorkspace * pWork, SAst ** ppAst)
+{
+	auto pAst = *ppAst;
+	STypeId tidSrc = pAst->tid;
+	if (tidSrc.pType == nullptr)
+	{
+		if (pAst->astk != ASTK_Literal)
+		{
+			ShowErr(pAst->errinfo, "Can't generate type for a non-literal");
+		}
+
+		tidSrc = TidFromLiteral(pWork, PastCast<SAstLiteral>(pAst)->lit);
+	}
+
+	TYPEK typekSrc = tidSrc.pType->typek;
+	if (FIsFloat(typekSrc))
+	{
+		Coerce(pWork, ppAst, TidEnsure(pWork, SType{TYPEK_Double}));
+	}
+	else if (FIsInt(typekSrc))
+	{
+		if (CBit(typekSrc) < 32)
+		{
+			Coerce(pWork, ppAst, TidEnsure(pWork, SType{FSigned(typekSrc) ? TYPEK_S32 : TYPEK_U32}));
+		}
+	}
+
+	// If the literal was already big enough, just set it to default type
+
+	if (pAst->tid.pType == nullptr)
+	{
+		pAst->tid = tidSrc;
 	}
 }
 
@@ -5909,6 +5971,8 @@ enum FBOPI
 
 typedef u32 GRFBOPI;
 
+
+
 struct SBinaryOperatorInst
 {
 	const char * pChzOp;
@@ -6045,7 +6109,8 @@ void TryCoerceOperator(SWorkspace * pWork, SAstOperator * pAstop, GRFBOPI grfbop
 
 bool FCanGetAddress(SAst * pAst)
 {
-	if (pAst->astk == ASTK_Operator)
+	ASTK astk = pAst->astk;
+	if (astk == ASTK_Operator)
 	{
 		auto pAstop = PastCast<SAstOperator>(pAst);
 		auto pChzOp = pAstop->pChzOp;
@@ -6056,7 +6121,7 @@ bool FCanGetAddress(SAst * pAst)
 			return true;
 	}
 
-	if (pAst->astk == ASTK_Identifier)
+	if (astk == ASTK_Identifier || astk == ASTK_ArrayIndex)
 		return true;
 
 	return false;
@@ -6122,6 +6187,447 @@ void RegisterResolved(SWorkspace * pWork, SAst * pAstIdent, SAstDeclareSingle * 
 	auto hv = HvFromKey(reinterpret_cast<u64>(pAstIdent));
 	Add(&pWork->hashPastPastdeclResolved, hv, pAstIdent, pAstdecl);
 }
+
+
+
+struct SValue
+{
+	// BB (adrianb) If we want to hold typed NULL 
+	TYPEK typek;
+	union
+	{
+		bool f;
+		s64 n;
+		double g;
+		const char * pChz;
+	} contents;
+};
+
+SValue ValueBool(bool f)
+{
+	SValue val = { TYPEK_Bool };
+	val.contents.n = f;
+	return val;
+}
+
+SValue ValueInt(TYPEK typek, s64 n)
+{
+	ASSERT(FIsInt(typek));
+	SValue val = { typek };
+
+	// BB (adrianb) Zext based on source type?
+
+	int cBit = CBit(typek);
+	if (FSigned(typek))
+	{
+		s64 nMask = ((~0ull) >> (64 - cBit));
+		s64 nSign = (n & (1ll << (cBit - 1))) ? ~nMask : 0;
+		val.contents.n = (n & nMask) | nSign;
+	}
+	else
+	{
+		int cBit = CBit(typek);
+		s64 nMask = ((~0ull) >> (64 - cBit));
+		val.contents.n = n & nMask;
+	}
+
+	return val;
+}
+
+SValue ValueFloat(TYPEK typek, double g)
+{
+	ASSERT(FIsFloat(typek));
+	SValue val = { typek };
+	val.contents.g = (typek == TYPEK_Double) ? g : (double)(float)g;
+	return val;
+}
+
+using PFNEVALCONSTBINARY = SValue (*)(SValue valLeft, SValue valRight);
+
+struct SEvalConstBinaryOperator
+{
+	const char * pChzOp;
+
+	PFNEVALCONSTBINARY pfnecbInt;
+	PFNEVALCONSTBINARY pfnecbIntUnsigned;
+	PFNEVALCONSTBINARY pfnecbFloat;
+
+	// bools
+};
+
+SValue ValAdd(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n + val1.contents.n);
+}
+
+SValue ValFAdd(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g + val1.contents.g);
+}
+
+SValue ValSub(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n - val1.contents.n);
+}
+
+SValue ValFSub(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g - val1.contents.g);
+}
+
+SValue ValMul(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n * val1.contents.n);
+}
+
+SValue ValFMul(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g * val1.contents.g);
+}
+
+SValue ValSDiv(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n / val1.contents.n);
+}
+
+SValue ValUDiv(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, u64(val0.contents.n) / u64(val1.contents.n));
+}
+
+SValue ValFDiv(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g / val1.contents.g);
+}
+
+SValue ValSRem(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n % val1.contents.n);
+}
+
+SValue ValURem(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, u64(val0.contents.n) % u64(val1.contents.n));
+}
+
+SValue ValCmpEqInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT((val0.typek == TYPEK_Bool || FIsInt(val0.typek)) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n == val1.contents.n);
+}
+
+SValue ValCmpNeqInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT((val0.typek == TYPEK_Bool || FIsInt(val0.typek)) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n != val1.contents.n);
+}
+
+SValue ValCmpLTInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n < val1.contents.n);
+}
+
+SValue ValCmpLTUInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(u64(val0.contents.n) < u64(val1.contents.n));
+}
+
+SValue ValCmpLTFloat(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.g < val1.contents.g);
+}
+
+SValue ValCmpGTInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n > val1.contents.n);
+}
+
+SValue ValCmpGTUInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(u64(val0.contents.n) > u64(val1.contents.n));
+}
+
+SValue ValCmpGTFloat(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.g > val1.contents.g);
+}
+
+// BB (adrianb) Embed these in normal operator array?
+static const SEvalConstBinaryOperator s_aEcbop[] =
+{
+	// BB (adrianb) Unordered (either arg NaN) vs Ordered. Which to choose?
+	{ "<", ValCmpLTInt, ValCmpLTUInt, ValCmpLTFloat },
+	{ ">", ValCmpGTInt, ValCmpGTUInt, ValCmpGTFloat },
+
+	{ "==", ValCmpEqInt, nullptr, nullptr },
+	{ "!=", ValCmpNeqInt, nullptr, nullptr },
+
+	{ "+", ValAdd, nullptr, ValFAdd },
+	{ "-", ValSub, nullptr, ValFSub },
+	{ "*", ValMul, nullptr, ValFMul },
+	{ "/", ValSDiv, ValUDiv, ValFDiv },
+	{ "%", ValSRem, ValURem, nullptr }, // FRem?
+};
+
+SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst);
+
+SValue ValEvalBinaryOperator(SWorkspace * pWork, const SEvalConstBinaryOperator & ecbop, SAst * pAstLeft, SAst * pAstRight)
+{
+	SValue valLeft = ValEvalConstant(pWork, pAstLeft);
+	SValue valRight = ValEvalConstant(pWork, pAstRight);
+
+	TYPEK typekLeft = valLeft.typek;
+	if (ecbop.pfnecbInt && typekLeft == TYPEK_Bool)
+	{
+		return ecbop.pfnecbInt(valLeft, valRight);
+	}
+	else if (ecbop.pfnecbInt && FIsInt(typekLeft))
+	{
+		if (ecbop.pfnecbInt && !FSigned(typekLeft))
+		{
+			return ecbop.pfnecbIntUnsigned(valLeft, valRight);
+		}
+		else
+		{
+			return ecbop.pfnecbInt(valLeft, valRight);
+		}
+	}
+	else if (ecbop.pfnecbFloat && FIsFloat(typekLeft))
+	{
+		return ecbop.pfnecbFloat(valLeft, valRight);
+	}
+
+	// Error outside
+
+	return {};
+}
+
+SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
+{
+	ASTK astk = pAst->astk;
+	switch (astk)
+	{
+	case ASTK_Literal:
+		{
+			const SLiteral & lit = PastCast<SAstLiteral>(pAst)->lit;
+			switch (lit.litk)
+			{
+			case LITK_Bool:
+				return ValueBool(lit.n != 0);
+
+			case LITK_Int:
+				return ValueInt(pAst->tid.pType->typek, lit.n);
+
+			case LITK_Float:
+				// BB (adrianb) Can't use APFloat from C-api. Do I care? I want explicit type anyways.
+
+				return ValueFloat(pAst->tid.pType->typek, lit.g);
+
+			case LITK_String:
+				ASSERTCHZ(false, "NYI");
+
+			default:
+				ASSERT(false);
+				return {};
+			}
+		}
+		break;
+
+#if 0
+	case ASTK_Null:
+		return LLVMConstNull(LtyperefGenerate(pWork, pAst->tid));
+#endif
+
+	// BB (adrianb) 90% of this is the same as normal generation. Generalize somehow?
+
+	case ASTK_Identifier:
+		{
+			// This must be a variable if we are evaluating it directly
+
+			SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
+			if (!pAstdecl->fIsConstant)
+			{
+				ShowErr(pAst->errinfo, "Expected a reference to a constant");
+				return {};
+			}
+
+			return ValEvalConstant(pWork, pAstdecl->pAstValue);
+		}
+
+	case ASTK_Operator:
+		{
+			auto pAstop = PastCast<SAstOperator>(pAst);
+			auto pChzOp = pAstop->pChzOp;
+
+			// BB (adrianb) Table drive these or it will get insane!
+
+			if (pAstop->pAstLeft == nullptr)
+			{
+				auto pAstRight = pAstop->pAstRight;
+				TYPEK typekRight = pAstRight->tid.pType->typek;
+
+				if (strcmp(pChzOp, "-") == 0)
+				{
+					SValue valRight = ValEvalConstant(pWork, pAstRight);
+
+					if (FIsInt(typekRight))
+					{
+						return ValueInt(typekRight, -valRight.contents.n);
+					}
+					else if (FIsFloat(typekRight))
+					{
+						return ValueFloat(typekRight, -valRight.contents.g);
+					}
+				}
+				
+				ShowErr(pAstop->errinfo, "Unary operator %s constant with type %s NYI", 
+						  pChzOp, StrPrintType(pAstRight->tid.pType).Pchz());
+				return {};
+			}
+			else
+			{
+				auto pAstLeft = pAstop->pAstLeft;
+				auto pAstRight = pAstop->pAstRight;
+
+				for (const auto & ecbop : s_aEcbop)
+				{
+					if (strcmp(ecbop.pChzOp, pChzOp) == 0)
+					{
+						SValue val = ValEvalBinaryOperator(pWork, ecbop, pAstLeft, pAstRight);
+						if (val.typek == TYPEK_Void)
+						{
+							ShowErr(pAstop->errinfo, "Don't know how to perform constant operator for types %s and %s",
+									StrPrintType(pAstLeft->tid).Pchz(), StrPrintType(pAstRight->tid).Pchz());
+						}
+						return val;
+					}
+				}
+
+				if (strcmp(pChzOp, ".") == 0)
+				{
+					STypeId tidStruct = pAstLeft->tid;
+					if (tidStruct.pType->typek == TYPEK_TypeOf)
+					{
+						auto pTypetypeof = PtypeCast<STypeTypeOf>(tidStruct.pType);
+						auto pSymtStruct = PsymtStructLookup(pWork, pTypetypeof->tid);
+						if (pSymtStruct)
+						{
+							auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
+							auto pResolve = PresolveLookup(pSymtStruct, pAstident->pChz);
+
+							return ValEvalConstant(pWork, pResolve->pAstdecl->pAstValue);
+						}
+					}
+				}
+
+				ShowErr(pAstop->errinfo, "Operator %s constant eval with types %s and %s NYI", 
+						  pChzOp, StrPrintType(pAstLeft->tid.pType).Pchz(), StrPrintType(pAstRight->tid.pType).Pchz());
+				return {};
+			}
+		}
+		break;
+
+	case ASTK_Cast:
+		{
+			auto pAstcast = PastCast<SAstCast>(pAst);
+
+			SValue valExpr = ValEvalConstant(pWork, pAstcast->pAstExpr);
+
+			STypeId tidSrc = pAstcast->pAstExpr->tid;
+			STypeId tidDst = pAstcast->tid;
+
+			if (tidSrc == tidDst)
+			{
+				return valExpr;
+			}
+			
+			TYPEK typekSrc = tidSrc.pType->typek;
+			TYPEK typekDst = tidDst.pType->typek;
+
+			if (FIsInt(typekSrc))
+			{
+				if (FIsInt(typekDst))
+				{
+					// BB (adrianb) Need to mask off sext bits from upper part of N.
+
+					switch (typekSrc)
+					{
+					case TYPEK_S8: return ValueInt(typekDst, static_cast<s8>(valExpr.contents.n));
+					case TYPEK_S16: return ValueInt(typekDst, static_cast<s16>(valExpr.contents.n));
+					case TYPEK_S32: return ValueInt(typekDst, static_cast<s32>(valExpr.contents.n));
+					case TYPEK_S64: return ValueInt(typekDst, valExpr.contents.n);
+					case TYPEK_U8: return ValueInt(typekDst, static_cast<u8>(valExpr.contents.n));
+					case TYPEK_U16: return ValueInt(typekDst, static_cast<u16>(valExpr.contents.n));
+					case TYPEK_U32: return ValueInt(typekDst, static_cast<u32>(valExpr.contents.n));
+					case TYPEK_U64: return ValueInt(typekDst, valExpr.contents.n);
+					default:
+						ASSERT(false);
+						break;
+					}
+				}
+				else if (FIsFloat(typekDst))
+				{
+					return ValueFloat(typekDst, double((FSigned(typekSrc)) ? valExpr.contents.n : u64(valExpr.contents.n)));
+				}
+			}
+			else if (FIsFloat(typekSrc))
+			{
+				if (FIsFloat(typekDst))
+				{
+					return ValueFloat(typekDst, valExpr.contents.g);
+				}
+				else if (FIsInt(typekDst))
+				{
+					if (FSigned(typekSrc))
+					{
+						return ValueInt(typekDst, s64(valExpr.contents.g));
+					}
+					else
+					{
+						return ValueInt(typekDst, u64(valExpr.contents.g));
+					}
+				}
+			}
+
+			ShowErr(pAst->errinfo, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
+					  StrPrintType(tidDst.pType).Pchz());
+			return SValue{};
+		}
+
+	default:
+		ShowErr(pAst->errinfo, "Can't evaluate as constant");
+		return SValue{};
+	}
+}
+
+
 
 struct STypeCheckSwitch // tag = tcswitch
 {
@@ -6262,20 +6768,33 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 					STypeId tidOwner = pAstop->pAstLeft->tid;
 					if (tidOwner.pType)
 					{
-						if (tidOwner.pType->typek == TYPEK_Pointer)
+						TYPEK typek = tidOwner.pType->typek;
+						if (typek == TYPEK_Pointer)
 						{
 							tidOwner = PtypeCast<STypePointer>(tidOwner.pType)->tidPointedTo;
 						}
 
-						if (tidOwner.pType->typek == TYPEK_Struct)
+						if (typek == TYPEK_Struct || 
+							(typek == TYPEK_TypeOf && 
+								TidUnwrap(pAstop->errinfo, tidOwner).pType->typek == TYPEK_Struct))
 						{
-							SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidOwner);
+							STypeId tidStruct = (typek == TYPEK_Struct)
+													? tidOwner
+													: TidUnwrap(pAstop->errinfo, tidOwner);
+
+							SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidStruct);
                             ASSERT(pSymtStruct);
 
 							if (pAstop->pAstRight->astk == ASTK_Identifier)
 							{
 								auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
 								auto pResolve = PresolveLookup(pSymtStruct, pAstident->pChz);
+
+								if (typek == TYPEK_TypeOf && !pResolve->pAstdecl->fIsConstant)
+								{
+									ShowErr(pAstop->errinfo, 
+											"Can only reference constants when indirecting through struct type");
+								}
 
 								STypeId tid = pResolve->pAstdecl->tid;
 								if (tid.pType == nullptr)
@@ -6314,7 +6833,9 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 									pChzOp);
 						}
 
-						FTryCoerceOperatorAssign(pWork, pAstop, bopi.grfbopi);
+						if (!FTryCoerceOperatorAssign(pWork, pAstop, bopi.grfbopi))
+                            goto LOperatorDone;
+                            
 						pAstop->tid = pWork->tidVoid;
 						goto LOperatorDone;
 					}
@@ -6396,8 +6917,30 @@ LOperatorDone:
 		break;
 
 	case ASTK_ArrayIndex:
-		ASSERT(false);
-		// Use indirected type of pAstArray
+		{
+			auto pAstarrayindex = PastCast<SAstArrayIndex>(pAst);
+
+			Coerce(pWork, &pAstarrayindex->pAstIndex, TidEnsure(pWork, SType{TYPEK_S64}));
+
+			auto pAstArray = pAstarrayindex->pAstArray;
+			auto pTypeArray = pAstArray->tid.pType;
+			if (pTypeArray)
+			{
+				if (pTypeArray->typek == TYPEK_Array)
+				{
+					pAst->tid = PtypeCast<STypeArray>(pTypeArray)->tidElement;
+				}
+				else if (pTypeArray->typek != TYPEK_Pointer)
+				{
+					pAst->tid = PtypeCast<STypePointer>(pTypeArray)->tidPointedTo;
+				}
+			}
+
+			if (pAst->tid.pType == nullptr)
+			{
+				ShowErr(pAst->errinfo, "Expected array or pointer type but found %s", StrPrintType(pTypeArray).Pchz());
+			}
+		}
 		break;
 
 	case ASTK_Call:
@@ -6439,7 +6982,16 @@ LOperatorDone:
 				// BB (adrianb) For built in functions will need to coerce to Any and build an array?
 				//  Anything necessary in type checking to do that?
 
-				TryCoerceLit(pWork, pAstcall->arypAstArgs[ipAst]);
+				// Coerce to larger types for C vararg setup
+
+				if (pTypeproc->fUsesCVararg)
+				{
+					TryCoerceCVararg(pWork, &pAstcall->arypAstArgs[ipAst]);
+				}
+				else
+				{
+					TryCoerceLit(pWork, pAstcall->arypAstArgs[ipAst]);
+				}
 			}
 		
 			if (pTypeproc->cTidRet > 0)
@@ -6529,6 +7081,14 @@ LOperatorDone:
 			if (pAstdecl->pAstValue)
 				Coerce(pWork, &pAstdecl->pAstValue, pAstdecl->tid);
 
+			if (pTrec->pSymtParent->symtk == SYMTK_Struct && !pAstdecl->fIsConstant)
+			{
+				auto pTypestruct = pTrec->pSymtParent->pTypestruct;
+				ASSERT(pTypestruct->cMember < pTypestruct->cMemberMax);
+				auto pMember = &pTypestruct->aMember[pTypestruct->cMember++];
+				pMember->pAstdecl = pAstdecl;
+			}
+
 			ASSERT(!pAstdecl->pAstValue || pAstdecl->tid == pAstdecl->pAstValue->tid);
 		}
 		break;
@@ -6555,9 +7115,26 @@ LOperatorDone:
 			pTypestruct->typek = TYPEK_Struct;
 			pTypestruct->pChzName = pAststruct->pChzName;
 
-			pAststruct->tid.pType = pTypestruct;
+			int cMember = 0;
+			for (auto pAstDecl : pAststruct->arypAstDecl)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAstDecl);
+				if (!pAstdecl->fIsConstant)
+					++cMember;
+			}
 
-			RegisterStruct(pWork, pAststruct->tid, pTrec->pSymtParent);
+			pTypestruct->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, cMember);
+			pTypestruct->cMemberMax = cMember;
+
+			STypeId tidStruct = { pTypestruct };
+
+			pAststruct->tid = TidWrap(pWork, tidStruct);
+
+			// Assuming struct is immediately inside a constant declaration
+
+			pTrec->pSymtParent->pTypestruct = pTypestruct;
+
+			RegisterStruct(pWork, tidStruct, pTrec->pSymtParent);
 		}
 		break;
 
@@ -6649,8 +7226,42 @@ LOperatorDone:
 		break;
 
 	case ASTK_TypeArray:
-		ASSERT(false);
-		// PtypeWrapPointer(PtypeResolve(PastCast<SAstTypePointer>(pAst)->pTypeInner));
+		{
+			auto pAtypearray = PastCast<SAstTypeArray>(pAst);
+			if (pAtypearray->pAstSize)
+			{
+				// BB (adrianb) Specially detect variable sized arrays?
+                auto pAstSize = pAtypearray->pAstSize;
+                if (pAstSize->tid.pType == nullptr)
+                    TryCoerceLit(pWork, pAtypearray->pAstSize);
+
+				if (!FIsInt(pAstSize->tid.pType->typek))
+				{
+					ShowErr(pAtypearray->pAstSize->errinfo, "Expected integer constant for size, got type %s",
+							StrPrintType(pAtypearray->pAstSize->tid).Pchz());
+				}
+				else
+				{
+					auto val = ValEvalConstant(pWork, pAtypearray->pAstSize);
+
+					STypeArray typearray = {};
+					typearray.typek = TYPEK_Array;
+					ASSERT(FIsInt(val.typek));
+					// BB (adrianb) Validate that size is >= 0.
+					typearray.cSizeFixed = val.contents.n;
+					typearray.tidElement = TidUnwrap(pAtypearray->pAstTypeInner->errinfo, 
+													 pAtypearray->pAstTypeInner->tid);
+
+					ASSERT(typearray.tidElement.pType);
+
+					STypeId tidArray = TidEnsure(pWork, typearray);
+					pAtypearray->tid = TidWrap(pWork, tidArray);
+					return;
+				}
+			}
+
+			ShowErr(pAtypearray->errinfo, "Couldn't get type of array");
+		}
 		break;
 		
 	case ASTK_TypeProcedure:
@@ -6816,9 +7427,13 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 			return LLVMPointerType(LtyperefGenerate(pWork, pTypeptr->tidPointedTo), 0);
 		}
 
-#if 0
-	TYPEK_Array,
-#endif
+	case TYPEK_Array:
+		{
+			auto pTypearray = PtypeCast<STypeArray>(pType);
+			ASSERT(!pTypearray->fSoa && !pTypearray->fDynamicallySized);
+			return LLVMArrayType(LtyperefGenerate(pWork, pTypearray->tidElement), pTypearray->cSizeFixed);
+		}
+
 	case TYPEK_Procedure:
 		{
 			// BB (adrianb) For foreign functions need to support varargs differently.
@@ -6841,8 +7456,24 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 
 			return LLVMFunctionType(LtyperefGenerate(pWork, tidRet), aTyperefArg, cArg, pTypeproc->fUsesCVararg);
 		}
+
+	case TYPEK_Struct:
+		{
+			// BB (adrianb) Use named structs everywhere instead?
+
+			auto pTypestruct = PtypeCast<STypeStruct>(pType);
+			int cMember = pTypestruct->cMember;
+			auto aTyperef = static_cast<LLVMTypeRef *>(alloca(sizeof(LLVMTypeRef) * cMember));
+
+			for (int iMember : IterCount(cMember))
+			{
+				auto pAstdecl = pTypestruct->aMember[iMember].pAstdecl;
+				aTyperef[iMember] = LtyperefGenerate(pWork, pAstdecl->tid);
+			}
+
+			return LLVMStructType(aTyperef, cMember, false);
+		}
 #if 0
-	TYPEK_Struct,
 	TYPEK_Null,
 	TYPEK_Any,
 	TYPEK_Enum,
@@ -6923,24 +7554,85 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 {
 	auto pWork = genx.pWork;
+	auto lbuilder = pWork->lbuilder;
 
-	if (pAst->astk == ASTK_Operator)
+	ASTK astk = pAst->astk;
+	switch (astk)
 	{
-		auto pAstop = PastCast<SAstOperator>(pAst);
-		if (pAstop->pAstLeft == nullptr && strcmp(pAstop->pChzOp, "<<") == 0)
+	case ASTK_Operator:
 		{
-			LLVMValueRef lvalrefPtr = {};
-			GenerateRecursive(genx, pAstop->pAstRight, &lvalrefPtr);
-			return lvalrefPtr;
-		}
-	}
+			auto pAstop = PastCast<SAstOperator>(pAst);
+			auto pAstLeft = pAstop->pAstLeft;
+			auto pAstRight = pAstop->pAstRight;
+			if (pAstLeft == nullptr)
+			{
+				if (strcmp(pAstop->pChzOp, "<<") == 0)
+				{
+					LLVMValueRef lvalrefPtr = {};
+					GenerateRecursive(genx, pAstop->pAstRight, &lvalrefPtr);
+					return lvalrefPtr;
+				}
+			}
+			else
+			{
+				if (strcmp(pAstop->pChzOp, ".") == 0)
+				{
+					auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstLeft);
+					STypeId tidStruct = pAstLeft->tid;
+					if (tidStruct.pType->typek == TYPEK_Pointer)
+					{
+						tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
+						lvalrefAddr = LLVMBuildLoad(lbuilder, lvalrefAddr, "dotpointertmp");
+					}
 
-	if (pAst->astk == ASTK_Identifier)
-	{
-		SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
-		ASSERT(pAstdecl && !pAstdecl->fIsConstant);
-		auto pStorage = PstorageLookup(pWork, pAstdecl);
-		return pStorage->lvalrefPtr;
+					auto pTypestruct = PtypeCast<STypeStruct>(tidStruct.pType);
+					ASSERT(pTypestruct->cMember == pTypestruct->cMemberMax);
+
+					auto pAstident = PastCast<SAstIdentifier>(pAstRight);
+
+					for (int iMember = 0;; ++iMember)
+					{
+						if (iMember >= pTypestruct->cMember)
+						{
+							// BB (adrianb) Much more complex lookup for using. Cache namespace here?
+							ShowErr(pAstident->errinfo, "Couldn't find member %s of type %s", pAstident->pChz, 
+									StrPrintType(pTypestruct).Pchz());
+							break;
+						}
+
+						if (strcmp(pAstident->pChz, pTypestruct->aMember[iMember].pAstdecl->pChzName) != 0)
+							continue;
+
+						return LLVMBuildStructGEP(lbuilder, lvalrefAddr, iMember, "membertmp");
+					}
+				}
+			}
+		}
+		break;
+
+	case ASTK_Identifier:
+		{
+			SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
+			ASSERT(pAstdecl && !pAstdecl->fIsConstant);
+			auto pStorage = PstorageLookup(pWork, pAstdecl);
+			return pStorage->lvalrefPtr;
+		}
+
+	case ASTK_ArrayIndex:
+		{
+			auto pAstarrayindex = PastCast<SAstArrayIndex>(pAst);
+			auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstarrayindex->pAstArray);
+			
+			LLVMValueRef aLvalrefIndex[2] = {};
+			aLvalrefIndex[0] = LLVMConstInt(LLVMInt32Type(), 0, false);
+
+			GenerateRecursive(genx, pAstarrayindex->pAstIndex, &aLvalrefIndex[1]);
+
+			return LLVMBuildGEP(lbuilder, lvalrefAddr, aLvalrefIndex, DIM(aLvalrefIndex), "arrayindextmp");
+		}
+
+	default:
+		break;
 	}
 
 	ShowErr(pAst->errinfo, "Can't get address to load or store from");
@@ -7062,6 +7754,115 @@ void GenerateBinaryAssignOperator(const SGenerateCtx & genx, const SGenerateBina
 	*pLvalref = {};
 }
 
+LLVMValueRef LvalrefConstruct(SWorkspace * pWork, SValue val)
+{
+	if (FIsInt(val.typek) || val.typek == TYPEK_Bool)
+	{
+		return LLVMConstInt(LtyperefGenerate(pWork, TidEnsure(pWork, SType{val.typek})), val.contents.n, false);
+	}
+	else if (FIsFloat(val.typek))
+	{
+		return LLVMConstReal(LtyperefGenerate(pWork, TidEnsure(pWork, SType{val.typek})), val.contents.g);
+	}
+
+	ASSERTCHZ(val.typek == TYPEK_Void, "Can't build constant from %s", PchzFromTypek(val.typek));
+	return {};
+}
+
+LLVMValueRef LvalrefGenerateConstant(const SGenerateCtx & genx, SAst * pAst)
+{
+	auto pWork = genx.pWork;
+
+	ASTK astk = pAst->astk;
+	switch (astk)
+	{
+	case ASTK_Literal:
+		{
+			auto pAstlit = PastCast<SAstLiteral>(pAst);
+			const SLiteral & lit = pAstlit->lit;
+			if (lit.litk == LITK_String && pAst->tid.pType->typek == TYPEK_Pointer)
+			{
+				ASSERT(PtypeCast<STypePointer>(pAst->tid.pType)->tidPointedTo.pType->typek == TYPEK_U8);
+
+				// BB (adrianb) String or StringPtr? Do we need to pool these manually?
+				// BB (adrianb) LLVMConstString instead?
+				return LLVMBuildGlobalStringPtr(pWork->lbuilder, lit.pChz, "stringptr");
+			}
+
+			return LvalrefConstruct(pWork, ValEvalConstant(pWork, pAst));
+		}
+
+	case ASTK_Cast:
+	case ASTK_Operator:
+	case ASTK_Identifier:
+		return LvalrefConstruct(pWork, ValEvalConstant(pWork, pAst));
+
+	case ASTK_Procedure:
+		return LvalrefEnsureProcedure(genx, PastCast<SAstProcedure>(pAst));
+
+	default:
+		ShowErr(pAst->errinfo, "Can't generate constant for ast %s(%d)", PchzFromAstk(astk), astk);
+		return {};
+	}
+}
+
+LLVMValueRef LvalrefGenerateDefaultValue(const SGenerateCtx & genx, STypeId tid, LLVMTypeRef ltyperef)
+{
+	// Generate default value
+
+	TYPEK typek = tid.pType->typek;
+
+	if (FIsInt(typek))
+	{
+		return LLVMConstInt(ltyperef, 0, false);
+	}
+	else if (FIsFloat(typek))
+	{
+		return LLVMConstReal(ltyperef, 0.0);
+	}
+	else if (typek == TYPEK_Pointer)
+	{
+		return LLVMConstNull(ltyperef);
+	}
+	else if (typek == TYPEK_Struct)
+	{
+		auto pTypestruct = PtypeCast<STypeStruct>(tid.pType);
+		int cMember = pTypestruct->cMember;
+		auto aLvalref = static_cast<LLVMValueRef *>(alloca(sizeof(LLVMValueRef) * cMember));
+		for (int iMember : IterCount(cMember))
+		{
+			auto pAstdecl = pTypestruct->aMember[iMember].pAstdecl;
+			ASSERT(!pAstdecl->fIsConstant);
+
+			// BB (adrianb) Are values always set to correct type?
+
+			if (pAstdecl->pAstValue)
+				aLvalref[iMember] = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
+			else
+				aLvalref[iMember] = LvalrefGenerateDefaultValue(genx, pAstdecl->tid, 
+																LtyperefGenerate(genx.pWork, pAstdecl->tid));
+		}
+
+		return LLVMConstStruct(aLvalref, cMember, false);
+	}
+	else if (typek == TYPEK_Array)
+	{
+		auto pTypearray = PtypeCast<STypeArray>(tid.pType);
+		ASSERT(!pTypearray->fSoa && pTypearray->cSizeFixed >= 0);
+		s64 cElement = pTypearray->cSizeFixed;
+		auto aLvalref = static_cast<LLVMValueRef *>(alloca(sizeof(LLVMValueRef) * cElement));
+		auto ltyperefElement = LtyperefGenerate(genx.pWork, pTypearray->tidElement);
+		for (int iElement : IterCount(cElement))
+		{
+			aLvalref[iElement] = LvalrefGenerateDefaultValue(genx, pTypearray->tidElement, ltyperefElement);
+		}
+
+		return LLVMConstArray(ltyperefElement, aLvalref, cElement);
+	}
+	
+	ASSERTCHZ(false, "Declaration default value for type %s NYI", StrPrintType(tid.pType).Pchz());
+}
+
 void MarkReturned(const SGenerateCtx & genx)
 {
 	genx.pGens->fReturnMarked = true;
@@ -7096,45 +7897,8 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 	switch (pAst->astk)
 	{
 	case ASTK_Literal:
-		{
-			const SLiteral & lit = PastCast<SAstLiteral>(pAst)->lit;
-			switch (lit.litk)
-			{
-			case LITK_Bool:
-			case LITK_Int:
-				*pLvalref = LLVMConstInt(LtyperefGenerate(pWork, pAst->tid), lit.n, false);
-				return;
-
-			case LITK_Float:
-				// BB (adrianb) Can't use APFloat from C-api. Do I care? I want explicit type anyways.
-
-				*pLvalref = LLVMConstReal(LtyperefGenerate(pWork, pAst->tid), lit.g);
-				return;
-
-			case LITK_String:
-				{
-					if (pAst->tid.pType->typek == TYPEK_Pointer)
-					{
-						ASSERT(PtypeCast<STypePointer>(pAst->tid.pType)->tidPointedTo.pType->typek == TYPEK_U8);
-
-						// BB (adrianb) String or StringPtr? Do we need to pool these manually?
-						*pLvalref = LLVMBuildGlobalStringPtr(lbuilder, lit.pChz, "stringptr");
-                        return;
-					}
-
-					ASSERT(false);
-				}
-				break;
-
-			default:
-				ASSERT(false);
-				break;
-			}
-		}
-		break;
-
 	case ASTK_Null:
-		LLVMConstNull(LtyperefGenerate(pWork, pAst->tid));
+		*pLvalref = LvalrefGenerateConstant(genx, pAst);
 		break;
 
 #if 0
@@ -7160,16 +7924,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
 			if (pAstdecl->fIsConstant)
 			{
-				if (pAstdecl->pAstValue->astk == ASTK_Procedure)
-				{
-					*pLvalref = LvalrefEnsureProcedure(genx, PastCast<SAstProcedure>(pAstdecl->pAstValue));
-					return;
-				}
-
-				// BB (adrianb) Do a separate pass for validating this is a generated constant?
-				*pLvalref = LLVMValueRef();
-				GenerateRecursive(genx, pAstdecl->pAstValue, pLvalref);
-				ASSERT(*pLvalref);
+				*pLvalref = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
 			}
 			else
 			{
@@ -7257,6 +8012,13 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 						GenerateBinaryAssignOperator(genx, gbop, pAstLeft, pAstRight, pLvalref);
 						return;
 					}
+				}
+
+				if (strcmp(pChzOp, ".") == 0)
+				{
+					auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstop);
+					*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "membertmp");
+					return;
 				}
 
 				if (strcmp(pChzOp, "=") == 0)
@@ -7354,44 +8116,89 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 		{
 			auto pAstcast = PastCast<SAstCast>(pAst);
 
+			LLVMValueRef lvalrefExpr = {};
+			GenerateRecursive(genx, pAstcast->pAstExpr, &lvalrefExpr);
+
 			STypeId tidSrc = pAstcast->pAstExpr->tid;
 			STypeId tidDst = pAstcast->tid;
 
 			if (tidSrc == tidDst)
+			{
+				*pLvalref = lvalrefExpr;
 				return;
-
-			LLVMValueRef lvalrefExpr = {};
-			GenerateRecursive(genx, pAstcast->pAstExpr, &lvalrefExpr);
+			}
 
 			TYPEK typekSrc = tidSrc.pType->typek;
 			TYPEK typekDst = tidDst.pType->typek;
 
 			LLVMTypeRef ltyperefDst = LtyperefGenerate(pWork, tidDst);
 
-			if (FIsInt(typekDst) && FIsInt(typekSrc))
+			if (FIsInt(typekSrc))
 			{
-				// sext or zext when up casting in bitcount
-
-				if (CBit(typekSrc) > CBit(typekDst))
+				if (FIsInt(typekDst))
 				{
-					*pLvalref = LLVMBuildTrunc(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
-				}
-				else
-				{
-					// BB (adrianb) Zext is faster than sext. Should we emit zext more often?
-					//  Default to unsigned more often?
+					// sext or zext when up casting in bitcount
 
-					if (FSigned(typekSrc))
+					if (CBit(typekSrc) > CBit(typekDst))
 					{
-						*pLvalref = LLVMBuildSExt(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+						*pLvalref = LLVMBuildTrunc(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
 					}
 					else
 					{
-						*pLvalref = LLVMBuildZExt(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
-					}
-				}
+						// BB (adrianb) Zext is faster than sext. Should we emit zext more often?
+						//  Default to unsigned more often?
 
-				return;
+						if (FSigned(typekSrc))
+						{
+							*pLvalref = LLVMBuildSExt(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+						}
+						else
+						{
+							*pLvalref = LLVMBuildZExt(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+						}
+					}
+
+					return;
+				}
+				else if (FIsFloat(typekDst))
+				{
+					if (FSigned(typekSrc))
+					{
+						*pLvalref = LLVMBuildSIToFP(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+					}
+					else
+					{
+						*pLvalref = LLVMBuildUIToFP(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+					}
+					return;
+				}
+			}
+			else if (FIsFloat(typekSrc))
+			{
+				if (FIsFloat(typekDst))
+				{
+					if (CBit(typekSrc) > CBit(typekDst))
+					{
+						*pLvalref = LLVMBuildFPTrunc(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+					}
+					else
+					{
+						*pLvalref = LLVMBuildFPExt(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+					}
+					return;
+				}
+				else if (FIsInt(typekDst))
+				{
+					if (FSigned(typekSrc))
+					{
+						*pLvalref = LLVMBuildFPToSI(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+					}
+					else
+					{
+						*pLvalref = LLVMBuildFPToUI(lbuilder, lvalrefExpr, ltyperefDst, "casttmp");
+					}
+					return;
+				}
 			}
 
 			ASSERTCHZ(false, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
@@ -7406,9 +8213,14 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 	ASTK_Defer,
 	ASTK_Inline,
 	ASTK_PushContext, // BB (adrianb) unconvinced about this.  Is it thread safe?
-
-	ASTK_ArrayIndex,
 #endif
+
+	case ASTK_ArrayIndex:
+		{
+			auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAst);
+			*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "arrayindextmp");
+		}
+		break;
 
 	case ASTK_Call:
 		{
@@ -7488,18 +8300,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			}
 			else
 			{
-				// Generate default value
-
-				TYPEK typek = pAstdecl->tid.pType->typek;
-
-				if (FIsInt(typek))
-				{
-					lvalrefInitial = LLVMConstInt(ltyperefStore, 0, false);
-				}
-				else
-				{
-					ASSERTCHZ(false, "Declaration default value for type %s NYI", StrPrintType(pAstdecl->tid.pType).Pchz());
-				}
+				lvalrefInitial = LvalrefGenerateDefaultValue(genx, pAstdecl->tid, ltyperefStore);
 			}
 
 			// BB (adrianb) Return value? Or register it against this AST node?
@@ -7592,9 +8393,41 @@ void GenerateAll(SWorkspace * pWork)
 	// BB (adrianb) Is this ok for debugging?
 
 	pWork->lmodule = LLVMModuleCreateWithName(pWork->aryModule[0].pChzFile);
+	// BB (adrianb) How do I get this string from arbitrary platform? Also C generates a target data layout.
+	LLVMSetTarget(pWork->lmodule, "x86_64-apple-macosx10.11.0"); 
 
 	for (auto pModule : IterPointer(pWork->aryModule))
 	{
+		for (auto pAst : pModule->pAstblockRoot->arypAst)
+		{
+			if (pAst->astk != ASTK_DeclareSingle)
+				continue;
+
+			// BB (adrianb) Keep storage for constants when they are things like strings or structs or whatnot? 
+			auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
+			if (pAstdecl->fIsConstant)
+				continue;
+
+			SGenerateState gens = {};
+			SGenerateCtx genx = { pWork, pWork->lmodule, &gens };
+
+			// BB (adrianb) Need to generate unique name?
+
+			LLVMTypeRef ltyperef = LtyperefGenerate(pWork, pAstdecl->tid);
+
+			LLVMValueRef lvalrefGlobal = LLVMAddGlobal(pWork->lmodule, ltyperef, pAstdecl->pChzName);
+			RegisterStorage(pWork, pAstdecl, lvalrefGlobal);
+			if (pAstdecl->pAstValue)
+			{
+				// Globals always have initializers
+				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateConstant(genx, pAstdecl->pAstValue));
+			}
+			else
+			{
+				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(genx, pAstdecl->tid, ltyperef));
+			}
+		}
+
 		// Generate code for functions in this module
 
 		for (auto pAstproc : pModule->arypAstproc)
@@ -7735,7 +8568,7 @@ void RunUnitTests()
 		"S :: struct { a :: \"6.0\"; }"
 		"a :: S.a;",
 		"(DeclareSingle const a infer-type (. 'S 'a))", 
-		"(DeclareSingle string infer-type (. string S string))");
+		"(DeclareSingle string infer-type (. string (Type S) string))");
 
 	CompileAndCheckDeclaration("operator-pluseq", "Add",
 		"Add :: (n : int) -> int { n += 5; return n; } ",
@@ -8040,7 +8873,7 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
-	- Default initialization of structs. Add struct init syntax? E.g. StructName(named parameter arguments)?
+	- Add struct init syntax? E.g. StructName(named parameter arguments)?
 	- #run #check. Use LLVM JIT. Side effects to globals must be persisted. Eg. init_crc64. How to do this? After every
 		#run copy out all globals? Can we wait until ALL #runs have been run and then copy out globals? What if they point
 		to allocated memory or something?

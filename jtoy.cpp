@@ -6904,7 +6904,6 @@ LOperatorDone:
 		break;
 
 	case ASTK_Defer: 
-		// BB (adrianb) Switch to substituting AST at all return/break/continue etc?
 		pAst->tid = pWork->tidVoid;
 		break;
 
@@ -7511,9 +7510,16 @@ void RegisterStorage(SWorkspace * pWork, SAstDeclareSingle * pAstdecl, LLVMValue
 	Add(&pWork->hashPastdeclStorage, hv, pAstdecl, {lvalrefPtr});
 }
 
+struct SScopeCtx
+{
+	int ipAstDeferMic;
+};
+
 struct SGenerateState
 {
+	SArray<SAst *> arypAstDefer;
 	bool fReturnMarked;
+	bool fInProcedure;
 };
 
 struct SGenerateCtx
@@ -7524,6 +7530,11 @@ struct SGenerateCtx
 
 	SGenerateState * pGens;
 };
+
+SScopeCtx Scopectx(const SGenerateCtx & genx)
+{
+	return { genx.pGens->arypAstDefer.c };
+}
 
 LLVMValueRef LvalrefEnsureProcedure(const SGenerateCtx & genx, SAstProcedure * pAstproc)
 {
@@ -7884,6 +7895,26 @@ void Branch(const SGenerateCtx & genx, LLVMBasicBlockRef lbbref)
 	LLVMBuildBr(genx.pWork->lbuilder, lbbref);
 }
 
+void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pLvalref);
+void PopScope(const SGenerateCtx & genx, const SScopeCtx & scopectx)
+{
+	while (genx.pGens->arypAstDefer.c > scopectx.ipAstDeferMic)
+	{
+		auto pAstDefer = Tail(&genx.pGens->arypAstDefer);
+		Pop(&genx.pGens->arypAstDefer);
+		GenerateRecursive(genx, pAstDefer, nullptr);
+	}
+}
+
+void EarlyReturnPopScopes(const SGenerateCtx & genx)
+{
+	for (int ipAst : IterCount(genx.pGens->arypAstDefer.c))
+	{
+		auto pAstDefer = Tail(&genx.pGens->arypAstDefer, ipAst);
+		GenerateRecursive(genx, pAstDefer, nullptr);
+	}
+}
+
 void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pLvalref)
 {
 	SWorkspace * pWork = genx.pWork;
@@ -7906,10 +7937,12 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 #endif
 	case ASTK_Block:
 		{
+			SScopeCtx scopectx = Scopectx(genx);
 			for (auto pAst : PastCast<SAstBlock>(pAst)->arypAst)
 			{
 				GenerateRecursive(genx, pAst, nullptr);
 			}
+			PopScope(genx, scopectx);
 		}
 		break;
 
@@ -8040,6 +8073,8 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 		{
 			// Construct a test basic block and jump to it, fill into that block
 			// Run while loop body and jump to test basic block
+
+			// BB (adrianb) Scope for if pass or else?
 
 			auto pAstif = PastCast<SAstIf>(pAst);
 
@@ -8210,7 +8245,14 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 	ASTK_New,
 	ASTK_Delete,
 	ASTK_Remove, // yuck, use #remove instead? Not compile time...
-	ASTK_Defer,
+#endif
+
+	case ASTK_Defer:
+		{
+			Append(&genx.pGens->arypAstDefer, PastCast<SAstDefer>(pAst)->pAstStmt);
+		}
+		break;
+#if 0
 	ASTK_Inline,
 	ASTK_PushContext, // BB (adrianb) unconvinced about this.  Is it thread safe?
 #endif
@@ -8260,6 +8302,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 			if (pAst->tid.pType->typek == TYPEK_Void)
 			{
+				EarlyReturnPopScopes(genx);
 				LLVMBuildRetVoid(lbuilder);
 				return;
 			}
@@ -8268,6 +8311,8 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				ASSERT(pAstret->arypAstRet.c == 1);
 				LLVMValueRef lvalref = {};
 				GenerateRecursive(genx, pAstret->arypAstRet[0], &lvalref);
+				
+				EarlyReturnPopScopes(genx);
 				LLVMBuildRet(lbuilder, lvalref);
                 return;
 			}
@@ -8287,6 +8332,8 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 			// BB (adrianb) We need to do this in the entry block for all normal variables per
 			//  http://llvm.org/docs/Frontend/PerformanceTips.html#use-of-allocas
+
+			// BB (adrianb) Don't generate procedures here, just get address?
 
 			auto ltyperefStore = LtyperefGenerate(pWork, pAstdecl->tid);
 			auto lvalrefPtr = LLVMBuildAlloca(lbuilder, ltyperefStore, pAstdecl->pChzName);
@@ -8322,6 +8369,10 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 		{
 			auto pAstproc = PastCast<SAstProcedure>(pAst);
 
+			ASSERT(!genx.pGens->fInProcedure && genx.pGens->arypAstDefer.c == 0);
+
+			genx.pGens->fInProcedure = true;
+
 			auto lvalrefProc = LvalrefEnsureProcedure(genx, pAstproc);
 			ASSERT(pLvalref == &lvalrefDontCare);
 
@@ -8346,6 +8397,8 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
             auto pAstblock = pAstproc->pAstblock;
             if (pAstblock)
             {
+				SScopeCtx scopectx = Scopectx(genx);
+
                 LLVMValueRef lvalref = {};
                 GenerateRecursive(genx, pAstblock, &lvalref);
 
@@ -8356,9 +8409,22 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
                 		ShowErr(pAstproc->errinfo, "Procedure didn't return a value");
                 	}
 
+                	PopScope(genx, scopectx);
+
                 	LLVMBuildRetVoid(lbuilder);
                 }
+                else
+                {
+                	// Assuming someone else has already returned and performed defer operations, 
+                	//  just reset scopes here.
+
+                	// BB (adrianb) Code might be simpler if we did store return value.
+
+                	genx.pGens->arypAstDefer.c = 0;
+                }
             }
+
+			genx.pGens->fInProcedure = false;
 		}
 		break;
 

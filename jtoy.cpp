@@ -46,17 +46,21 @@
 #include "llvm-c/Core.h"
 #include "llvm-c/Analysis.h"
 #include "llvm-c/BitWriter.h"
+#include "llvm-c/TargetMachine.h"
 
 // Compilation phases:
 // Parse to AST, no types
-// Recursively parse #import directives
-// Recursive typecheck, code gen, execution.
-//  1. Seed declaration table with all top level declarations unresolved.
-//  2. Pick one off the list to compile. Need to pick top level #run directives first?
-//  3. Typecheck amending AST, then generate code for it.  
-//	   May require recursing to later unresolved declarations.  If we try and resolve an declaration that's in progress, error.
-//     ??? Recursion can include typecheck, code gen and compile time execution.
-//  4. Seed the list with unresolved top level functions.
+// Perform all #import directives
+// Out of order typechecking:
+//  1. Flatten AST into type check order list.
+//  2. Iterate over list performing type checking, if we find a declaration that is unresolved, push current progress
+//		onto the stack and switch to it.
+//  3. Continue type checking popping off the progress stack until we're done.
+// Generate: global variables then procedures.
+//  Running modify procs during type checking will require generating and executing code during type checking.
+//  How to keep fast?
+
+
 
 // Some basic typedefs
 
@@ -1077,28 +1081,29 @@ inline bool operator != (STypeId tid0, STypeId tid1)
 	return tid0.pType != tid1.pType;
 }
 
-enum SYMTK
+enum SYMTBLK
 {
-	SYMTK_Scope,
-	SYMTK_Procedure,
-	SYMTK_TopLevel,
-	SYMTK_Struct,
+	SYMTBLK_Scope,
+	SYMTBLK_Procedure,
+	SYMTBLK_TopLevel,
+	SYMTBLK_Struct,
 
-	SYMTK_Max,
-	SYMTK_RegisterAllMic = SYMTK_TopLevel
+	SYMTBLK_Max,
+	SYMTBLK_RegisterAllMic = SYMTBLK_TopLevel
 };
 
-struct SResolve;
 struct SAstProcedure;
 struct SAstDeclareSingle;
 struct SStorage;
 struct STypeStruct;
+struct SResolveDecl;
 
 struct SSymbolTable
 {
-	SYMTK symtk;
+	SYMTBLK symtblk;
 	SSymbolTable * pSymtParent;
-	SArray<SResolve *> arypResolve; // Declarations, may be finished or unfinished if out of order
+	SArray<SResolveDecl *> arypResdecl; // Declarations, may be finished or unfinished if out of order
+	int ipResdeclUsing;
 
 	SAstProcedure * pAstproc; // Function for procedure symbol tables
 	STypeStruct * pTypestruct; // Function for procedure symbol tables
@@ -1141,7 +1146,7 @@ struct SWorkspace
 	SArray<SSymbolTable *> arypSymtAll; // All symbol tables for destroying
 
 	SHash<STypeId, SSymbolTable *> hashTidPsymtStruct; // Struct registration
-	SHash<SAst *, SAstDeclareSingle *> hashPastPastdeclResolved;
+	SHash<SAst *, SResolveDecl *> hashPastPresdeclResolved;
 
 	// Code generation
 
@@ -2308,8 +2313,6 @@ struct SAstTypeArray : public SAst
 	SAst * pAstTypeInner;
 };
 
-struct SDeclaration;
-
 struct SAstTypeProcedure : public SAst
 {
 	static const ASTK s_astk = ASTK_TypeProcedure;
@@ -2858,7 +2861,6 @@ SAstDeclareSingle * PastdeclParseSimple(SWorkspace * pWork)
 		tokIdent = TokPeek(pWork);
 	}
 
-
 	SAstDeclareSingle * pAstdecl = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
 
 	SToken tokDefineOp = TokPeek(pWork, 1);
@@ -2872,6 +2874,7 @@ SAstDeclareSingle * PastdeclParseSimple(SWorkspace * pWork)
 	ConsumeToken(pWork, 2);
 
 	pAstdecl->pChzName = tokIdent.ident.pChz;
+	pAstdecl->fUsing = fUsing;
 
 	const char * pChzColonOp = tokDefineOp.op.pChz;
 	if (strcmp(pChzColonOp, ":") == 0)
@@ -4655,9 +4658,6 @@ bool FAreSameType(const SType * pType0, const SType * pType1)
 	if (pType0->typek != pType1->typek)
 		return false;
 
-	// BB (adrianb) Can we be sure dependent types are fully resolved?
-	//  If so just compare pointers for inner types.
-
 	if (FIsBuiltinType(pType0->typek))
 		return true;
 
@@ -4912,37 +4912,34 @@ u32 HvFromType(const SType & type)
 //  indirecting, because using requires it.  Could try to support partial, but
 //  that gets really complex really fast.
 
-struct SSymbolTable;
-
 struct STypeRecurse
 {
 	// BB (adrianb) We'll need these hooked up for code generation. Annotate the AST values directly?
 	SAst ** ppAst;
 	SSymbolTable * pSymtParent;
-	SResolve * pResolve; // BB (adrianb) Provide hash to these? Can always just search again if in same scope.
 };
 
-// BB (adrianb) Change this to resolve declaration?
-
-struct SResolve
+struct SDeclaration
 {
-	// BB (adrianb) Merge this into SAstIdentifier? Or SAst for pSymtParent?
-
-	SSymbolTable * pSymtParent;
 	const char * pChzName;
 
 	// BB (adrianb) Need this for specific instances of declarations. Better way to store it?
-	// BB (adrianb) Name of storage variable? Need to know if parent is struct or not.
-	//  Need to keep track of where each identifier resolves to? Is it ambuiguous after our normal pass?
 
 	SAstDeclareSingle * pAstdecl; // Which instance of a procedure is it? Which declaration (do we care)?
 
-	// For out of sync declarations type check in any order, not done until pType is set, 
-	//  struct not searchable until iTrecCur is done.
+	// For out of sync declarations type check in any order, not done until pType is set.
 
 	int iTrecCur;
 	SArray<STypeRecurse> aryTrec;
 };
+
+struct SResolveDecl
+{
+	SDeclaration * pDecl; // Declaration to resolve
+	SArray<SDeclaration *> arypDeclUsingPath; // Using path, statically allocated
+};
+
+
 
 template <class T>
 T * PtypeClone(SWorkspace * pWork, const T * pTIn, SType ** ppType)
@@ -5033,42 +5030,161 @@ inline STypeId TidEnsure(SWorkspace * pWork, const SType & typeTry)
 	return TidEnsure(pWork, &typeTry);
 }
 
-SResolve * PresolveLookup(SSymbolTable * pSymt, const char * pChzName)
+struct STypeCheckSwitch // tag = tcswitch
 {
-	// BB (adrianb) Don't allow lookup of parent non-constant stuff when crossing function boundary.
+	SDeclaration * pDecl;
+};
 
-	for (auto pResolve : pSymt->arypResolve)
+enum RESLK
+{
+	RESLK_Local,
+	RESLK_WithUsing
+};
+
+SResolveDecl * PresdeclLookupSimple(SSymbolTable * pSymt, const char * pChzName, RESLK reslk)
+{
+	for (auto pResdecl : pSymt->arypResdecl)
 	{
-		if (strcmp(pResolve->pChzName, pChzName) == 0)
-			return pResolve;
+		if (strcmp(pResdecl->pDecl->pChzName, pChzName) == 0)
+			return pResdecl;
 	}
 
+	// BB (adrianb) Add or strip using rights when lookup up in parent scopes? For some scopes this might be fine.
+	//  Others maybe not.
+
 	if (pSymt->pSymtParent)
-		return PresolveLookup(pSymt->pSymtParent, pChzName);
+		return PresdeclLookupSimple(pSymt->pSymtParent, pChzName, reslk);
 
 	return nullptr;
 }
 
-SResolve * PresolveAdd(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, SAstDeclareSingle * pAstdecl)
+void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, SAstDeclareSingle * pAstdecl,
+					SDeclaration ** ppDeclRet = nullptr, const SArray<SDeclaration *> & arypDeclUsingPath = {})
 {
+	// BB (adrianb) Check that we aren't doing this during type checking? Or if we do it's a using decl?
 	// BB (adrianb) Need to deal with overloading somehow.
-	// BB (adrianb) Line info needed.
 
-	if (PresolveLookup(pSymt, pChzName))
+	if (PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing))
+	{
 		ShowErr((pAstdecl) ? pAstdecl->errinfo : SErrorInfo(), "Duplicate symbol found");
+	}
 
-	SResolve * pResolve = PtAlloc<SResolve>(&pWork->pagealloc);
-    pResolve->pChzName = pChzName;
-	pResolve->pSymtParent = pSymt;
-	pResolve->pAstdecl = pAstdecl;
-	Append(&pSymt->arypResolve, pResolve);
-	return pResolve;
+	auto pDecl = PtAlloc<SDeclaration>(&pWork->pagealloc);
+    pDecl->pChzName = pChzName;
+	pDecl->pAstdecl = pAstdecl;
+
+	if (ppDeclRet)
+		*ppDeclRet = pDecl;
+	
+	auto pResdecl = PtAlloc<SResolveDecl>(&pWork->pagealloc);
+	pResdecl->pDecl = pDecl;
+	pResdecl->arypDeclUsingPath = arypDeclUsingPath;
+
+	Append(&pSymt->arypResdecl, pResdecl);
 }
 
-SSymbolTable * PsymtCreate(SYMTK symtk, SWorkspace * pWork, SSymbolTable * pSymtParent)
+SSymbolTable * PsymtStructLookup(SWorkspace * pWork, STypeId tid);
+
+bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch * pTcswitch)
+{
+	if (pSymt->pSymtParent)
+	{
+		if (!FTryResolveUsing(pWork, pSymt->pSymtParent, pTcswitch))
+			return false;
+	}
+		
+	for (; pSymt->ipResdeclUsing < pSymt->arypResdecl.c; ++pSymt->ipResdeclUsing)
+	{
+		auto pResdecl = pSymt->arypResdecl[pSymt->ipResdeclUsing];
+		auto pDecl = pResdecl->pDecl;
+		auto pAstdecl = pDecl->pAstdecl;
+		if (!pAstdecl->fUsing)
+			continue;
+
+		// Wait for this type to be resolved
+
+		if (pAstdecl->tid.pType == nullptr)
+		{
+			pTcswitch->pDecl = pDecl;
+			return false;
+		}
+
+		// Add the contents of the symbol table of the struct we are using
+		//  Or constant entries in a straight type's namespace
+
+		if (pAstdecl->tid.pType->typek == TYPEK_Struct)
+		{
+			auto pSymtStruct = PsymtStructLookup(pWork, pAstdecl->tid);
+
+			if (pSymt == pSymtStruct)
+			{
+				// BB (adrianb) Better error here?
+				ShowErr(pAstdecl->errinfo, "Loop in using members.");
+			}
+
+			for (auto pResdeclUse : pSymtStruct->arypResdecl)
+			{
+				// Ignore symbol table retrieved by using, we'll get there eventually
+
+				if (pResdeclUse->arypDeclUsingPath.c > 0)
+					continue;
+
+				int cpDeclUsing = pResdecl->arypDeclUsingPath.c + 1;
+				auto apDeclUsing = PtAlloc<SDeclaration *>(&pWork->pagealloc, cpDeclUsing);
+				for (int ipDeclUsing : IterCount(cpDeclUsing - 1))
+				{
+					apDeclUsing[ipDeclUsing] = pResdecl->arypDeclUsingPath[ipDeclUsing];
+				}
+
+				apDeclUsing[cpDeclUsing - 1] = pResdecl->pDecl;
+
+				const char * pChzName = pResdeclUse->pDecl->pAstdecl->pChzName;
+				if (PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing))
+				{
+					// BB (adrianb) Need better error reporting info for both conflicting symbol paths?
+
+					auto pAstdeclRoot = apDeclUsing[0]->pAstdecl;
+					ShowErr(pAstdeclRoot->errinfo, "Duplicate symbol %s imported through using declaration", pChzName);
+				}
+
+				auto pResdeclUsing = PtAlloc<SResolveDecl>(&pWork->pagealloc);
+				pResdeclUsing->pDecl = pResdeclUse->pDecl;
+				pResdeclUsing->arypDeclUsingPath = { apDeclUsing, cpDeclUsing };
+				
+				Append(&pSymt->arypResdecl, pResdeclUsing);
+			}
+		}
+		else
+		{
+			ShowErr(pAstdecl->errinfo, "Can't apply using to a non-struct type.");
+		}
+	}
+
+	return true;
+}
+
+bool FTryResolveSymbolWithUsing(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, 
+					   			STypeCheckSwitch * pTcswitch, SResolveDecl ** ppResdecl)
+{
+	// Resolve using declarations all the way up the chain
+	if (!FTryResolveUsing(pWork, pSymt, pTcswitch))
+		return false;
+
+	auto pResdecl = PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing);
+	if (pResdecl && pResdecl->pDecl->pAstdecl->tid.pType == nullptr)
+	{
+		pTcswitch->pDecl = pResdecl->pDecl;
+		return false;
+	}
+
+	*ppResdecl = pResdecl;
+	return true;
+}
+
+SSymbolTable * PsymtCreate(SYMTBLK symtblk, SWorkspace * pWork, SSymbolTable * pSymtParent)
 {
 	SSymbolTable * pSymt = PtAlloc<SSymbolTable>(&pWork->pagealloc);
-	pSymt->symtk = symtk;
+	pSymt->symtblk = symtblk;
 	pSymt->pSymtParent = pSymtParent;
 	Append(&pWork->arypSymtAll, pSymt);
 	return pSymt;
@@ -5084,7 +5200,7 @@ SSymbolTable * PsymtStructLookup(SWorkspace * pWork, STypeId tid)
 
 void RegisterStruct(SWorkspace * pWork, STypeId tid, SSymbolTable * pSymt)
 {
-	ASSERT(pSymt->symtk == SYMTK_Struct);
+	ASSERT(pSymt->symtblk == SYMTBLK_Struct);
 	auto hv = HvFromKey(tid);
 	ASSERT(!PtLookupImpl(&pWork->hashTidPsymtStruct, hv, tid));
     
@@ -5114,7 +5230,7 @@ void AddBuiltinType(SWorkspace * pWork, const char * pChzName, const SType & typ
 	// BB (adrianb) No type/value ast? Ok?
 
 	auto pSymt = &pWork->symtBuiltin;
-	(void) PresolveAdd(pWork, pSymt, pChzName, pAstdecl);
+	AddDeclaration(pWork, pSymt, pChzName, pAstdecl);
 
 	if (pTid)
 		*pTid = tid;
@@ -5132,7 +5248,7 @@ void InitWorkspace(SWorkspace * pWork)
 	Append(&pWork->arypSymtAll, &pWork->symtBuiltin);
 	Append(&pWork->arypSymtAll, &pWork->symtRoot);
 
-	pWork->symtRoot.symtk = SYMTK_TopLevel;
+	pWork->symtRoot.symtblk = SYMTBLK_TopLevel;
 
 	// Initialize built in types
 
@@ -5175,11 +5291,11 @@ void Destroy(SWorkspace * pWork)
 
 	for (auto pSymt : pWork->arypSymtAll)
 	{
-		for (auto pResolve : pSymt->arypResolve)
+		for (auto pResdecl : pSymt->arypResdecl)
 		{
-			Destroy(&pResolve->aryTrec);
+			Destroy(&pResdecl->pDecl->aryTrec);
 		}
-		Destroy(&pSymt->arypResolve);
+		Destroy(&pSymt->arypResdecl);
 	}
 	Destroy(&pWork->arypSymtAll);
 	Destroy(&pWork->hashTidPsymtStruct);
@@ -5198,7 +5314,7 @@ void Destroy(SWorkspace * pWork)
 	if (pWork->lmodule)
 		LLVMDisposeModule(pWork->lmodule);
 
-	Destroy(&pWork->hashPastPastdeclResolved);
+	Destroy(&pWork->hashPastPresdeclResolved);
 	Destroy(&pWork->hashPastprocLvalref);
 	Destroy(&pWork->hashPastdeclStorage);
 
@@ -5226,7 +5342,7 @@ struct SRecurseCtx // tag = recx
 
 SRecurseCtx RecxNewScope(const SRecurseCtx & recx)
 {
-	auto pSymt = PsymtCreate(SYMTK_Scope, recx.pWork, recx.pSymtParent);
+	auto pSymt = PsymtCreate(SYMTBLK_Scope, recx.pWork, recx.pSymtParent);
 	pSymt->pSymtParent = recx.pSymtParent;
 
 	SRecurseCtx recxNew = recx;
@@ -5235,7 +5351,7 @@ SRecurseCtx RecxNewScope(const SRecurseCtx & recx)
 	return recxNew;
 }
 
-void AppendAst(const SRecurseCtx & recx, SAst ** ppAst, SResolve * pResolve = nullptr)
+void AppendAst(const SRecurseCtx & recx, SAst ** ppAst)
 {
 	auto pTrec = PtAppendNew(recx.paryTrec);
 	pTrec->ppAst = ppAst;
@@ -5248,7 +5364,7 @@ void RecurseTypeCheck(const SRecurseCtx & recxIn, SAst ** ppAst);
 
 void RecurseProcArgRet(SRecurseCtx * pRecxProc, SAstProcedure * pAstproc)
 {
-	SSymbolTable * pSymtProc = PsymtCreate(SYMTK_Procedure, pRecxProc->pWork, pRecxProc->pSymtParent);
+	SSymbolTable * pSymtProc = PsymtCreate(SYMTBLK_Procedure, pRecxProc->pWork, pRecxProc->pSymtParent);
 	pSymtProc->pAstproc = pAstproc;
 	pRecxProc->pSymtParent = pSymtProc;
 
@@ -5285,14 +5401,15 @@ void RecurseTypeCheckDecl(const SRecurseCtx & recxIn, SAst ** ppAst)
 			// Register for out-of-order when a constant, top level, or in a struct.
 
 			if (pAstdecl->pChzName && 
-				(pAstdecl->fIsConstant || recx.pSymtParent->symtk >= SYMTK_RegisterAllMic))
+				(pAstdecl->fIsConstant || recx.pSymtParent->symtblk >= SYMTBLK_RegisterAllMic))
 			{
-				SResolve * pResolve = PresolveAdd(recx.pWork, recx.pSymtParent, pAstdecl->pChzName, pAstdecl);
+				SDeclaration * pDecl;
+				AddDeclaration(recx.pWork, recx.pSymtParent, pAstdecl->pChzName, pAstdecl, &pDecl);
 
 				// Procedure handles its own declaration addition
 
-				if (recx.pSymtParent->symtk != SYMTK_Procedure)
-					recx.paryTrec = &pResolve->aryTrec;
+				if (recx.pSymtParent->symtblk != SYMTBLK_Procedure)
+					recx.paryTrec = &pDecl->aryTrec;
 			}
 
 			if (pAstdecl->pAstType)
@@ -5331,7 +5448,7 @@ void RecurseTypeCheckDecl(const SRecurseCtx & recxIn, SAst ** ppAst)
 		break;
             
     case ASTK_ImportDirective:
-        if (recxIn.pSymtParent->symtk == SYMTK_TopLevel)
+        if (recxIn.pSymtParent->symtblk == SYMTBLK_TopLevel)
             break;
         // Intentional fallthrough...
 
@@ -5374,10 +5491,6 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 
 	case ASTK_Operator:
 		{
-			// BB (adrianb) If processing a . don't recurse right, just left then do identifier resolve on right in 
-			//  context of left.
-			// Actual operators: +=,-=,*=,/=,=,~,^,&,|,!,&=,^=
-
 			auto pAstop = PastCast<SAstOperator>(pAst);
 
 			if (pAstop->pAstLeft)
@@ -5514,7 +5627,7 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 
 			SRecurseCtx recxStruct = recx;
 
-			SSymbolTable * pSymtMembers = PsymtCreate(SYMTK_Struct, recx.pWork, recx.pSymtParent);
+			SSymbolTable * pSymtMembers = PsymtCreate(SYMTBLK_Struct, recx.pWork, recx.pSymtParent);
 			recxStruct.pSymtParent = pSymtMembers;
 
 			// Type check the struct right away, will create type but not fill it in
@@ -6174,25 +6287,27 @@ bool FTryCoerceOperatorAssign(SWorkspace * pWork, SAstOperator * pAstop, GRFBOPI
 	return false;
 }
 
-SAstDeclareSingle * PastdeclResolved(SWorkspace * pWork, SAst * pAstIdent)
+SResolveDecl * PresdeclResolved(SWorkspace * pWork, SAst * pAstIdent)
 {
 	auto hv = HvFromKey(reinterpret_cast<u64>(pAstIdent));
-	SAstDeclareSingle ** ppAstdecl = PtLookupImpl(&pWork->hashPastPastdeclResolved, hv, pAstIdent);
-	return (ppAstdecl) ? *ppAstdecl : nullptr;
+	SResolveDecl ** ppResdecl = PtLookupImpl(&pWork->hashPastPresdeclResolved, hv, pAstIdent);
+	return (ppResdecl) ? *ppResdecl : nullptr;
 }
 
-void RegisterResolved(SWorkspace * pWork, SAst * pAstIdent, SAstDeclareSingle * pAstdecl)
+void RegisterResolved(SWorkspace * pWork, SAst * pAstIdent, SResolveDecl * pResdecl)
 {
-	ASSERT(PastdeclResolved(pWork, pAstIdent) == nullptr);
+	ASSERT(PresdeclResolved(pWork, pAstIdent) == nullptr);
 	auto hv = HvFromKey(reinterpret_cast<u64>(pAstIdent));
-	Add(&pWork->hashPastPastdeclResolved, hv, pAstIdent, pAstdecl);
+	Add(&pWork->hashPastPresdeclResolved, hv, pAstIdent, pResdecl);
 }
 
 
+
+// BB (adrianb) Move the bulk of this downward?
 
 struct SValue
 {
-	// BB (adrianb) If we want to hold typed NULL 
+	// BB (adrianb) If we want to hold typed NULL need STypeId.
 	TYPEK typek;
 	union
 	{
@@ -6471,7 +6586,8 @@ SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
 		{
 			// This must be a variable if we are evaluating it directly
 
-			SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
+			auto pResdecl = PresdeclResolved(pWork, pAst);
+			auto pAstdecl = pResdecl->pDecl->pAstdecl;
 			if (!pAstdecl->fIsConstant)
 			{
 				ShowErr(pAst->errinfo, "Expected a reference to a constant");
@@ -6540,9 +6656,11 @@ SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
 						if (pSymtStruct)
 						{
 							auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
-							auto pResolve = PresolveLookup(pSymtStruct, pAstident->pChz);
+							// BB (adrianb) Lookup from RegisterResolved instead?
+							auto pResdecl = PresdeclResolved(pWork, pAstident);
+							ASSERT(pResdecl);
 
-							return ValEvalConstant(pWork, pResolve->pAstdecl->pAstValue);
+							return ValEvalConstant(pWork, pResdecl->pDecl->pAstdecl->pAstValue);
 						}
 					}
 				}
@@ -6627,13 +6745,6 @@ SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
 	}
 }
 
-
-
-struct STypeCheckSwitch // tag = tcswitch
-{
-	SResolve * pResolve;
-};
-
 void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcswitch)
 {
 	SAst * pAst = *pTrec->ppAst;
@@ -6664,23 +6775,35 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 			//   set pTcsw to switch to that declaration (pushing the current one on the stack).
 
 			auto pAstident = PastCast<SAstIdentifier>(pAst);
-			auto pResolve = PresolveLookup(pTrec->pSymtParent, pAstident->pChz);
+			auto pSymt = pTrec->pSymtParent;
 
-			if (!pResolve)
+			SResolveDecl * pResdecl;
+			if (pSymt->symtblk >= SYMTBLK_RegisterAllMic)
+			{
+				pResdecl = PresdeclLookupSimple(pSymt, pAstident->pChz, RESLK_Local);
+			}
+			else if (!FTryResolveSymbolWithUsing(pWork, pSymt, pAstident->pChz, pTcswitch, &pResdecl))
+			{
+				// We have switched to resolving another declaration
+				ASSERT(pTcswitch->pDecl);
+				break;
+			}
+
+			if (!pResdecl)
 			{
 				ShowErr(pAst->errinfo, "Couldn't find declaration for identifier");
 			}
 
-			STypeId tid = pResolve->pAstdecl->tid;
+			STypeId tid = pResdecl->pDecl->pAstdecl->tid;
 			if (tid.pType == nullptr)
 			{
-				pTcswitch->pResolve = pResolve;
+				pTcswitch->pDecl = pResdecl->pDecl;
 				break;
 			}
-
+			
 			pAstident->tid = tid;
 
-			RegisterResolved(pWork, pAstident, pResolve->pAstdecl);
+			RegisterResolved(pWork, pAstident, pResdecl);
 		}
 		break;
 
@@ -6785,31 +6908,43 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 							SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidStruct);
                             ASSERT(pSymtStruct);
 
-							if (pAstop->pAstRight->astk == ASTK_Identifier)
-							{
-								auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
-								auto pResolve = PresolveLookup(pSymtStruct, pAstident->pChz);
-
-								if (typek == TYPEK_TypeOf && !pResolve->pAstdecl->fIsConstant)
-								{
-									ShowErr(pAstop->errinfo, 
-											"Can only reference constants when indirecting through struct type");
-								}
-
-								STypeId tid = pResolve->pAstdecl->tid;
-								if (tid.pType == nullptr)
-								{
-									pTcswitch->pResolve = pResolve;
-									break;
-								}
-
-								pAstop->pAstRight->tid = tid;
-								pAstop->tid = tid;
-							}
-							else
+							if (pAstop->pAstRight->astk != ASTK_Identifier)
 							{
 								ShowErr(pAstop->pAstRight->errinfo, "Expected identifier to the right of .");
 							}
+								
+							auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
+
+							SResolveDecl * pResdecl;
+							if (!FTryResolveSymbolWithUsing(pWork, pSymtStruct, pAstident->pChz, pTcswitch, &pResdecl))
+							{
+								// We have switched to resolving another declaration
+								ASSERT(pTcswitch->pDecl);
+								break;
+							}
+
+							if (!pResdecl)
+							{
+                                ShowErr(pAstident->errinfo, "Couldn't find member of struct %s", 
+                                		StrPrintType(tidStruct).Pchz());
+							}
+
+							auto pAstdeclResolved = pResdecl->pDecl->pAstdecl;
+							if (typek == TYPEK_TypeOf && !pAstdeclResolved->fIsConstant)
+							{
+								ShowErr(pAstop->errinfo, 
+										"Can only reference constants when indirecting through struct type");
+							}
+
+							STypeId tid = pAstdeclResolved->tid;
+							ASSERT(tid.pType != nullptr);
+
+							pAstop->pAstRight->tid = tid;
+							pAstop->tid = tid;
+
+							// BB (adrianb) We want to store using path with this!?
+
+							RegisterResolved(pWork, pAstident, pResdecl);
 						}
 					}
 
@@ -6866,10 +7001,8 @@ LOperatorDone:
 							StrPrintType(pAstop->pAstRight->tid.pType).Pchz());
 				}
 			}
-			// Use type determined from coerce.
-			// For ., treat like identifier resolve except use namespace from left side
 
-			// BB (adrianb) Different for math vs . vs logical operators etc.
+			// BB (adrianb) Different for math vs logical operators etc.
 		}
 		break;
 
@@ -7013,11 +7146,11 @@ LOperatorDone:
 			auto pSymtProc = pTrec->pSymtParent;
 			for (; pSymtProc; pSymtProc = pSymtProc->pSymtParent)
 			{
-				if (pSymtProc->symtk != SYMTK_Scope)
+				if (pSymtProc->symtblk != SYMTBLK_Scope)
 					break;
 			}
 
-			if (pSymtProc == nullptr || pSymtProc->symtk != SYMTK_Procedure)
+			if (pSymtProc == nullptr || pSymtProc->symtblk != SYMTBLK_Procedure)
 			{
 				ShowErr(pAst->errinfo, "Cannot return when not inside a procedure.");
 			}
@@ -7048,10 +7181,12 @@ LOperatorDone:
 	case ASTK_DeclareSingle:
 		{
 			auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
+
+			// BB (adrianb) Verify using only with struct or * struct. Or eventually ()->* struct.
 			
-			if (pAstdecl->pChzName && !pAstdecl->fIsConstant && pTrec->pSymtParent->symtk < SYMTK_RegisterAllMic)
+			if (pAstdecl->pChzName && !pAstdecl->fIsConstant && pTrec->pSymtParent->symtblk < SYMTBLK_RegisterAllMic)
 			{
-				(void) PresolveAdd(pWork, pTrec->pSymtParent, pAstdecl->pChzName, pAstdecl);
+				AddDeclaration(pWork, pTrec->pSymtParent, pAstdecl->pChzName, pAstdecl);
 			}
 			
 			// If we don't have an explicit type, coerce literals to best type to best match 
@@ -7080,7 +7215,7 @@ LOperatorDone:
 			if (pAstdecl->pAstValue)
 				Coerce(pWork, &pAstdecl->pAstValue, pAstdecl->tid);
 
-			if (pTrec->pSymtParent->symtk == SYMTK_Struct && !pAstdecl->fIsConstant)
+			if (pTrec->pSymtParent->symtblk == SYMTBLK_Struct && !pAstdecl->fIsConstant)
 			{
 				auto pTypestruct = pTrec->pSymtParent->pTypestruct;
 				ASSERT(pTypestruct->cMember < pTypestruct->cMemberMax);
@@ -7289,7 +7424,7 @@ LOperatorDone:
 		break;
 	}
 
-	if (pTcswitch->pResolve == nullptr && pAst->astk != ASTK_Literal && pAst->tid.pType == nullptr)
+	if (pTcswitch->pDecl == nullptr && pAst->astk != ASTK_Literal && pAst->tid.pType == nullptr)
 	{
 		ShowErr(pAst->errinfo, "Couldn't compute type");
 	}
@@ -7297,7 +7432,7 @@ LOperatorDone:
 
 struct STypeCheckEntry
 {
-	SResolve * pResolve;
+	SDeclaration * pDecl;
 };
 
 void TypeCheckAll(SWorkspace * pWork)
@@ -7339,48 +7474,49 @@ void TypeCheckAll(SWorkspace * pWork)
 
 	// Run type checking in preprecursion order
 
-	SArray<SResolve *> arypResolveWait = {};
+	SArray<SDeclaration *> arypResolveWait = {};
 
 	// BB (adrianb) Do we want to allow for more symbol tables or more resolves to get added?
 
 	for (auto pSymt : pWork->arypSymtAll)
 	{
-		for (auto pResolve : pSymt->arypResolve)
+		for (int ipResdecl : IterCount(pSymt->arypResdecl.c))
 		{
+			auto pDecl = pSymt->arypResdecl[ipResdecl]->pDecl;
 			for (;;)
 			{
 				// Empty queue of waiting resolves after we've finished this one
 
-				if (pResolve->iTrecCur >= pResolve->aryTrec.c)
+				if (pDecl->iTrecCur >= pDecl->aryTrec.c)
 				{
 					if (arypResolveWait.c == 0)
 						break;
 
-					pResolve = Tail(&arypResolveWait);
+					pDecl = Tail(&arypResolveWait);
 					Pop(&arypResolveWait);
                     continue;
 				}
 
 				STypeCheckSwitch tcswitch = {};
-				TypeCheck(pWork, &pResolve->aryTrec[pResolve->iTrecCur], &tcswitch);
+				TypeCheck(pWork, &pDecl->aryTrec[pDecl->iTrecCur], &tcswitch);
 
-				if (tcswitch.pResolve)
+				if (tcswitch.pDecl)
 				{
-					for (SResolve * pResolveWait : arypResolveWait)
+					for (SDeclaration * pResolveWait : arypResolveWait)
 					{
-						if (pResolveWait == tcswitch.pResolve)
+						if (pResolveWait == tcswitch.pDecl)
 						{
 							// BB (adrianb) Display the full contents of the cycle (and where the references were from)?
 							ShowErr(pResolveWait->pAstdecl->errinfo, "Cycle asking for symbol resolution");
 						}
 					}
 
-					Append(&arypResolveWait, pResolve);
-					pResolve = tcswitch.pResolve;
+					Append(&arypResolveWait, pDecl);
+					pDecl = tcswitch.pDecl;
 				}
 				else
 				{
-					pResolve->iTrecCur++;
+					pDecl->iTrecCur++;
 				}
 			}
 		}
@@ -7588,34 +7724,59 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 			{
 				if (strcmp(pAstop->pChzOp, ".") == 0)
 				{
-					auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstLeft);
 					STypeId tidStruct = pAstLeft->tid;
+					LLVMValueRef lvalrefAddrPrev;
 					if (tidStruct.pType->typek == TYPEK_Pointer)
 					{
-						tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
-						lvalrefAddr = LLVMBuildLoad(lbuilder, lvalrefAddr, "dotpointertmp");
+					 	GenerateRecursive(genx, pAstLeft, &lvalrefAddrPrev);
+					 	tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
+					}
+					else
+					{
+						lvalrefAddrPrev = LvalrefGetLoadStoreAddress(genx, pAstLeft);
 					}
 
-					auto pTypestruct = PtypeCast<STypeStruct>(tidStruct.pType);
-					ASSERT(pTypestruct->cMember == pTypestruct->cMemberMax);
+					auto pResdecl = PresdeclResolved(pWork, pAstRight);
+					STypeId tidPrev = pAstLeft->tid;
 
-					auto pAstident = PastCast<SAstIdentifier>(pAstRight);
-
-					for (int iMember = 0;; ++iMember)
+					for (int ipDecl = 0; ipDecl <= pResdecl->arypDeclUsingPath.c; ++ipDecl)
 					{
-						if (iMember >= pTypestruct->cMember)
+						auto pDecl = (ipDecl == pResdecl->arypDeclUsingPath.c) ?
+										pResdecl->pDecl : 
+										pResdecl->arypDeclUsingPath[ipDecl];
+
+						STypeId tidStruct = tidPrev;
+						if (tidStruct.pType->typek == TYPEK_Pointer)
 						{
-							// BB (adrianb) Much more complex lookup for using. Cache namespace here?
-							ShowErr(pAstident->errinfo, "Couldn't find member %s of type %s", pAstident->pChz, 
-									StrPrintType(pTypestruct).Pchz());
-							break;
+							lvalrefAddrPrev = LLVMBuildLoad(lbuilder, lvalrefAddrPrev, "membertmp");
+							tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
 						}
 
-						if (strcmp(pAstident->pChz, pTypestruct->aMember[iMember].pAstdecl->pChzName) != 0)
-							continue;
+						auto pTypestruct = PtypeCast<STypeStruct>(tidStruct.pType);
+						ASSERT(pTypestruct->cMember == pTypestruct->cMemberMax);
 
-						return LLVMBuildStructGEP(lbuilder, lvalrefAddr, iMember, "membertmp");
+						const char * pChzName = pDecl->pAstdecl->pChzName;
+						tidPrev = pDecl->pAstdecl->tid;
+
+						for (int iMember = 0;; ++iMember)
+						{
+							if (iMember >= pTypestruct->cMember)
+							{
+								// BB (adrianb) Much more complex lookup for using. Cache namespace here?
+								ShowErr(pAst->errinfo, "Couldn't find member %s of type %s during using expansion", 
+										pChzName, StrPrintType(pTypestruct).Pchz());
+								break;
+							}
+
+							if (strcmp(pChzName, pTypestruct->aMember[iMember].pAstdecl->pChzName) != 0)
+								continue;
+
+							lvalrefAddrPrev = LLVMBuildStructGEP(lbuilder, lvalrefAddrPrev, iMember, "membertmp");
+							break;
+						}
 					}
+
+					return lvalrefAddrPrev;
 				}
 			}
 		}
@@ -7623,10 +7784,65 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 
 	case ASTK_Identifier:
 		{
-			SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
-			ASSERT(pAstdecl && !pAstdecl->fIsConstant);
-			auto pStorage = PstorageLookup(pWork, pAstdecl);
-			return pStorage->lvalrefPtr;
+			auto pResdecl = PresdeclResolved(pWork, pAst);
+			ASSERT(pResdecl);
+			if (pResdecl->arypDeclUsingPath.c > 0)
+			{
+				// BB (adrianb) This initial lookup and starting at path decl 1 is the only difference
+				//  with member declaration lookup.
+
+				auto pDecl0 = pResdecl->arypDeclUsingPath[0];
+				auto pAstdecl0 = pDecl0->pAstdecl;
+				auto pStorage0 = PstorageLookup(pWork, pAstdecl0);
+				
+				auto lvalrefAddrPrev = pStorage0->lvalrefPtr;
+				auto pAstdeclPrev = pAstdecl0;
+
+				for (int ipDecl = 1; ipDecl <= pResdecl->arypDeclUsingPath.c; ++ipDecl)
+				{
+					auto pDecl = (ipDecl == pResdecl->arypDeclUsingPath.c) ?
+									pResdecl->pDecl : 
+									pResdecl->arypDeclUsingPath[ipDecl];
+
+					STypeId tidStruct = pAstdeclPrev->tid;
+					if (tidStruct.pType->typek == TYPEK_Pointer)
+					{
+						lvalrefAddrPrev = LLVMBuildLoad(lbuilder, lvalrefAddrPrev, "usingtmp");
+						tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
+					}
+
+					auto pTypestruct = PtypeCast<STypeStruct>(tidStruct.pType);
+					ASSERT(pTypestruct->cMember == pTypestruct->cMemberMax);
+
+					const char * pChzName = pDecl->pAstdecl->pChzName;
+
+					for (int iMember = 0;; ++iMember)
+					{
+						if (iMember >= pTypestruct->cMember)
+						{
+							// BB (adrianb) Much more complex lookup for using. Cache namespace here?
+							ShowErr(pAst->errinfo, "Couldn't find member %s of type %s during using expansion", 
+									pChzName, StrPrintType(pTypestruct).Pchz());
+							break;
+						}
+
+						if (strcmp(pChzName, pTypestruct->aMember[iMember].pAstdecl->pChzName) != 0)
+							continue;
+
+						lvalrefAddrPrev = LLVMBuildStructGEP(lbuilder, lvalrefAddrPrev, iMember, "usingtmp");
+						break;
+					}
+				}
+
+				return lvalrefAddrPrev;
+			}
+			else
+			{
+				auto pAstdecl = pResdecl->pDecl->pAstdecl;
+				ASSERT(!pAstdecl->fIsConstant);
+				auto pStorage = PstorageLookup(pWork, pAstdecl);
+				return pStorage->lvalrefPtr;
+			}
 		}
 
 	case ASTK_ArrayIndex:
@@ -7952,18 +8168,19 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 	case ASTK_Identifier:
 		{
-			// This must be a variable if we are evaluating it directly
+			// If we are a constant, just go directly to constant evaluation
 
-			SAstDeclareSingle * pAstdecl = PastdeclResolved(pWork, pAst);
+			auto pResdecl = PresdeclResolved(pWork, pAst);
+			auto pAstdecl = pResdecl->pDecl->pAstdecl;
 			if (pAstdecl->fIsConstant)
 			{
 				*pLvalref = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
 			}
 			else
 			{
+				auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAst);
 				// BB (adrianb) Use actual declaration name here for more readable bitcode?
-				auto pStorage = PstorageLookup(pWork, pAstdecl);
-				*pLvalref = LLVMBuildLoad(lbuilder, pStorage->lvalrefPtr, "loadtmp");
+				*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "loadtmp");
 			}
 		}
 		break;
@@ -8049,8 +8266,27 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 				if (strcmp(pChzOp, ".") == 0)
 				{
-					auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstop);
-					*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "membertmp");
+					auto pResdecl = PresdeclResolved(pWork, pAstop->pAstRight);
+					auto pAstdecl = pResdecl->pDecl->pAstdecl;
+
+					if (pAstdecl->fIsConstant)
+					{
+						// BB (adrianb) If there's executable code down this path somewhere should we always be 
+						//  executing it? It could be either an identifier or a dot. We could try and generate the dot
+						//  case?
+
+						if (pAstop->tid.pType->typek != TYPEK_TypeOf)
+						{
+							(void) LvalrefGetLoadStoreAddress(genx, pAstLeft);
+						}
+
+						*pLvalref = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
+					}
+					else
+					{
+						auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstop);
+						*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "membertmp");
+					}
 					return;
 				}
 
@@ -8311,7 +8547,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				ASSERT(pAstret->arypAstRet.c == 1);
 				LLVMValueRef lvalref = {};
 				GenerateRecursive(genx, pAstret->arypAstRet[0], &lvalref);
-				
+
 				EarlyReturnPopScopes(genx);
 				LLVMBuildRet(lbuilder, lvalref);
                 return;
@@ -8460,7 +8696,12 @@ void GenerateAll(SWorkspace * pWork)
 
 	pWork->lmodule = LLVMModuleCreateWithName(pWork->aryModule[0].pChzFile);
 	// BB (adrianb) How do I get this string from arbitrary platform? Also C generates a target data layout.
-	LLVMSetTarget(pWork->lmodule, "x86_64-apple-macosx10.11.0"); 
+	//  Apparently the default target triple is wrong for some reason :/.
+	{
+		//auto pChzTriple = LLVMGetDefaultTargetTriple();
+		LLVMSetTarget(pWork->lmodule, "x86_64-apple-macosx10.11.0");
+		//LLVMDisposeMessage(pChzTriple);
+	}
 
 	for (auto pModule : IterPointer(pWork->aryModule))
 	{
@@ -8492,6 +8733,8 @@ void GenerateAll(SWorkspace * pWork)
 			{
 				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(genx, pAstdecl->tid, ltyperef));
 			}
+
+			Destroy(&gens.arypAstDefer);
 		}
 
 		// Generate code for functions in this module
@@ -8502,6 +8745,8 @@ void GenerateAll(SWorkspace * pWork)
 			SGenerateCtx genx = { pWork, pWork->lmodule, &gens };
 
 			GenerateRecursive(genx, pAstproc, nullptr);
+
+			Destroy(&gens.arypAstDefer);
 		}
 	}
 
@@ -8537,17 +8782,18 @@ void CompileAndCheckDeclaration(
     TypeCheckAll(&work);
     GenerateAll(&work);
 
-	SResolve * pResolve = PresolveLookup(&work.symtRoot, pChzDecl);
-	if (!pResolve)
+	auto pResdecl = PresdeclLookupSimple(&work.symtRoot, pChzDecl, RESLK_WithUsing);
+	if (!pResdecl)
 	{
 		ShowErr(SErrorInfo{pChzTestName}, "Can't find declaration %s", pChzDecl);
 	}
     
-    ASSERT(pResolve->pAstdecl);
+    auto pAstdecl = pResdecl->pDecl->pAstdecl;
+    ASSERT(pAstdecl);
 	SStringBuilder strb;
 	SAstCtx acx = {};
 	InitPrint(&acx.print, PrintToString, &strb);
-	PrintSchemeAst(&acx, pResolve->pAstdecl);
+	PrintSchemeAst(&acx, pAstdecl);
 
 	if (strcmp(strb.aChz, pChzAst) != 0)
 	{
@@ -8562,7 +8808,7 @@ void CompileAndCheckDeclaration(
 	strb.aChz[0] = '\0';
 	strb.cCh = 0;
 	acx.fPrintType = true;
-	PrintSchemeAst(&acx, pResolve->pAstdecl);
+	PrintSchemeAst(&acx, pAstdecl);
 	if (strcmp(strb.aChz, pChzType) != 0)
 	{
 		ShowErr(SErrorInfo{pChzTestName}, 
@@ -8944,11 +9190,12 @@ int main(int cpChzArg, const char * apChzArg[])
 		#run copy out all globals? Can we wait until ALL #runs have been run and then copy out globals? What if they point
 		to allocated memory or something?
 	- Named parameters? Default values?
+	- Dll loading. Can OSX do this implicitly like windows?
 	- Example program to test
-	- Flesh out operators
-	- defer - scopes plus registration, verify no expressions after return mid scope?
+	- Flesh out operators - logical operators, bitwise operators
 	- using
-	- overloading
+	- overloading.
+	- Templated procedures with modify proc.
 	- SOA support.
 	- Any/typeinfo
 	- printf replacement

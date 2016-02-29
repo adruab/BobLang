@@ -47,6 +47,7 @@
 #include "llvm-c/Analysis.h"
 #include "llvm-c/BitWriter.h"
 #include "llvm-c/TargetMachine.h"
+#include "llvm-c/ExecutionEngine.h"
 
 // Compilation phases:
 // Parse to AST, no types
@@ -1150,6 +1151,7 @@ struct SWorkspace
 
 	// Code generation
 
+	LLVMContextRef lcontext;
 	LLVMBuilderRef lbuilder;
 	LLVMModuleRef lmodule;
 	SHash<SAstDeclareSingle *, SStorage> hashPastdeclStorage; // 
@@ -1913,11 +1915,11 @@ USING : 27, // for using an external global variable?
 DIRECTIVE_INLINE : 28, // So we haven't performed any inlining yet?
 
 DIRECTIVE_IMPORT : 29,
-DIRECTIVE_LOAD : 30, ???
+DIRECTIVE_LOAD : 30, auto-load dll?
 
 DIRECTIVE_RUN : 31,
-DIRECTIVE_CHECK_CALL : 32, #run but compile error if the result didn't succeed (BB better to error from the routine itself? In which case just #run?)
-DIRECTIVE_ASSERT : 33, ??? Compile time assert? How is this different from CHECK_CALL?
+DIRECTIVE_CHECK_CALL : 32, Runs procedure with info from call? Used for printf, but who cares? Any other cases?
+DIRECTIVE_ASSERT : 33, ??? Compile time assert?
 DIRECTIVE_IF_DEFINED : 34, ??? Is there a way to define symbols from the command line or dynamically?  Or is this just so if you import something you can tell if its there?
 DIRECTIVE_BAKE : 35, ???
 DIRECTIVE_MODIFY : 36, For restricting 
@@ -5314,6 +5316,9 @@ void Destroy(SWorkspace * pWork)
 	if (pWork->lmodule)
 		LLVMDisposeModule(pWork->lmodule);
 
+	if (pWork->lcontext)
+		LLVMContextDispose(pWork->lcontext);
+
 	Destroy(&pWork->hashPastPresdeclResolved);
 	Destroy(&pWork->hashPastprocLvalref);
 	Destroy(&pWork->hashPastdeclStorage);
@@ -5728,10 +5733,11 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 	case ASTK_ImportDirective:
 		return;
 
-	#if 0
 	case ASTK_RunDirective:
+		RecurseTypeCheck(recx, &PastCast<SAstRunDirective>(pAst)->pAstExpr);
 		break;
 
+	#if 0
 	case ASTK_ForeignLibraryDirective:
 		break;
 	#endif
@@ -6303,8 +6309,6 @@ void RegisterResolved(SWorkspace * pWork, SAst * pAstIdent, SResolveDecl * pResd
 
 
 
-// BB (adrianb) Move the bulk of this downward?
-
 struct SValue
 {
 	// BB (adrianb) If we want to hold typed NULL need STypeId.
@@ -6318,432 +6322,9 @@ struct SValue
 	} contents;
 };
 
-SValue ValueBool(bool f)
-{
-	SValue val = { TYPEK_Bool };
-	val.contents.n = f;
-	return val;
-}
-
-SValue ValueInt(TYPEK typek, s64 n)
-{
-	ASSERT(FIsInt(typek));
-	SValue val = { typek };
-
-	// BB (adrianb) Zext based on source type?
-
-	int cBit = CBit(typek);
-	if (FSigned(typek))
-	{
-		s64 nMask = ((~0ull) >> (64 - cBit));
-		s64 nSign = (n & (1ll << (cBit - 1))) ? ~nMask : 0;
-		val.contents.n = (n & nMask) | nSign;
-	}
-	else
-	{
-		int cBit = CBit(typek);
-		s64 nMask = ((~0ull) >> (64 - cBit));
-		val.contents.n = n & nMask;
-	}
-
-	return val;
-}
-
-SValue ValueFloat(TYPEK typek, double g)
-{
-	ASSERT(FIsFloat(typek));
-	SValue val = { typek };
-	val.contents.g = (typek == TYPEK_Double) ? g : (double)(float)g;
-	return val;
-}
-
-using PFNEVALCONSTBINARY = SValue (*)(SValue valLeft, SValue valRight);
-
-struct SEvalConstBinaryOperator
-{
-	const char * pChzOp;
-
-	PFNEVALCONSTBINARY pfnecbInt;
-	PFNEVALCONSTBINARY pfnecbIntUnsigned;
-	PFNEVALCONSTBINARY pfnecbFloat;
-
-	// bools
-};
-
-SValue ValAdd(SValue val0, SValue val1)
-{
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, val0.contents.n + val1.contents.n);
-}
-
-SValue ValFAdd(SValue val0, SValue val1)
-{
-	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
-	return ValueFloat(val0.typek, val0.contents.g + val1.contents.g);
-}
-
-SValue ValSub(SValue val0, SValue val1)
-{
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, val0.contents.n - val1.contents.n);
-}
-
-SValue ValFSub(SValue val0, SValue val1)
-{
-	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
-	return ValueFloat(val0.typek, val0.contents.g - val1.contents.g);
-}
-
-SValue ValMul(SValue val0, SValue val1)
-{
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, val0.contents.n * val1.contents.n);
-}
-
-SValue ValFMul(SValue val0, SValue val1)
-{
-	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
-	return ValueFloat(val0.typek, val0.contents.g * val1.contents.g);
-}
-
-SValue ValSDiv(SValue val0, SValue val1)
-{
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, val0.contents.n / val1.contents.n);
-}
-
-SValue ValUDiv(SValue val0, SValue val1)
-{
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, u64(val0.contents.n) / u64(val1.contents.n));
-}
-
-SValue ValFDiv(SValue val0, SValue val1)
-{
-	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
-	return ValueFloat(val0.typek, val0.contents.g / val1.contents.g);
-}
-
-SValue ValSRem(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, val0.contents.n % val1.contents.n);
-}
-
-SValue ValURem(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueInt(val0.typek, u64(val0.contents.n) % u64(val1.contents.n));
-}
-
-SValue ValCmpEqInt(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT((val0.typek == TYPEK_Bool || FIsInt(val0.typek)) && val0.typek == val1.typek);
-	return ValueBool(val0.contents.n == val1.contents.n);
-}
-
-SValue ValCmpNeqInt(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT((val0.typek == TYPEK_Bool || FIsInt(val0.typek)) && val0.typek == val1.typek);
-	return ValueBool(val0.contents.n != val1.contents.n);
-}
-
-SValue ValCmpLTInt(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueBool(val0.contents.n < val1.contents.n);
-}
-
-SValue ValCmpLTUInt(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueBool(u64(val0.contents.n) < u64(val1.contents.n));
-}
-
-SValue ValCmpLTFloat(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
-	return ValueBool(val0.contents.g < val1.contents.g);
-}
-
-SValue ValCmpGTInt(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueBool(val0.contents.n > val1.contents.n);
-}
-
-SValue ValCmpGTUInt(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
-	return ValueBool(u64(val0.contents.n) > u64(val1.contents.n));
-}
-
-SValue ValCmpGTFloat(SValue val0, SValue val1)
-{
-	// BB (adrianb) Different based on signed/unsigned.
-	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
-	return ValueBool(val0.contents.g > val1.contents.g);
-}
-
-// BB (adrianb) Embed these in normal operator array?
-static const SEvalConstBinaryOperator s_aEcbop[] =
-{
-	// BB (adrianb) Unordered (either arg NaN) vs Ordered. Which to choose?
-	{ "<", ValCmpLTInt, ValCmpLTUInt, ValCmpLTFloat },
-	{ ">", ValCmpGTInt, ValCmpGTUInt, ValCmpGTFloat },
-
-	{ "==", ValCmpEqInt, nullptr, nullptr },
-	{ "!=", ValCmpNeqInt, nullptr, nullptr },
-
-	{ "+", ValAdd, nullptr, ValFAdd },
-	{ "-", ValSub, nullptr, ValFSub },
-	{ "*", ValMul, nullptr, ValFMul },
-	{ "/", ValSDiv, ValUDiv, ValFDiv },
-	{ "%", ValSRem, ValURem, nullptr }, // FRem?
-};
-
 SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst);
 
-SValue ValEvalBinaryOperator(SWorkspace * pWork, const SEvalConstBinaryOperator & ecbop, SAst * pAstLeft, SAst * pAstRight)
-{
-	SValue valLeft = ValEvalConstant(pWork, pAstLeft);
-	SValue valRight = ValEvalConstant(pWork, pAstRight);
 
-	TYPEK typekLeft = valLeft.typek;
-	if (ecbop.pfnecbInt && typekLeft == TYPEK_Bool)
-	{
-		return ecbop.pfnecbInt(valLeft, valRight);
-	}
-	else if (ecbop.pfnecbInt && FIsInt(typekLeft))
-	{
-		if (ecbop.pfnecbInt && !FSigned(typekLeft))
-		{
-			return ecbop.pfnecbIntUnsigned(valLeft, valRight);
-		}
-		else
-		{
-			return ecbop.pfnecbInt(valLeft, valRight);
-		}
-	}
-	else if (ecbop.pfnecbFloat && FIsFloat(typekLeft))
-	{
-		return ecbop.pfnecbFloat(valLeft, valRight);
-	}
-
-	// Error outside
-
-	return {};
-}
-
-SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
-{
-	ASTK astk = pAst->astk;
-	switch (astk)
-	{
-	case ASTK_Literal:
-		{
-			const SLiteral & lit = PastCast<SAstLiteral>(pAst)->lit;
-			switch (lit.litk)
-			{
-			case LITK_Bool:
-				return ValueBool(lit.n != 0);
-
-			case LITK_Int:
-				return ValueInt(pAst->tid.pType->typek, lit.n);
-
-			case LITK_Float:
-				// BB (adrianb) Can't use APFloat from C-api. Do I care? I want explicit type anyways.
-
-				return ValueFloat(pAst->tid.pType->typek, lit.g);
-
-			case LITK_String:
-				ASSERTCHZ(false, "NYI");
-
-			default:
-				ASSERT(false);
-				return {};
-			}
-		}
-		break;
-
-#if 0
-	case ASTK_Null:
-		return LLVMConstNull(LtyperefGenerate(pWork, pAst->tid));
-#endif
-
-	// BB (adrianb) 90% of this is the same as normal generation. Generalize somehow?
-
-	case ASTK_Identifier:
-		{
-			// This must be a variable if we are evaluating it directly
-
-			auto pResdecl = PresdeclResolved(pWork, pAst);
-			auto pAstdecl = pResdecl->pDecl->pAstdecl;
-			if (!pAstdecl->fIsConstant)
-			{
-				ShowErr(pAst->errinfo, "Expected a reference to a constant");
-				return {};
-			}
-
-			return ValEvalConstant(pWork, pAstdecl->pAstValue);
-		}
-
-	case ASTK_Operator:
-		{
-			auto pAstop = PastCast<SAstOperator>(pAst);
-			auto pChzOp = pAstop->pChzOp;
-
-			// BB (adrianb) Table drive these or it will get insane!
-
-			if (pAstop->pAstLeft == nullptr)
-			{
-				auto pAstRight = pAstop->pAstRight;
-				TYPEK typekRight = pAstRight->tid.pType->typek;
-
-				if (strcmp(pChzOp, "-") == 0)
-				{
-					SValue valRight = ValEvalConstant(pWork, pAstRight);
-
-					if (FIsInt(typekRight))
-					{
-						return ValueInt(typekRight, -valRight.contents.n);
-					}
-					else if (FIsFloat(typekRight))
-					{
-						return ValueFloat(typekRight, -valRight.contents.g);
-					}
-				}
-				
-				ShowErr(pAstop->errinfo, "Unary operator %s constant with type %s NYI", 
-						  pChzOp, StrPrintType(pAstRight->tid.pType).Pchz());
-				return {};
-			}
-			else
-			{
-				auto pAstLeft = pAstop->pAstLeft;
-				auto pAstRight = pAstop->pAstRight;
-
-				for (const auto & ecbop : s_aEcbop)
-				{
-					if (strcmp(ecbop.pChzOp, pChzOp) == 0)
-					{
-						SValue val = ValEvalBinaryOperator(pWork, ecbop, pAstLeft, pAstRight);
-						if (val.typek == TYPEK_Void)
-						{
-							ShowErr(pAstop->errinfo, "Don't know how to perform constant operator for types %s and %s",
-									StrPrintType(pAstLeft->tid).Pchz(), StrPrintType(pAstRight->tid).Pchz());
-						}
-						return val;
-					}
-				}
-
-				if (strcmp(pChzOp, ".") == 0)
-				{
-					STypeId tidStruct = pAstLeft->tid;
-					if (tidStruct.pType->typek == TYPEK_TypeOf)
-					{
-						auto pTypetypeof = PtypeCast<STypeTypeOf>(tidStruct.pType);
-						auto pSymtStruct = PsymtStructLookup(pWork, pTypetypeof->tid);
-						if (pSymtStruct)
-						{
-							auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
-							// BB (adrianb) Lookup from RegisterResolved instead?
-							auto pResdecl = PresdeclResolved(pWork, pAstident);
-							ASSERT(pResdecl);
-
-							return ValEvalConstant(pWork, pResdecl->pDecl->pAstdecl->pAstValue);
-						}
-					}
-				}
-
-				ShowErr(pAstop->errinfo, "Operator %s constant eval with types %s and %s NYI", 
-						  pChzOp, StrPrintType(pAstLeft->tid.pType).Pchz(), StrPrintType(pAstRight->tid.pType).Pchz());
-				return {};
-			}
-		}
-		break;
-
-	case ASTK_Cast:
-		{
-			auto pAstcast = PastCast<SAstCast>(pAst);
-
-			SValue valExpr = ValEvalConstant(pWork, pAstcast->pAstExpr);
-
-			STypeId tidSrc = pAstcast->pAstExpr->tid;
-			STypeId tidDst = pAstcast->tid;
-
-			if (tidSrc == tidDst)
-			{
-				return valExpr;
-			}
-			
-			TYPEK typekSrc = tidSrc.pType->typek;
-			TYPEK typekDst = tidDst.pType->typek;
-
-			if (FIsInt(typekSrc))
-			{
-				if (FIsInt(typekDst))
-				{
-					// BB (adrianb) Need to mask off sext bits from upper part of N.
-
-					switch (typekSrc)
-					{
-					case TYPEK_S8: return ValueInt(typekDst, static_cast<s8>(valExpr.contents.n));
-					case TYPEK_S16: return ValueInt(typekDst, static_cast<s16>(valExpr.contents.n));
-					case TYPEK_S32: return ValueInt(typekDst, static_cast<s32>(valExpr.contents.n));
-					case TYPEK_S64: return ValueInt(typekDst, valExpr.contents.n);
-					case TYPEK_U8: return ValueInt(typekDst, static_cast<u8>(valExpr.contents.n));
-					case TYPEK_U16: return ValueInt(typekDst, static_cast<u16>(valExpr.contents.n));
-					case TYPEK_U32: return ValueInt(typekDst, static_cast<u32>(valExpr.contents.n));
-					case TYPEK_U64: return ValueInt(typekDst, valExpr.contents.n);
-					default:
-						ASSERT(false);
-						break;
-					}
-				}
-				else if (FIsFloat(typekDst))
-				{
-					return ValueFloat(typekDst, double((FSigned(typekSrc)) ? valExpr.contents.n : u64(valExpr.contents.n)));
-				}
-			}
-			else if (FIsFloat(typekSrc))
-			{
-				if (FIsFloat(typekDst))
-				{
-					return ValueFloat(typekDst, valExpr.contents.g);
-				}
-				else if (FIsInt(typekDst))
-				{
-					if (FSigned(typekSrc))
-					{
-						return ValueInt(typekDst, s64(valExpr.contents.g));
-					}
-					else
-					{
-						return ValueInt(typekDst, u64(valExpr.contents.g));
-					}
-				}
-			}
-
-			ShowErr(pAst->errinfo, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
-					  StrPrintType(tidDst.pType).Pchz());
-			return SValue{};
-		}
-
-	default:
-		ShowErr(pAst->errinfo, "Can't evaluate as constant");
-		return SValue{};
-	}
-}
 
 void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcswitch)
 {
@@ -7412,9 +6993,19 @@ LOperatorDone:
 	// case ASTK_ImportDirective:
 	
 	case ASTK_RunDirective:
-		ASSERT(false);
-		// Type check as the type of the run directive
-		// Do literal coercion at this point? Or can the result just be a literal?
+		{
+			// BB (adrianb) Should we be trying to support just literals here?
+			auto pAstrun = PastCast<SAstRunDirective>(pAst);
+			pAstrun->tid = pAstrun->pAstExpr->tid;
+			if (pAstrun->tid.pType == nullptr)
+			{
+				auto pAstlit = PastCast<SAstLiteral>(pAstrun->pAstExpr);
+				STypeId tid = TidFromLiteral(pWork, pAstlit->lit);
+
+				pAstrun->tid = tid;
+				pAstlit->tid = tid;
+			}
+		}
 		break;
 
 	// case ASTK_ForeignLibraryDirective:
@@ -7527,6 +7118,433 @@ void TypeCheckAll(SWorkspace * pWork)
 
 
 
+SValue ValueBool(bool f)
+{
+	SValue val = { TYPEK_Bool };
+	val.contents.n = f;
+	return val;
+}
+
+SValue ValueInt(TYPEK typek, s64 n)
+{
+	ASSERT(FIsInt(typek));
+	SValue val = { typek };
+
+	// BB (adrianb) Zext based on source type?
+
+	int cBit = CBit(typek);
+	if (FSigned(typek))
+	{
+		s64 nMask = ((~0ull) >> (64 - cBit));
+		s64 nSign = (n & (1ll << (cBit - 1))) ? ~nMask : 0;
+		val.contents.n = (n & nMask) | nSign;
+	}
+	else
+	{
+		int cBit = CBit(typek);
+		s64 nMask = ((~0ull) >> (64 - cBit));
+		val.contents.n = n & nMask;
+	}
+
+	return val;
+}
+
+SValue ValueFloat(TYPEK typek, double g)
+{
+	ASSERT(FIsFloat(typek));
+	SValue val = { typek };
+	val.contents.g = (typek == TYPEK_Double) ? g : (double)(float)g;
+	return val;
+}
+
+using PFNEVALCONSTBINARY = SValue (*)(SValue valLeft, SValue valRight);
+
+struct SEvalConstBinaryOperator
+{
+	const char * pChzOp;
+
+	PFNEVALCONSTBINARY pfnecbInt;
+	PFNEVALCONSTBINARY pfnecbIntUnsigned;
+	PFNEVALCONSTBINARY pfnecbFloat;
+
+	// bools
+};
+
+SValue ValAdd(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n + val1.contents.n);
+}
+
+SValue ValFAdd(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g + val1.contents.g);
+}
+
+SValue ValSub(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n - val1.contents.n);
+}
+
+SValue ValFSub(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g - val1.contents.g);
+}
+
+SValue ValMul(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n * val1.contents.n);
+}
+
+SValue ValFMul(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g * val1.contents.g);
+}
+
+SValue ValSDiv(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n / val1.contents.n);
+}
+
+SValue ValUDiv(SValue val0, SValue val1)
+{
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, u64(val0.contents.n) / u64(val1.contents.n));
+}
+
+SValue ValFDiv(SValue val0, SValue val1)
+{
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueFloat(val0.typek, val0.contents.g / val1.contents.g);
+}
+
+SValue ValSRem(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, val0.contents.n % val1.contents.n);
+}
+
+SValue ValURem(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueInt(val0.typek, u64(val0.contents.n) % u64(val1.contents.n));
+}
+
+SValue ValCmpEqInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT((val0.typek == TYPEK_Bool || FIsInt(val0.typek)) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n == val1.contents.n);
+}
+
+SValue ValCmpNeqInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT((val0.typek == TYPEK_Bool || FIsInt(val0.typek)) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n != val1.contents.n);
+}
+
+SValue ValCmpLTInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n < val1.contents.n);
+}
+
+SValue ValCmpLTUInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(u64(val0.contents.n) < u64(val1.contents.n));
+}
+
+SValue ValCmpLTFloat(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.g < val1.contents.g);
+}
+
+SValue ValCmpGTInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.n > val1.contents.n);
+}
+
+SValue ValCmpGTUInt(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsInt(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(u64(val0.contents.n) > u64(val1.contents.n));
+}
+
+SValue ValCmpGTFloat(SValue val0, SValue val1)
+{
+	// BB (adrianb) Different based on signed/unsigned.
+	ASSERT(FIsFloat(val0.typek) && val0.typek == val1.typek);
+	return ValueBool(val0.contents.g > val1.contents.g);
+}
+
+// BB (adrianb) Embed these in normal operator array?
+static const SEvalConstBinaryOperator s_aEcbop[] =
+{
+	// BB (adrianb) Unordered (either arg NaN) vs Ordered. Which to choose?
+	{ "<", ValCmpLTInt, ValCmpLTUInt, ValCmpLTFloat },
+	{ ">", ValCmpGTInt, ValCmpGTUInt, ValCmpGTFloat },
+
+	{ "==", ValCmpEqInt, nullptr, nullptr },
+	{ "!=", ValCmpNeqInt, nullptr, nullptr },
+
+	{ "+", ValAdd, nullptr, ValFAdd },
+	{ "-", ValSub, nullptr, ValFSub },
+	{ "*", ValMul, nullptr, ValFMul },
+	{ "/", ValSDiv, ValUDiv, ValFDiv },
+	{ "%", ValSRem, ValURem, nullptr }, // FRem?
+};
+
+SValue ValEvalBinaryOperator(SWorkspace * pWork, const SEvalConstBinaryOperator & ecbop, SAst * pAstLeft, SAst * pAstRight)
+{
+	SValue valLeft = ValEvalConstant(pWork, pAstLeft);
+	SValue valRight = ValEvalConstant(pWork, pAstRight);
+
+	TYPEK typekLeft = valLeft.typek;
+	if (ecbop.pfnecbInt && typekLeft == TYPEK_Bool)
+	{
+		return ecbop.pfnecbInt(valLeft, valRight);
+	}
+	else if (ecbop.pfnecbInt && FIsInt(typekLeft))
+	{
+		if (ecbop.pfnecbInt && !FSigned(typekLeft))
+		{
+			return ecbop.pfnecbIntUnsigned(valLeft, valRight);
+		}
+		else
+		{
+			return ecbop.pfnecbInt(valLeft, valRight);
+		}
+	}
+	else if (ecbop.pfnecbFloat && FIsFloat(typekLeft))
+	{
+		return ecbop.pfnecbFloat(valLeft, valRight);
+	}
+
+	// Error outside
+
+	return {};
+}
+
+SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
+{
+	ASTK astk = pAst->astk;
+	switch (astk)
+	{
+	case ASTK_Literal:
+		{
+			const SLiteral & lit = PastCast<SAstLiteral>(pAst)->lit;
+			switch (lit.litk)
+			{
+			case LITK_Bool:
+				return ValueBool(lit.n != 0);
+
+			case LITK_Int:
+				return ValueInt(pAst->tid.pType->typek, lit.n);
+
+			case LITK_Float:
+				// BB (adrianb) Can't use APFloat from C-api. Do I care? I want explicit type anyways.
+
+				return ValueFloat(pAst->tid.pType->typek, lit.g);
+
+			case LITK_String:
+				ASSERTCHZ(false, "NYI");
+
+			default:
+				ASSERT(false);
+				return {};
+			}
+		}
+		break;
+
+#if 0
+	case ASTK_Null:
+		return LLVMConstNull(LtyperefGenerate(pWork, pAst->tid));
+#endif
+
+	// BB (adrianb) 90% of this is the same as normal generation. Generalize somehow?
+
+	case ASTK_Identifier:
+		{
+			// This must be a variable if we are evaluating it directly
+
+			auto pResdecl = PresdeclResolved(pWork, pAst);
+			auto pAstdecl = pResdecl->pDecl->pAstdecl;
+			if (!pAstdecl->fIsConstant)
+			{
+				ShowErr(pAst->errinfo, "Expected a reference to a constant");
+				return {};
+			}
+
+			return ValEvalConstant(pWork, pAstdecl->pAstValue);
+		}
+
+	case ASTK_Operator:
+		{
+			auto pAstop = PastCast<SAstOperator>(pAst);
+			auto pChzOp = pAstop->pChzOp;
+
+			// BB (adrianb) Table drive these or it will get insane!
+
+			if (pAstop->pAstLeft == nullptr)
+			{
+				auto pAstRight = pAstop->pAstRight;
+				TYPEK typekRight = pAstRight->tid.pType->typek;
+
+				if (strcmp(pChzOp, "-") == 0)
+				{
+					SValue valRight = ValEvalConstant(pWork, pAstRight);
+
+					if (FIsInt(typekRight))
+					{
+						return ValueInt(typekRight, -valRight.contents.n);
+					}
+					else if (FIsFloat(typekRight))
+					{
+						return ValueFloat(typekRight, -valRight.contents.g);
+					}
+				}
+				
+				ShowErr(pAstop->errinfo, "Unary operator %s constant with type %s NYI", 
+						  pChzOp, StrPrintType(pAstRight->tid.pType).Pchz());
+				return {};
+			}
+			else
+			{
+				auto pAstLeft = pAstop->pAstLeft;
+				auto pAstRight = pAstop->pAstRight;
+
+				for (const auto & ecbop : s_aEcbop)
+				{
+					if (strcmp(ecbop.pChzOp, pChzOp) == 0)
+					{
+						SValue val = ValEvalBinaryOperator(pWork, ecbop, pAstLeft, pAstRight);
+						if (val.typek == TYPEK_Void)
+						{
+							ShowErr(pAstop->errinfo, "Don't know how to perform constant operator for types %s and %s",
+									StrPrintType(pAstLeft->tid).Pchz(), StrPrintType(pAstRight->tid).Pchz());
+						}
+						return val;
+					}
+				}
+
+				if (strcmp(pChzOp, ".") == 0)
+				{
+					STypeId tidStruct = pAstLeft->tid;
+					if (tidStruct.pType->typek == TYPEK_TypeOf)
+					{
+						auto pTypetypeof = PtypeCast<STypeTypeOf>(tidStruct.pType);
+						auto pSymtStruct = PsymtStructLookup(pWork, pTypetypeof->tid);
+						if (pSymtStruct)
+						{
+							auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
+							// BB (adrianb) Lookup from RegisterResolved instead?
+							auto pResdecl = PresdeclResolved(pWork, pAstident);
+							ASSERT(pResdecl);
+
+							return ValEvalConstant(pWork, pResdecl->pDecl->pAstdecl->pAstValue);
+						}
+					}
+				}
+
+				ShowErr(pAstop->errinfo, "Operator %s constant eval with types %s and %s NYI", 
+						  pChzOp, StrPrintType(pAstLeft->tid.pType).Pchz(), StrPrintType(pAstRight->tid.pType).Pchz());
+				return {};
+			}
+		}
+		break;
+
+	case ASTK_Cast:
+		{
+			auto pAstcast = PastCast<SAstCast>(pAst);
+
+			SValue valExpr = ValEvalConstant(pWork, pAstcast->pAstExpr);
+
+			STypeId tidSrc = pAstcast->pAstExpr->tid;
+			STypeId tidDst = pAstcast->tid;
+
+			if (tidSrc == tidDst)
+			{
+				return valExpr;
+			}
+			
+			TYPEK typekSrc = tidSrc.pType->typek;
+			TYPEK typekDst = tidDst.pType->typek;
+
+			if (FIsInt(typekSrc))
+			{
+				if (FIsInt(typekDst))
+				{
+					// BB (adrianb) Need to mask off sext bits from upper part of N.
+
+					switch (typekSrc)
+					{
+					case TYPEK_S8: return ValueInt(typekDst, static_cast<s8>(valExpr.contents.n));
+					case TYPEK_S16: return ValueInt(typekDst, static_cast<s16>(valExpr.contents.n));
+					case TYPEK_S32: return ValueInt(typekDst, static_cast<s32>(valExpr.contents.n));
+					case TYPEK_S64: return ValueInt(typekDst, valExpr.contents.n);
+					case TYPEK_U8: return ValueInt(typekDst, static_cast<u8>(valExpr.contents.n));
+					case TYPEK_U16: return ValueInt(typekDst, static_cast<u16>(valExpr.contents.n));
+					case TYPEK_U32: return ValueInt(typekDst, static_cast<u32>(valExpr.contents.n));
+					case TYPEK_U64: return ValueInt(typekDst, valExpr.contents.n);
+					default:
+						ASSERT(false);
+						break;
+					}
+				}
+				else if (FIsFloat(typekDst))
+				{
+					return ValueFloat(typekDst, double((FSigned(typekSrc)) ? valExpr.contents.n : u64(valExpr.contents.n)));
+				}
+			}
+			else if (FIsFloat(typekSrc))
+			{
+				if (FIsFloat(typekDst))
+				{
+					return ValueFloat(typekDst, valExpr.contents.g);
+				}
+				else if (FIsInt(typekDst))
+				{
+					if (FSigned(typekSrc))
+					{
+						return ValueInt(typekDst, s64(valExpr.contents.g));
+					}
+					else
+					{
+						return ValueInt(typekDst, u64(valExpr.contents.g));
+					}
+				}
+			}
+
+			ShowErr(pAst->errinfo, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
+					  StrPrintType(tidDst.pType).Pchz());
+			return SValue{};
+		}
+
+	default:
+		ShowErr(pAst->errinfo, "Can't evaluate as constant");
+		return SValue{};
+	}
+}
+
+
+
 LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 {
 	auto pType = tid.pType;
@@ -7536,21 +7554,23 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 	// BB (adrianb) Need to branch for foreign function signature vs internal function signature.
 	//  E.g. vararg, 
 
+	auto lcontext = pWork->lcontext;
+
 	TYPEK typek = pType->typek;
 	switch (typek)
 	{
-	case TYPEK_Void: return LLVMVoidType();
-	case TYPEK_Bool: return LLVMInt1Type(); // Bool is just int1 in llvm
-	case TYPEK_S8: return LLVMInt8Type();
-	case TYPEK_S16: return LLVMInt16Type();
-	case TYPEK_S32: return LLVMInt32Type();
-	case TYPEK_S64: return LLVMInt64Type();
-	case TYPEK_U8: return LLVMInt8Type(); // Unsigned is not part of LLVM (must sext/zext explicitly)
-	case TYPEK_U16: return LLVMInt16Type();
-	case TYPEK_U32: return LLVMInt32Type();
-	case TYPEK_U64: return LLVMInt64Type();
-	case TYPEK_Float: return LLVMFloatType();
-	case TYPEK_Double: return LLVMDoubleType();
+	case TYPEK_Void: return LLVMVoidTypeInContext(lcontext);
+	case TYPEK_Bool: return LLVMInt1TypeInContext(lcontext); // Bool is just int1 in llvm
+	case TYPEK_S8: return LLVMInt8TypeInContext(lcontext);
+	case TYPEK_S16: return LLVMInt16TypeInContext(lcontext);
+	case TYPEK_S32: return LLVMInt32TypeInContext(lcontext);
+	case TYPEK_S64: return LLVMInt64TypeInContext(lcontext);
+	case TYPEK_U8: return LLVMInt8TypeInContext(lcontext); // Unsigned is not part of LLVM (must sext/zext explicitly)
+	case TYPEK_U16: return LLVMInt16TypeInContext(lcontext);
+	case TYPEK_U32: return LLVMInt32TypeInContext(lcontext);
+	case TYPEK_U64: return LLVMInt64TypeInContext(lcontext);
+	case TYPEK_Float: return LLVMFloatTypeInContext(lcontext);
+	case TYPEK_Double: return LLVMDoubleTypeInContext(lcontext);
 
 #if 0
 	TYPEK_String,
@@ -7606,7 +7626,7 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 				aTyperef[iMember] = LtyperefGenerate(pWork, pAstdecl->tid);
 			}
 
-			return LLVMStructType(aTyperef, cMember, false);
+			return LLVMStructTypeInContext(pWork->lcontext, aTyperef, cMember, false);
 		}
 #if 0
 	TYPEK_Null,
@@ -7657,6 +7677,13 @@ struct SGenerateState
 	bool fReturnMarked;
 	bool fInProcedure;
 };
+
+void Reset(SGenerateState * pGens)
+{
+	ASSERT(pGens->arypAstDefer.c == 0);
+	ASSERT(pGens->fInProcedure == false);
+	pGens->fReturnMarked = false;
+}
 
 struct SGenerateCtx
 {
@@ -8070,7 +8097,7 @@ LLVMValueRef LvalrefGenerateDefaultValue(const SGenerateCtx & genx, STypeId tid,
 																LtyperefGenerate(genx.pWork, pAstdecl->tid));
 		}
 
-		return LLVMConstStruct(aLvalref, cMember, false);
+		return LLVMConstStructInContext(genx.pWork->lcontext, aLvalref, cMember, false);
 	}
 	else if (typek == TYPEK_Array)
 	{
@@ -8315,12 +8342,12 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			auto pAstif = PastCast<SAstIf>(pAst);
 
 			LLVMValueRef lvalrefFunc = LLVMGetBasicBlockParent(LLVMGetInsertBlock(lbuilder));
-			LLVMBasicBlockRef lbbrefIfPass = LLVMAppendBasicBlock(lvalrefFunc, "ifpass");
-			LLVMBasicBlockRef lbbrefIfExit = LLVMAppendBasicBlock(lvalrefFunc, "ifexit");
+			LLVMBasicBlockRef lbbrefIfPass = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "ifpass");
+			LLVMBasicBlockRef lbbrefIfExit = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "ifexit");
 
 			LLVMBasicBlockRef lbbrefIfElse = lbbrefIfExit;
 			if (pAstif->pAstElse)
-				lbbrefIfElse = LLVMAppendBasicBlock(lvalrefFunc, "ifelse");
+				lbbrefIfElse = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "ifelse");
 
 			LLVMValueRef lvalrefTest;
 			GenerateRecursive(genx, pAstif->pAstCondition, &lvalrefTest);
@@ -8354,9 +8381,9 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			// BB (adrianb) Pack these into genx so continue/break can jump to necessary spots if need be.
 
 			LLVMValueRef lvalrefFunc = LLVMGetBasicBlockParent(LLVMGetInsertBlock(lbuilder));
-			LLVMBasicBlockRef lbbrefWhileTest = LLVMAppendBasicBlock(lvalrefFunc, "whilelooptest");
-			LLVMBasicBlockRef lbbrefWhileBody = LLVMAppendBasicBlock(lvalrefFunc, "whileloopbody");
-			LLVMBasicBlockRef lbbrefWhileExit = LLVMAppendBasicBlock(lvalrefFunc, "whileloopexit");
+			LLVMBasicBlockRef lbbrefWhileTest = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "whilelooptest");
+			LLVMBasicBlockRef lbbrefWhileBody = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "whileloopbody");
+			LLVMBasicBlockRef lbbrefWhileExit = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "whileloopexit");
 
 			LLVMBuildBr(lbuilder, lbbrefWhileTest);
 			LLVMPositionBuilderAtEnd(lbuilder, lbbrefWhileTest);
@@ -8588,6 +8615,10 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 			// BB (adrianb) Return value? Or register it against this AST node?
 
+			// BB (adrianb) Support ASTK_UninitializedValue. For complex structs run a function to initialize.
+			//  E.g. big structs, or with uninitialized members. Also could memcpy from a global like clang does
+			//  for C++ structs.
+
 			LLVMBuildStore(lbuilder, lvalrefInitial, lvalrefPtr);
 			RegisterStorage(pWork, pAstdecl, lvalrefPtr);
 		}
@@ -8614,7 +8645,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 			// Start basic block for the procedure
 
-			LLVMBasicBlockRef lbblockEntry = LLVMAppendBasicBlock(lvalrefProc, "entry");
+			LLVMBasicBlockRef lbblockEntry = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefProc, "entry");
 			LLVMPositionBuilderAtEnd(lbuilder, lbblockEntry);
             
             // Add storage for arguments
@@ -8689,12 +8720,13 @@ void GenerateAll(SWorkspace * pWork)
 	if (pWork->aryModule.c == 0)
 		return;
 
-	pWork->lbuilder = LLVMCreateBuilder();
+	pWork->lcontext = LLVMContextCreate();
+	pWork->lbuilder = LLVMCreateBuilderInContext(pWork->lcontext);
 
 	// Just create one module named after the root file
 	// BB (adrianb) Is this ok for debugging?
 
-	pWork->lmodule = LLVMModuleCreateWithName(pWork->aryModule[0].pChzFile);
+	pWork->lmodule = LLVMModuleCreateWithNameInContext(pWork->aryModule[0].pChzFile, pWork->lcontext);
 	// BB (adrianb) How do I get this string from arbitrary platform? Also C generates a target data layout.
 	//  Apparently the default target triple is wrong for some reason :/.
 	{
@@ -8702,6 +8734,9 @@ void GenerateAll(SWorkspace * pWork)
 		LLVMSetTarget(pWork->lmodule, "x86_64-apple-macosx10.11.0");
 		//LLVMDisposeMessage(pChzTriple);
 	}
+
+	SGenerateState gens = {};
+	SGenerateCtx genx = { pWork, pWork->lmodule, &gens };
 
 	for (auto pModule : IterPointer(pWork->aryModule))
 	{
@@ -8715,15 +8750,15 @@ void GenerateAll(SWorkspace * pWork)
 			if (pAstdecl->fIsConstant)
 				continue;
 
-			SGenerateState gens = {};
-			SGenerateCtx genx = { pWork, pWork->lmodule, &gens };
-
 			// BB (adrianb) Need to generate unique name?
 
 			LLVMTypeRef ltyperef = LtyperefGenerate(pWork, pAstdecl->tid);
 
 			LLVMValueRef lvalrefGlobal = LLVMAddGlobal(pWork->lmodule, ltyperef, pAstdecl->pChzName);
 			RegisterStorage(pWork, pAstdecl, lvalrefGlobal);
+
+			// BB (adrianb) Handle UninitializedValue.
+
 			if (pAstdecl->pAstValue)
 			{
 				// Globals always have initializers
@@ -8734,21 +8769,20 @@ void GenerateAll(SWorkspace * pWork)
 				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(genx, pAstdecl->tid, ltyperef));
 			}
 
-			Destroy(&gens.arypAstDefer);
+			Reset(&gens);
 		}
 
 		// Generate code for functions in this module
 
 		for (auto pAstproc : pModule->arypAstproc)
 		{
-			SGenerateState gens = {};
-			SGenerateCtx genx = { pWork, pWork->lmodule, &gens };
-
 			GenerateRecursive(genx, pAstproc, nullptr);
 
-			Destroy(&gens.arypAstDefer);
+			Reset(&gens);
 		}
 	}
+	
+	Destroy(&gens.arypAstDefer);
 
 	{
 		char * pChzError = nullptr;
@@ -9024,6 +9058,7 @@ int main(int cpChzArg, const char * apChzArg[])
 			else
 			{
 				char aChzOut[256];
+				aChzOut[0] = '\0';
 				for (;;)
 				{
 					if (feof(pFileCmdOut))
@@ -9185,23 +9220,26 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
+	- Put all allocas at beginning of functions.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
-	- #run #check. Use LLVM JIT. Side effects to globals must be persisted. Eg. init_crc64. How to do this? After every
-		#run copy out all globals? Can we wait until ALL #runs have been run and then copy out globals? What if they point
-		to allocated memory or something?
+	- #run. Use LLVM JIT, MCJIT is the only option until I can get 3.7.1 working. 
+		- How are side effects to globals persisted? Eg. init_crc64. After every #run copy out all globals? 
+		Can we wait until ALL #runs have been run and then copy out globals? What if they point to allocated memory
+		or something?
 	- Named parameters? Default values?
-	- Dll loading. Can OSX do this implicitly like windows?
-	- Example program to test
+	- Dll loading. 
+		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
+	- Example program to test? OpenGL game?
 	- Flesh out operators - logical operators, bitwise operators
-	- using
+	- using with procedures.
+	- Any/typeinfo.
 	- overloading.
-	- Templated procedures with modify proc.
+	- Polymorphic procedures with modify proc.
 	- SOA support.
-	- Any/typeinfo
+	- Inlining.  Does this happen at AST level?
 	- printf replacement
 	- implicit context
 	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN
-	- Inlining.  Does this happen at AST level?
 	- Annotations?
 	- Expose typed compiler AST to compile time run procedures ala BANANAS demo. Ouch...
 	- Debugger GUI?

@@ -47,7 +47,7 @@
 #include "llvm-c/Analysis.h"
 #include "llvm-c/BitWriter.h"
 #include "llvm-c/TargetMachine.h"
-#include "llvm-c/ExecutionEngine.h"
+//#include "llvm-c/OrcBindings.h"
 
 // Compilation phases:
 // Parse to AST, no types
@@ -1110,6 +1110,14 @@ struct SSymbolTable
 	STypeStruct * pTypestruct; // Function for procedure symbol tables
 };
 
+struct SGenerate
+{
+	LLVMContextRef lcontext;
+	LLVMModuleRef lmodule;
+	SHash<SAstDeclareSingle *, SStorage> hashPastdeclStorage; // 
+	SHash<SAstProcedure *, LLVMValueRef> hashPastprocLvalref; // Procedures started
+};
+
 struct SWorkspace
 {
 	SPagedAlloc pagealloc;
@@ -1149,13 +1157,10 @@ struct SWorkspace
 	SHash<STypeId, SSymbolTable *> hashTidPsymtStruct; // Struct registration
 	SHash<SAst *, SResolveDecl *> hashPastPresdeclResolved;
 
-	// Code generation
+	SGenerate genGlobal;
+	SGenerate genJit;
 
-	LLVMContextRef lcontext;
-	LLVMBuilderRef lbuilder;
-	LLVMModuleRef lmodule;
-	SHash<SAstDeclareSingle *, SStorage> hashPastdeclStorage; // 
-	SHash<SAstProcedure *, LLVMValueRef> hashPastprocLvalref; // Procedures started
+	//LLVMExecutionEngineRef lengineJit;
 };
 
 struct SStringWithLength
@@ -5279,6 +5284,19 @@ void InitWorkspace(SWorkspace * pWork)
 	AddBuiltinType(pWork, "Any", SType{TYPEK_Any});
 }
 
+void Destroy(SGenerate * pGen)
+{
+	Destroy(&pGen->hashPastprocLvalref);
+	Destroy(&pGen->hashPastdeclStorage);
+
+	LLVMDisposeModule(pGen->lmodule);
+	
+	if (pGen->lcontext)
+		LLVMContextDispose(pGen->lcontext);
+
+	ClearStruct(pGen);
+}
+
 void Destroy(SWorkspace * pWork)
 {
 	// BB (adrianb) Almost all of this junk is to deal with dynamically sized arrays.
@@ -5313,15 +5331,10 @@ void Destroy(SWorkspace * pWork)
 	}
 	Destroy(&pWork->aryModule);
 
-	if (pWork->lmodule)
-		LLVMDisposeModule(pWork->lmodule);
-
-	if (pWork->lcontext)
-		LLVMContextDispose(pWork->lcontext);
+	Destroy(&pWork->genGlobal);
+	Destroy(&pWork->genJit);
 
 	Destroy(&pWork->hashPastPresdeclResolved);
-	Destroy(&pWork->hashPastprocLvalref);
-	Destroy(&pWork->hashPastdeclStorage);
 
 	Destroy(&pWork->setpChz);
 	Destroy(&pWork->aryTokNext);
@@ -6796,14 +6809,6 @@ LOperatorDone:
 			if (pAstdecl->pAstValue)
 				Coerce(pWork, &pAstdecl->pAstValue, pAstdecl->tid);
 
-			if (pTrec->pSymtParent->symtblk == SYMTBLK_Struct && !pAstdecl->fIsConstant)
-			{
-				auto pTypestruct = pTrec->pSymtParent->pTypestruct;
-				ASSERT(pTypestruct->cMember < pTypestruct->cMemberMax);
-				auto pMember = &pTypestruct->aMember[pTypestruct->cMember++];
-				pMember->pAstdecl = pAstdecl;
-			}
-
 			ASSERT(!pAstdecl->pAstValue || pAstdecl->tid == pAstdecl->pAstValue->tid);
 		}
 		break;
@@ -6840,6 +6845,13 @@ LOperatorDone:
 
 			pTypestruct->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, cMember);
 			pTypestruct->cMemberMax = cMember;
+
+			for (auto pAstDecl : pAststruct->arypAstDecl)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAstDecl); 
+				if (!pAstdecl->fIsConstant)
+					pTypestruct->aMember[pTypestruct->cMember++].pAstdecl = pAstdecl;
+			}
 
 			STypeId tidStruct = { pTypestruct };
 
@@ -6997,6 +7009,7 @@ LOperatorDone:
 			// BB (adrianb) Should we be trying to support just literals here?
 			auto pAstrun = PastCast<SAstRunDirective>(pAst);
 			pAstrun->tid = pAstrun->pAstExpr->tid;
+			// BB (adrianb) Move this to function, how often is it duplicated?
 			if (pAstrun->tid.pType == nullptr)
 			{
 				auto pAstlit = PastCast<SAstLiteral>(pAstrun->pAstExpr);
@@ -7545,8 +7558,80 @@ SValue ValEvalConstant(SWorkspace * pWork, SAst * pAst)
 
 
 
-LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
+struct SGenerateCtx
 {
+	SWorkspace * pWork;
+	SGenerate * pGen;
+
+	// Current state
+
+	LLVMModuleRef lmodule;
+	LLVMBuilderRef lbuilder;
+	LLVMContextRef lcontext;
+
+	SArray<SAst *> arypAstDefer;
+	bool fReturnMarked;
+	bool fInProcedure;
+
+	SArray<SAst *> * parypAstReferenced;
+};
+
+void Reset(SGenerateCtx * pGenx)
+{
+	ASSERT(pGenx->arypAstDefer.c == 0);
+	ASSERT(pGenx->fInProcedure == false);
+	pGenx->fReturnMarked = false;
+}
+
+void AddReferenced(SGenerateCtx * pGenx, SAst * pAst)
+{
+	ASSERT(pAst->astk == ASTK_Procedure || pAst->astk == ASTK_DeclareSingle);
+	Append(pGenx->parypAstReferenced, pAst);
+}
+
+void Destroy(SGenerateCtx * pGenx)
+{
+	LLVMDisposeBuilder(pGenx->lbuilder);
+	ClearStruct(pGenx);
+}
+
+struct SScopeCtx
+{
+	int ipAstDeferMic;
+};
+
+SScopeCtx Scopectx(SGenerateCtx * pGenx)
+{
+	return { pGenx->arypAstDefer.c };
+}
+
+struct SStorage
+{
+	LLVMValueRef lvalrefPtr; // Address where variable is stored
+};
+
+bool FIsKeyEqual(void * pV0, void * pV1)
+{
+	return pV0 == pV1;
+}
+
+SStorage * PstorageLookup(SGenerate * pGen, SAstDeclareSingle * pAstdecl)
+{
+	auto hv = HvFromKey(reinterpret_cast<u64>(pAstdecl));
+	return PtLookupImpl(&pGen->hashPastdeclStorage, hv, pAstdecl);
+}
+
+void RegisterStorage(SGenerate * pGen, SAstDeclareSingle * pAstdecl, LLVMValueRef lvalrefPtr)
+{
+	ASSERT(PstorageLookup(pGen, pAstdecl) == nullptr);
+	auto hv = HvFromKey(reinterpret_cast<u64>(pAstdecl));
+	
+	Add(&pGen->hashPastdeclStorage, hv, pAstdecl, {lvalrefPtr});
+}
+
+LLVMTypeRef LtyperefGenerate(SGenerateCtx * pGenx, STypeId tid)
+{
+	auto pWork = pGenx->pWork;
 	auto pType = tid.pType;
 	if (pType == nullptr)
 		return LLVMTypeRef{};
@@ -7554,7 +7639,7 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 	// BB (adrianb) Need to branch for foreign function signature vs internal function signature.
 	//  E.g. vararg, 
 
-	auto lcontext = pWork->lcontext;
+	auto lcontext = pGenx->pGen->lcontext;
 
 	TYPEK typek = pType->typek;
 	switch (typek)
@@ -7579,14 +7664,14 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 		{
 			auto pTypeptr = PtypeCast<STypePointer>(pType);
 			ASSERT(!pTypeptr->fSoa);
-			return LLVMPointerType(LtyperefGenerate(pWork, pTypeptr->tidPointedTo), 0);
+			return LLVMPointerType(LtyperefGenerate(pGenx, pTypeptr->tidPointedTo), 0);
 		}
 
 	case TYPEK_Array:
 		{
 			auto pTypearray = PtypeCast<STypeArray>(pType);
 			ASSERT(!pTypearray->fSoa && !pTypearray->fDynamicallySized);
-			return LLVMArrayType(LtyperefGenerate(pWork, pTypearray->tidElement), pTypearray->cSizeFixed);
+			return LLVMArrayType(LtyperefGenerate(pGenx, pTypearray->tidElement), pTypearray->cSizeFixed);
 		}
 
 	case TYPEK_Procedure:
@@ -7606,10 +7691,10 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 			LLVMTypeRef * aTyperefArg = static_cast<LLVMTypeRef *>(alloca(sizeof(LLVMTypeRef) * cArg));
 			for (int iTid : IterCount(cArg))
 			{
-				aTyperefArg[iTid] = LtyperefGenerate(pWork, pTypeproc->aTidArg[iTid]);
+				aTyperefArg[iTid] = LtyperefGenerate(pGenx, pTypeproc->aTidArg[iTid]);
 			}
 
-			return LLVMFunctionType(LtyperefGenerate(pWork, tidRet), aTyperefArg, cArg, pTypeproc->fUsesCVararg);
+			return LLVMFunctionType(LtyperefGenerate(pGenx, tidRet), aTyperefArg, cArg, pTypeproc->fUsesCVararg);
 		}
 
 	case TYPEK_Struct:
@@ -7623,10 +7708,10 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 			for (int iMember : IterCount(cMember))
 			{
 				auto pAstdecl = pTypestruct->aMember[iMember].pAstdecl;
-				aTyperef[iMember] = LtyperefGenerate(pWork, pAstdecl->tid);
+				aTyperef[iMember] = LtyperefGenerate(pGenx, pAstdecl->tid);
 			}
 
-			return LLVMStructTypeInContext(pWork->lcontext, aTyperef, cMember, false);
+			return LLVMStructTypeInContext(pGenx->pGen->lcontext, aTyperef, cMember, false);
 		}
 #if 0
 	TYPEK_Null,
@@ -7642,75 +7727,19 @@ LLVMTypeRef LtyperefGenerate(SWorkspace * pWork, STypeId tid)
 	}
 }
 
-struct SStorage
+LLVMValueRef LvalrefEnsureProcedure(SGenerateCtx * pGenx, SAstProcedure * pAstproc)
 {
-	LLVMValueRef lvalrefPtr; // Address where variable is stored
-};
-
-bool FIsKeyEqual(void * pV0, void * pV1)
-{
-	return pV0 == pV1;
-}
-
-SStorage * PstorageLookup(SWorkspace * pWork, SAstDeclareSingle * pAstdecl)
-{
-	auto hv = HvFromKey(reinterpret_cast<u64>(pAstdecl));
-	return PtLookupImpl(&pWork->hashPastdeclStorage, hv, pAstdecl);
-}
-
-void RegisterStorage(SWorkspace * pWork, SAstDeclareSingle * pAstdecl, LLVMValueRef lvalrefPtr)
-{
-	ASSERT(PstorageLookup(pWork, pAstdecl) == nullptr);
-	auto hv = HvFromKey(reinterpret_cast<u64>(pAstdecl));
-	
-	Add(&pWork->hashPastdeclStorage, hv, pAstdecl, {lvalrefPtr});
-}
-
-struct SScopeCtx
-{
-	int ipAstDeferMic;
-};
-
-struct SGenerateState
-{
-	SArray<SAst *> arypAstDefer;
-	bool fReturnMarked;
-	bool fInProcedure;
-};
-
-void Reset(SGenerateState * pGens)
-{
-	ASSERT(pGens->arypAstDefer.c == 0);
-	ASSERT(pGens->fInProcedure == false);
-	pGens->fReturnMarked = false;
-}
-
-struct SGenerateCtx
-{
-	// BB (adrianb) If we have the module in the workspace, just pass pWork around?
-	SWorkspace * pWork;
-	LLVMModuleRef lmodule;
-
-	SGenerateState * pGens;
-};
-
-SScopeCtx Scopectx(const SGenerateCtx & genx)
-{
-	return { genx.pGens->arypAstDefer.c };
-}
-
-LLVMValueRef LvalrefEnsureProcedure(const SGenerateCtx & genx, SAstProcedure * pAstproc)
-{
-	auto pWork = genx.pWork;
 	auto hv = HvFromKey(reinterpret_cast<u64>(pAstproc));
-	LLVMValueRef * pLvalref = PtLookupImpl(&pWork->hashPastprocLvalref, hv, pAstproc);
+	LLVMValueRef * pLvalref = PtLookupImpl(&pGenx->pGen->hashPastprocLvalref, hv, pAstproc);
 	if (pLvalref)
 		return *pLvalref;
 
 	ASSERT(pAstproc->tid.pType && pAstproc->tid.pType->typek == TYPEK_Procedure);
-	LLVMTypeRef ltyperefProc = LtyperefGenerate(pWork, pAstproc->tid);
+	LLVMTypeRef ltyperefProc = LtyperefGenerate(pGenx, pAstproc->tid);
 
-	auto lvalrefProc = LLVMAddFunction(genx.lmodule, pAstproc->pChzName, ltyperefProc);
+	// BB (adrianb) Generate a unique name so that externs in future JIT modules can agree on one?
+
+	auto lvalrefProc = LLVMAddFunction(pGenx->lmodule, pAstproc->pChzName, ltyperefProc);
 	
 	// BB (adrianb) If it comes from a separate module mark as external?
 	//  Or just emit all bitcode into one translation unit? Doesn't seem like there's any advantage to
@@ -7719,16 +7748,16 @@ LLVMValueRef LvalrefEnsureProcedure(const SGenerateCtx & genx, SAstProcedure * p
 	if (pAstproc->fIsForeign)
 		LLVMSetLinkage(lvalrefProc, LLVMExternalLinkage);
 
-	Add(&pWork->hashPastprocLvalref, hv, pAstproc, lvalrefProc);
+	Add(&pGenx->pGen->hashPastprocLvalref, hv, pAstproc, lvalrefProc);
 	return lvalrefProc;
 }
 
-void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pLvalref);
+void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalref);
 
-LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
+LLVMValueRef LvalrefGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 {
-	auto pWork = genx.pWork;
-	auto lbuilder = pWork->lbuilder;
+	auto pWork = pGenx->pWork;
+	auto lbuilder = pGenx->lbuilder;
 
 	ASTK astk = pAst->astk;
 	switch (astk)
@@ -7743,7 +7772,7 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 				if (strcmp(pAstop->pChzOp, "<<") == 0)
 				{
 					LLVMValueRef lvalrefPtr = {};
-					GenerateRecursive(genx, pAstop->pAstRight, &lvalrefPtr);
+					GenerateRecursive(pGenx, pAstop->pAstRight, &lvalrefPtr);
 					return lvalrefPtr;
 				}
 			}
@@ -7755,12 +7784,12 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 					LLVMValueRef lvalrefAddrPrev;
 					if (tidStruct.pType->typek == TYPEK_Pointer)
 					{
-					 	GenerateRecursive(genx, pAstLeft, &lvalrefAddrPrev);
+					 	GenerateRecursive(pGenx, pAstLeft, &lvalrefAddrPrev);
 					 	tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
 					}
 					else
 					{
-						lvalrefAddrPrev = LvalrefGetLoadStoreAddress(genx, pAstLeft);
+						lvalrefAddrPrev = LvalrefGetLoadStoreAddress(pGenx, pAstLeft);
 					}
 
 					auto pResdecl = PresdeclResolved(pWork, pAstRight);
@@ -7820,7 +7849,7 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 
 				auto pDecl0 = pResdecl->arypDeclUsingPath[0];
 				auto pAstdecl0 = pDecl0->pAstdecl;
-				auto pStorage0 = PstorageLookup(pWork, pAstdecl0);
+				auto pStorage0 = PstorageLookup(pGenx->pGen, pAstdecl0);
 				
 				auto lvalrefAddrPrev = pStorage0->lvalrefPtr;
 				auto pAstdeclPrev = pAstdecl0;
@@ -7867,7 +7896,7 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 			{
 				auto pAstdecl = pResdecl->pDecl->pAstdecl;
 				ASSERT(!pAstdecl->fIsConstant);
-				auto pStorage = PstorageLookup(pWork, pAstdecl);
+				auto pStorage = PstorageLookup(pGenx->pGen, pAstdecl);
 				return pStorage->lvalrefPtr;
 			}
 		}
@@ -7875,12 +7904,12 @@ LLVMValueRef LvalrefGetLoadStoreAddress(const SGenerateCtx & genx, SAst * pAst)
 	case ASTK_ArrayIndex:
 		{
 			auto pAstarrayindex = PastCast<SAstArrayIndex>(pAst);
-			auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstarrayindex->pAstArray);
+			auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAstarrayindex->pAstArray);
 			
 			LLVMValueRef aLvalrefIndex[2] = {};
 			aLvalrefIndex[0] = LLVMConstInt(LLVMInt32Type(), 0, false);
 
-			GenerateRecursive(genx, pAstarrayindex->pAstIndex, &aLvalrefIndex[1]);
+			GenerateRecursive(pGenx, pAstarrayindex->pAstIndex, &aLvalrefIndex[1]);
 
 			return LLVMBuildGEP(lbuilder, lvalrefAddr, aLvalrefIndex, DIM(aLvalrefIndex), "arrayindextmp");
 		}
@@ -7938,11 +7967,11 @@ static const SGenerateBinaryOperator s_aGbop[] =
 	{ "%", "modtmp", LLVMBuildSRem, LLVMBuildURem, nullptr }, // FRem?
 };
 
-LLVMValueRef LvalrefGenerateBinaryOperator(const SGenerateCtx & genx, const SGenerateBinaryOperator & gbop, 
+LLVMValueRef LvalrefGenerateBinaryOperator(SGenerateCtx * pGenx, const SGenerateBinaryOperator & gbop, 
 											   SAst * pAstLeft, LLVMValueRef lvalrefLeft, 
 											   SAst * pAstRight, LLVMValueRef lvalrefRight)
 {
-	auto lbuilder = genx.pWork->lbuilder;
+	auto lbuilder = pGenx->lbuilder;
 
 	TYPEK typekLeft = pAstLeft->tid.pType->typek;
 	if (gbop.pfngbopInt && FIsInt(typekLeft))
@@ -7965,16 +7994,16 @@ LLVMValueRef LvalrefGenerateBinaryOperator(const SGenerateCtx & genx, const SGen
 	return {};
 }
 
-void GenerateBinaryOperator(const SGenerateCtx & genx, const SGenerateBinaryOperator & gbop, 
+void GenerateBinaryOperator(SGenerateCtx * pGenx, const SGenerateBinaryOperator & gbop, 
 							SAst * pAstLeft, SAst * pAstRight, LLVMValueRef * pLvalref)
 {
 	LLVMValueRef lvalrefLeft = {};
 	LLVMValueRef lvalrefRight = {};
 
-	GenerateRecursive(genx, pAstLeft, &lvalrefLeft);
-	GenerateRecursive(genx, pAstRight, &lvalrefRight);
+	GenerateRecursive(pGenx, pAstLeft, &lvalrefLeft);
+	GenerateRecursive(pGenx, pAstRight, &lvalrefRight);
 
-	*pLvalref = LvalrefGenerateBinaryOperator(genx, gbop, pAstLeft, lvalrefLeft, pAstRight, lvalrefRight);
+	*pLvalref = LvalrefGenerateBinaryOperator(pGenx, gbop, pAstLeft, lvalrefLeft, pAstRight, lvalrefRight);
 
 	ASSERTCHZ(*pLvalref, "Operator %s can't be generated with types %s and %s NYI", 
 			  gbop.pChzOp, StrPrintType(pAstLeft->tid.pType).Pchz(), StrPrintType(pAstRight->tid.pType).Pchz());
@@ -7989,17 +8018,17 @@ static const SGenerateBinaryOperator s_aGbopAssign[] =
 	{ "%=", "modeqtmp", LLVMBuildSRem, LLVMBuildURem, nullptr }, // FRem?
 };
 
-void GenerateBinaryAssignOperator(const SGenerateCtx & genx, const SGenerateBinaryOperator & gbop, 
+void GenerateBinaryAssignOperator(SGenerateCtx * pGenx, const SGenerateBinaryOperator & gbop, 
 								  SAst * pAstLeft, SAst * pAstRight, LLVMValueRef * pLvalref)
 {
-	auto lbuilder = genx.pWork->lbuilder;
-	auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstLeft);
+	auto lbuilder = pGenx->lbuilder;
+	auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAstLeft);
 
 	LLVMValueRef lvalrefRight = {};				
-	GenerateRecursive(genx, pAstRight, &lvalrefRight);
+	GenerateRecursive(pGenx, pAstRight, &lvalrefRight);
 
 	LLVMValueRef lvalrefLeft = LLVMBuildLoad(lbuilder, lvalrefAddr, gbop.pChzTemp);
-	LLVMValueRef lvalrefOp = LvalrefGenerateBinaryOperator(genx, gbop, pAstLeft, lvalrefLeft, pAstRight, lvalrefRight);
+	LLVMValueRef lvalrefOp = LvalrefGenerateBinaryOperator(pGenx, gbop, pAstLeft, lvalrefLeft, pAstRight, lvalrefRight);
 
 	ASSERTCHZ(lvalrefOp, "Operator %s can't be generated with types %s and %s. NYI?", 
 			  gbop.pChzOp, StrPrintType(pAstLeft->tid.pType).Pchz(), StrPrintType(pAstRight->tid.pType).Pchz());
@@ -8008,24 +8037,111 @@ void GenerateBinaryAssignOperator(const SGenerateCtx & genx, const SGenerateBina
 	*pLvalref = {};
 }
 
-LLVMValueRef LvalrefConstruct(SWorkspace * pWork, SValue val)
+LLVMValueRef LvalrefConstruct(SGenerateCtx * pGenx, SValue val)
 {
 	if (FIsInt(val.typek) || val.typek == TYPEK_Bool)
 	{
-		return LLVMConstInt(LtyperefGenerate(pWork, TidEnsure(pWork, SType{val.typek})), val.contents.n, false);
+		return LLVMConstInt(LtyperefGenerate(pGenx, TidEnsure(pGenx->pWork, SType{val.typek})), val.contents.n, false);
 	}
 	else if (FIsFloat(val.typek))
 	{
-		return LLVMConstReal(LtyperefGenerate(pWork, TidEnsure(pWork, SType{val.typek})), val.contents.g);
+		return LLVMConstReal(LtyperefGenerate(pGenx, TidEnsure(pGenx->pWork, SType{val.typek})), val.contents.g);
 	}
 
 	ASSERTCHZ(val.typek == TYPEK_Void, "Can't build constant from %s", PchzFromTypek(val.typek));
 	return {};
 }
 
-LLVMValueRef LvalrefGenerateConstant(const SGenerateCtx & genx, SAst * pAst)
+LLVMValueRef LvalrefRunCode(SWorkspace * pWork, SAst * pAst)
 {
-	auto pWork = genx.pWork;
+	// Make sure we have a JIT environment constructed
+
+	auto pGenJit = &pWork->genJit;
+	if (!pGenJit->lcontext)
+	{
+		pGenJit->lcontext = LLVMContextCreate();
+		//LLVMLinkInMCJIT();
+		LLVMInitializeNativeTarget();
+	}
+
+	// Generate an anonymous function into its own module, collecting referenced procedures/globals
+
+	// As part of any generate we might have multiple 
+
+	pGenJit->lmodule = LLVMModuleCreateWithNameInContext("anonymous", pGenJit->lcontext);
+	
+	SArray<SAst *> arypAstReferenced;
+
+	SGenerateCtx genx = { pWork, pGenJit, pGenJit->lmodule, LLVMCreateBuilderInContext(pGenJit->lcontext) };
+	genx.parypAstReferenced = &arypAstReferenced;
+
+	GenerateRecursive(&genx, pAst, nullptr);
+
+	// Generate all referenced globals/procedures as extern into anonymous module
+
+	for (int ipAst = 0; ipAst < arypAstReferenced.c; ++ipAst)
+	{
+		auto pAstRef = arypAstReferenced[ipAst];
+		switch (pAstRef->astk)
+		{
+		case ASTK_Procedure:
+			{
+				// Get unique name mangled stuff for each ast entry so we can point at earlier ones.
+
+
+			}
+			break;
+
+		case ASTK_DeclareSingle:
+			{
+			}
+			break;
+
+		default:	
+			ASSERT(false);
+			break;
+		}
+	}
+
+	// Generate all
+	// Build all newly touched declarations into a module and add it to execution engine (or create it).
+	// Then generate an anonymous function for our expression add it, run it, get the return value and remove it.
+	// BB (adrianb) If we return a struct how to get that? Always store the return value in a global 
+	//  and extract it that way?
+
+#if 0
+	if (pWork->lengineJit == nullptr)
+	{
+		char * pChzErr = NULL;
+		if (LLVMCreateExecutionEngineForModule(&pWork->lengineJit, lmoduleAnonymous, &pChzErr) != 0) 
+		{
+			ShowErr(pAst->errinfo, "Can't create execution engine");
+		}
+		else if (pChzErr)
+		{
+			ShowErr(pAst->errinfo, "Creating execution engine provided this error: %s", pChzErr);
+		}
+	}
+#endif
+
+#if 0
+	static bool s_fDont = false;
+
+	if (s_fDont)
+	{
+		LLVMOrcGetMangledSymbol(nullptr, nullptr, nullptr);
+	}
+#endif
+
+	Destroy(&genx);
+
+	ASSERT(false);
+	return {};
+}
+
+LLVMValueRef LvalrefGenerateConstant(SGenerateCtx * pGenx, SAst * pAst)
+{
+	auto pWork = pGenx->pWork;
 
 	ASTK astk = pAst->astk;
 	switch (astk)
@@ -8040,19 +8156,25 @@ LLVMValueRef LvalrefGenerateConstant(const SGenerateCtx & genx, SAst * pAst)
 
 				// BB (adrianb) String or StringPtr? Do we need to pool these manually?
 				// BB (adrianb) LLVMConstString instead?
-				return LLVMBuildGlobalStringPtr(pWork->lbuilder, lit.pChz, "stringptr");
+				return LLVMBuildGlobalStringPtr(pGenx->lbuilder, lit.pChz, "stringptr");
 			}
 
-			return LvalrefConstruct(pWork, ValEvalConstant(pWork, pAst));
+			return LvalrefConstruct(pGenx, ValEvalConstant(pWork, pAst));
 		}
 
 	case ASTK_Cast:
 	case ASTK_Operator:
 	case ASTK_Identifier:
-		return LvalrefConstruct(pWork, ValEvalConstant(pWork, pAst));
+		return LvalrefConstruct(pGenx, ValEvalConstant(pWork, pAst));
 
 	case ASTK_Procedure:
-		return LvalrefEnsureProcedure(genx, PastCast<SAstProcedure>(pAst));
+		{
+			AddReferenced(pGenx, pAst);
+			return LvalrefEnsureProcedure(pGenx, PastCast<SAstProcedure>(pAst));
+		}
+
+	case ASTK_RunDirective:
+		return LvalrefRunCode(pGenx->pWork, PastCast<SAstRunDirective>(pAst)->pAstExpr);
 
 	default:
 		ShowErr(pAst->errinfo, "Can't generate constant for ast %s(%d)", PchzFromAstk(astk), astk);
@@ -8060,7 +8182,7 @@ LLVMValueRef LvalrefGenerateConstant(const SGenerateCtx & genx, SAst * pAst)
 	}
 }
 
-LLVMValueRef LvalrefGenerateDefaultValue(const SGenerateCtx & genx, STypeId tid, LLVMTypeRef ltyperef)
+LLVMValueRef LvalrefGenerateDefaultValue(SGenerateCtx * pGenx, STypeId tid, LLVMTypeRef ltyperef)
 {
 	// Generate default value
 
@@ -8091,13 +8213,13 @@ LLVMValueRef LvalrefGenerateDefaultValue(const SGenerateCtx & genx, STypeId tid,
 			// BB (adrianb) Are values always set to correct type?
 
 			if (pAstdecl->pAstValue)
-				aLvalref[iMember] = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
+				aLvalref[iMember] = LvalrefGenerateConstant(pGenx, pAstdecl->pAstValue);
 			else
-				aLvalref[iMember] = LvalrefGenerateDefaultValue(genx, pAstdecl->tid, 
-																LtyperefGenerate(genx.pWork, pAstdecl->tid));
+				aLvalref[iMember] = LvalrefGenerateDefaultValue(pGenx, pAstdecl->tid, 
+																LtyperefGenerate(pGenx, pAstdecl->tid));
 		}
 
-		return LLVMConstStructInContext(genx.pWork->lcontext, aLvalref, cMember, false);
+		return LLVMConstStructInContext(pGenx->pGen->lcontext, aLvalref, cMember, false);
 	}
 	else if (typek == TYPEK_Array)
 	{
@@ -8105,87 +8227,86 @@ LLVMValueRef LvalrefGenerateDefaultValue(const SGenerateCtx & genx, STypeId tid,
 		ASSERT(!pTypearray->fSoa && pTypearray->cSizeFixed >= 0);
 		s64 cElement = pTypearray->cSizeFixed;
 		auto aLvalref = static_cast<LLVMValueRef *>(alloca(sizeof(LLVMValueRef) * cElement));
-		auto ltyperefElement = LtyperefGenerate(genx.pWork, pTypearray->tidElement);
+		auto ltyperefElement = LtyperefGenerate(pGenx, pTypearray->tidElement);
 		for (int iElement : IterCount(cElement))
 		{
-			aLvalref[iElement] = LvalrefGenerateDefaultValue(genx, pTypearray->tidElement, ltyperefElement);
+			aLvalref[iElement] = LvalrefGenerateDefaultValue(pGenx, pTypearray->tidElement, ltyperefElement);
 		}
 
 		return LLVMConstArray(ltyperefElement, aLvalref, cElement);
 	}
 	
 	ASSERTCHZ(false, "Declaration default value for type %s NYI", StrPrintType(tid.pType).Pchz());
+	return {};
 }
 
-void MarkReturned(const SGenerateCtx & genx)
+void MarkReturned(SGenerateCtx * pGenx)
 {
-	genx.pGens->fReturnMarked = true;
+	pGenx->fReturnMarked = true;
 }
 
 // BB (adrianb) Want a way to detect if we emit any instructions after a return in a basic block so we can error on
 //  said expression. Maybe do an expression level detection? Does that make sense?
 
-void Branch(const SGenerateCtx & genx, LLVMBasicBlockRef lbbref)
+void Branch(SGenerateCtx * pGenx, LLVMBasicBlockRef lbbref)
 {
 	// Don't branch if we've returned or it will count as terminator in middle of basic block
 
-	if (genx.pGens->fReturnMarked)
+	if (pGenx->fReturnMarked)
 	{
-		genx.pGens->fReturnMarked = false;
+		pGenx->fReturnMarked = false;
 		return;
 	}
 
-	LLVMBuildBr(genx.pWork->lbuilder, lbbref);
+	LLVMBuildBr(pGenx->lbuilder, lbbref);
 }
 
-void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pLvalref);
-void PopScope(const SGenerateCtx & genx, const SScopeCtx & scopectx)
+void PopScope(SGenerateCtx * pGenx, const SScopeCtx & scopectx)
 {
-	while (genx.pGens->arypAstDefer.c > scopectx.ipAstDeferMic)
+	while (pGenx->arypAstDefer.c > scopectx.ipAstDeferMic)
 	{
-		auto pAstDefer = Tail(&genx.pGens->arypAstDefer);
-		Pop(&genx.pGens->arypAstDefer);
-		GenerateRecursive(genx, pAstDefer, nullptr);
+		auto pAstDefer = Tail(&pGenx->arypAstDefer);
+		Pop(&pGenx->arypAstDefer);
+		GenerateRecursive(pGenx, pAstDefer, nullptr);
 	}
 }
 
-void EarlyReturnPopScopes(const SGenerateCtx & genx)
+void EarlyReturnPopScopes(SGenerateCtx * pGenx)
 {
-	for (int ipAst : IterCount(genx.pGens->arypAstDefer.c))
+	for (int ipAst : IterCount(pGenx->arypAstDefer.c))
 	{
-		auto pAstDefer = Tail(&genx.pGens->arypAstDefer, ipAst);
-		GenerateRecursive(genx, pAstDefer, nullptr);
+		auto pAstDefer = Tail(&pGenx->arypAstDefer, ipAst);
+		GenerateRecursive(pGenx, pAstDefer, nullptr);
 	}
 }
 
-void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pLvalref)
+void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalref)
 {
-	SWorkspace * pWork = genx.pWork;
+	auto pWork = pGenx->pWork;
+	auto lcontext = pGenx->lcontext; 
 
 	LLVMValueRef lvalrefDontCare;
 	if (pLvalref == nullptr)
 		pLvalref = &lvalrefDontCare;
 
-	const auto & lbuilder = pWork->lbuilder;
+	const auto & lbuilder = pGenx->lbuilder;
 
 	switch (pAst->astk)
 	{
 	case ASTK_Literal:
 	case ASTK_Null:
-		*pLvalref = LvalrefGenerateConstant(genx, pAst);
+		*pLvalref = LvalrefGenerateConstant(pGenx, pAst);
 		break;
 
-#if 0
-	ASTK_UninitializedValue,
-#endif
+	// ASTK_UninitializedValue,
 	case ASTK_Block:
 		{
-			SScopeCtx scopectx = Scopectx(genx);
+			SScopeCtx scopectx = Scopectx(pGenx);
 			for (auto pAst : PastCast<SAstBlock>(pAst)->arypAst)
 			{
-				GenerateRecursive(genx, pAst, nullptr);
+				GenerateRecursive(pGenx, pAst, nullptr);
 			}
-			PopScope(genx, scopectx);
+			PopScope(pGenx, scopectx);
 		}
 		break;
 
@@ -8201,11 +8322,11 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			auto pAstdecl = pResdecl->pDecl->pAstdecl;
 			if (pAstdecl->fIsConstant)
 			{
-				*pLvalref = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
+				*pLvalref = LvalrefGenerateConstant(pGenx, pAstdecl->pAstValue);
 			}
 			else
 			{
-				auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAst);
+				auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAst);
 				// BB (adrianb) Use actual declaration name here for more readable bitcode?
 				*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "loadtmp");
 			}
@@ -8227,7 +8348,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				if (strcmp(pChzOp, "-") == 0)
 				{
 					LLVMValueRef lvalrefRight = {};
-					GenerateRecursive(genx, pAstRight, &lvalrefRight);
+					GenerateRecursive(pGenx, pAstRight, &lvalrefRight);
 
 					if (FIsInt(typekRight))
 					{
@@ -8243,7 +8364,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				else if (strcmp(pChzOp, "++") == 0)
 				{
 					ASSERT(FIsInt(typekRight));
-					auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstRight);
+					auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAstRight);
 					auto lvalrefOrig = LLVMBuildLoad(lbuilder, lvalrefAddr, "incorigtmp");
 					auto lvalrefInc = LLVMBuildAdd(lbuilder, lvalrefOrig, LLVMConstInt(LLVMTypeOf(lvalrefOrig), 1, false), "incfinaltmp");
 					LLVMBuildStore(lbuilder, lvalrefInc, lvalrefAddr);
@@ -8253,13 +8374,13 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				else if (strcmp(pChzOp, "*") == 0)
 				{
 					ASSERT(FIsInt(typekRight));
-					*pLvalref = LvalrefGetLoadStoreAddress(genx, pAstRight);
+					*pLvalref = LvalrefGetLoadStoreAddress(pGenx, pAstRight);
 					return;
 				}
 				else if (strcmp(pChzOp, "<<") == 0)
 				{
 					LLVMValueRef lvalrefRight = {};
-					GenerateRecursive(genx, pAstRight, &lvalrefRight);
+					GenerateRecursive(pGenx, pAstRight, &lvalrefRight);
 
 					*pLvalref = LLVMBuildLoad(lbuilder, lvalrefRight, "indirtmp");
 					return;
@@ -8277,7 +8398,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				{
 					if (strcmp(gbop.pChzOp, pChzOp) == 0)
 					{
-						GenerateBinaryOperator(genx, gbop, pAstLeft, pAstRight, pLvalref);
+						GenerateBinaryOperator(pGenx, gbop, pAstLeft, pAstRight, pLvalref);
 						return;
 					}
 				}
@@ -8286,7 +8407,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 				{
 					if (strcmp(gbop.pChzOp, pChzOp) == 0)
 					{
-						GenerateBinaryAssignOperator(genx, gbop, pAstLeft, pAstRight, pLvalref);
+						GenerateBinaryAssignOperator(pGenx, gbop, pAstLeft, pAstRight, pLvalref);
 						return;
 					}
 				}
@@ -8304,14 +8425,14 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 						if (pAstop->tid.pType->typek != TYPEK_TypeOf)
 						{
-							(void) LvalrefGetLoadStoreAddress(genx, pAstLeft);
+							(void) LvalrefGetLoadStoreAddress(pGenx, pAstLeft);
 						}
 
-						*pLvalref = LvalrefGenerateConstant(genx, pAstdecl->pAstValue);
+						*pLvalref = LvalrefGenerateConstant(pGenx, pAstdecl->pAstValue);
 					}
 					else
 					{
-						auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstop);
+						auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAstop);
 						*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "membertmp");
 					}
 					return;
@@ -8319,9 +8440,9 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 				if (strcmp(pChzOp, "=") == 0)
 				{
-					auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAstLeft);
+					auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAstLeft);
 					LLVMValueRef lvalrefValue = {};
-					GenerateRecursive(genx, pAstRight, &lvalrefValue);
+					GenerateRecursive(pGenx, pAstRight, &lvalrefValue);
 					LLVMBuildStore(lbuilder, lvalrefValue, lvalrefAddr);
 					return;
 				}
@@ -8342,27 +8463,27 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			auto pAstif = PastCast<SAstIf>(pAst);
 
 			LLVMValueRef lvalrefFunc = LLVMGetBasicBlockParent(LLVMGetInsertBlock(lbuilder));
-			LLVMBasicBlockRef lbbrefIfPass = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "ifpass");
-			LLVMBasicBlockRef lbbrefIfExit = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "ifexit");
+			LLVMBasicBlockRef lbbrefIfPass = LLVMAppendBasicBlockInContext(lcontext, lvalrefFunc, "ifpass");
+			LLVMBasicBlockRef lbbrefIfExit = LLVMAppendBasicBlockInContext(lcontext, lvalrefFunc, "ifexit");
 
 			LLVMBasicBlockRef lbbrefIfElse = lbbrefIfExit;
 			if (pAstif->pAstElse)
-				lbbrefIfElse = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "ifelse");
+				lbbrefIfElse = LLVMAppendBasicBlockInContext(lcontext, lvalrefFunc, "ifelse");
 
 			LLVMValueRef lvalrefTest;
-			GenerateRecursive(genx, pAstif->pAstCondition, &lvalrefTest);
+			GenerateRecursive(pGenx, pAstif->pAstCondition, &lvalrefTest);
 
 			LLVMBuildCondBr(lbuilder, lvalrefTest, lbbrefIfPass, lbbrefIfElse);
 
 			LLVMPositionBuilderAtEnd(lbuilder, lbbrefIfPass);
-			GenerateRecursive(genx, pAstif->pAstPass, nullptr);
-			Branch(genx, lbbrefIfExit);
+			GenerateRecursive(pGenx, pAstif->pAstPass, nullptr);
+			Branch(pGenx, lbbrefIfExit);
 
 			if (pAstif->pAstElse)
 			{
 				LLVMPositionBuilderAtEnd(lbuilder, lbbrefIfElse);
-				GenerateRecursive(genx, pAstif->pAstElse, nullptr);
-				Branch(genx, lbbrefIfExit);
+				GenerateRecursive(pGenx, pAstif->pAstElse, nullptr);
+				Branch(pGenx, lbbrefIfExit);
 			}
 
 			LLVMPositionBuilderAtEnd(lbuilder, lbbrefIfExit);
@@ -8381,21 +8502,21 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			// BB (adrianb) Pack these into genx so continue/break can jump to necessary spots if need be.
 
 			LLVMValueRef lvalrefFunc = LLVMGetBasicBlockParent(LLVMGetInsertBlock(lbuilder));
-			LLVMBasicBlockRef lbbrefWhileTest = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "whilelooptest");
-			LLVMBasicBlockRef lbbrefWhileBody = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "whileloopbody");
-			LLVMBasicBlockRef lbbrefWhileExit = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefFunc, "whileloopexit");
+			LLVMBasicBlockRef lbbrefWhileTest = LLVMAppendBasicBlockInContext(lcontext, lvalrefFunc, "whilelooptest");
+			LLVMBasicBlockRef lbbrefWhileBody = LLVMAppendBasicBlockInContext(lcontext, lvalrefFunc, "whileloopbody");
+			LLVMBasicBlockRef lbbrefWhileExit = LLVMAppendBasicBlockInContext(lcontext, lvalrefFunc, "whileloopexit");
 
 			LLVMBuildBr(lbuilder, lbbrefWhileTest);
 			LLVMPositionBuilderAtEnd(lbuilder, lbbrefWhileTest);
 
             LLVMValueRef lvalrefTest = {};
-			GenerateRecursive(genx, pAstwhile->pAstCondition, &lvalrefTest);
+			GenerateRecursive(pGenx, pAstwhile->pAstCondition, &lvalrefTest);
 
 			LLVMBuildCondBr(lbuilder, lvalrefTest, lbbrefWhileBody, lbbrefWhileExit);
 			
 			LLVMPositionBuilderAtEnd(lbuilder, lbbrefWhileBody);
-			GenerateRecursive(genx, pAstwhile->pAstLoop, nullptr);
-			Branch(genx, lbbrefWhileTest);
+			GenerateRecursive(pGenx, pAstwhile->pAstLoop, nullptr);
+			Branch(pGenx, lbbrefWhileTest);
 
 			LLVMPositionBuilderAtEnd(lbuilder, lbbrefWhileExit);
 
@@ -8415,7 +8536,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			auto pAstcast = PastCast<SAstCast>(pAst);
 
 			LLVMValueRef lvalrefExpr = {};
-			GenerateRecursive(genx, pAstcast->pAstExpr, &lvalrefExpr);
+			GenerateRecursive(pGenx, pAstcast->pAstExpr, &lvalrefExpr);
 
 			STypeId tidSrc = pAstcast->pAstExpr->tid;
 			STypeId tidDst = pAstcast->tid;
@@ -8429,7 +8550,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			TYPEK typekSrc = tidSrc.pType->typek;
 			TYPEK typekDst = tidDst.pType->typek;
 
-			LLVMTypeRef ltyperefDst = LtyperefGenerate(pWork, tidDst);
+			LLVMTypeRef ltyperefDst = LtyperefGenerate(pGenx, tidDst);
 
 			if (FIsInt(typekSrc))
 			{
@@ -8512,7 +8633,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 	case ASTK_Defer:
 		{
-			Append(&genx.pGens->arypAstDefer, PastCast<SAstDefer>(pAst)->pAstStmt);
+			Append(&pGenx->arypAstDefer, PastCast<SAstDefer>(pAst)->pAstStmt);
 		}
 		break;
 #if 0
@@ -8522,7 +8643,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 	case ASTK_ArrayIndex:
 		{
-			auto lvalrefAddr = LvalrefGetLoadStoreAddress(genx, pAst);
+			auto lvalrefAddr = LvalrefGetLoadStoreAddress(pGenx, pAst);
 			*pLvalref = LLVMBuildLoad(lbuilder, lvalrefAddr, "arrayindextmp");
 		}
 		break;
@@ -8539,7 +8660,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
   			// and continue filling it later.
 
 			LLVMValueRef lvalrefFunc = LLVMValueRef();
-			GenerateRecursive(genx, pAstcall->pAstFunc, &lvalrefFunc);
+			GenerateRecursive(pGenx, pAstcall->pAstFunc, &lvalrefFunc);
 
 			int cArg = pAstcall->arypAstArgs.c;
 			void * pVArgs = alloca(sizeof(LLVMValueRef) * cArg);
@@ -8547,7 +8668,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 			for (int iArg : IterCount(cArg))
 			{
-				GenerateRecursive(genx, pAstcall->arypAstArgs[iArg], &aLvalrefArg[iArg]);
+				GenerateRecursive(pGenx, pAstcall->arypAstArgs[iArg], &aLvalrefArg[iArg]);
 			}
 
 			*pLvalref = LLVMBuildCall(lbuilder, lvalrefFunc, aLvalrefArg, cArg, "calltmp");
@@ -8561,11 +8682,11 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			auto pAstret = PastCast<SAstReturn>(pAst);
 			*pLvalref = {};
 
-			MarkReturned(genx);
+			MarkReturned(pGenx);
 
 			if (pAst->tid.pType->typek == TYPEK_Void)
 			{
-				EarlyReturnPopScopes(genx);
+				EarlyReturnPopScopes(pGenx);
 				LLVMBuildRetVoid(lbuilder);
 				return;
 			}
@@ -8573,9 +8694,9 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			{
 				ASSERT(pAstret->arypAstRet.c == 1);
 				LLVMValueRef lvalref = {};
-				GenerateRecursive(genx, pAstret->arypAstRet[0], &lvalref);
+				GenerateRecursive(pGenx, pAstret->arypAstRet[0], &lvalref);
 
-				EarlyReturnPopScopes(genx);
+				EarlyReturnPopScopes(pGenx);
 				LLVMBuildRet(lbuilder, lvalref);
                 return;
 			}
@@ -8598,7 +8719,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
 			// BB (adrianb) Don't generate procedures here, just get address?
 
-			auto ltyperefStore = LtyperefGenerate(pWork, pAstdecl->tid);
+			auto ltyperefStore = LtyperefGenerate(pGenx, pAstdecl->tid);
 			auto lvalrefPtr = LLVMBuildAlloca(lbuilder, ltyperefStore, pAstdecl->pChzName);
 			
 			LLVMValueRef lvalrefInitial = LLVMValueRef();
@@ -8606,11 +8727,11 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			{
 				// BB (adrianb) Anything special to do if this will evaluate to a constant?
 
-				GenerateRecursive(genx, pAstdecl->pAstValue, &lvalrefInitial);
+				GenerateRecursive(pGenx, pAstdecl->pAstValue, &lvalrefInitial);
 			}
 			else
 			{
-				lvalrefInitial = LvalrefGenerateDefaultValue(genx, pAstdecl->tid, ltyperefStore);
+				lvalrefInitial = LvalrefGenerateDefaultValue(pGenx, pAstdecl->tid, ltyperefStore);
 			}
 
 			// BB (adrianb) Return value? Or register it against this AST node?
@@ -8620,32 +8741,32 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 			//  for C++ structs.
 
 			LLVMBuildStore(lbuilder, lvalrefInitial, lvalrefPtr);
-			RegisterStorage(pWork, pAstdecl, lvalrefPtr);
+			RegisterStorage(pGenx->pGen, pAstdecl, lvalrefPtr);
 		}
 		break;
 
 #if 0
 	ASTK_DeclareMulti,
 	ASTK_AssignMulti,
-
-	ASTK_Struct,
-	ASTK_Enum,
 #endif
+
+	// ASTK_Struct
+	// ASTK_Enum
 
 	case ASTK_Procedure:
 		{
 			auto pAstproc = PastCast<SAstProcedure>(pAst);
 
-			ASSERT(!genx.pGens->fInProcedure && genx.pGens->arypAstDefer.c == 0);
+			ASSERT(!pGenx->fInProcedure && pGenx->arypAstDefer.c == 0);
 
-			genx.pGens->fInProcedure = true;
+			pGenx->fInProcedure = true;
 
-			auto lvalrefProc = LvalrefEnsureProcedure(genx, pAstproc);
+			auto lvalrefProc = LvalrefEnsureProcedure(pGenx, pAstproc);
 			ASSERT(pLvalref == &lvalrefDontCare);
 
 			// Start basic block for the procedure
 
-			LLVMBasicBlockRef lbblockEntry = LLVMAppendBasicBlockInContext(pWork->lcontext, lvalrefProc, "entry");
+			LLVMBasicBlockRef lbblockEntry = LLVMAppendBasicBlockInContext(lcontext, lvalrefProc, "entry");
 			LLVMPositionBuilderAtEnd(lbuilder, lbblockEntry);
             
             // Add storage for arguments
@@ -8653,10 +8774,10 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
             for (u32 iArg : IterCount(LLVMCountParams(lvalrefProc)))
             {
             	auto pAstdecl = PastCast<SAstDeclareSingle>(pAstproc->arypAstDeclArg[iArg]);
-            	auto lvalrefPtr = LLVMBuildAlloca(lbuilder, LtyperefGenerate(pWork, pAstdecl->tid), pAstdecl->pChzName);
+            	auto lvalrefPtr = LLVMBuildAlloca(lbuilder, LtyperefGenerate(pGenx, pAstdecl->tid), pAstdecl->pChzName);
 			
 				LLVMBuildStore(lbuilder, LLVMGetParam(lvalrefProc, iArg), lvalrefPtr);
-				RegisterStorage(pWork, pAstdecl, lvalrefPtr);
+				RegisterStorage(pGenx->pGen, pAstdecl, lvalrefPtr);
             }
 
 			// BB (adrianb) Need implicit return?
@@ -8664,10 +8785,10 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
             auto pAstblock = pAstproc->pAstblock;
             if (pAstblock)
             {
-				SScopeCtx scopectx = Scopectx(genx);
+				SScopeCtx scopectx = Scopectx(pGenx);
 
                 LLVMValueRef lvalref = {};
-                GenerateRecursive(genx, pAstblock, &lvalref);
+                GenerateRecursive(pGenx, pAstblock, &lvalref);
 
                 if (pAstblock->arypAst.c == 0 || Tail(&pAstblock->arypAst)->astk != ASTK_Return)
                 {
@@ -8676,7 +8797,7 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
                 		ShowErr(pAstproc->errinfo, "Procedure didn't return a value");
                 	}
 
-                	PopScope(genx, scopectx);
+                	PopScope(pGenx, scopectx);
 
                 	LLVMBuildRetVoid(lbuilder);
                 }
@@ -8687,11 +8808,11 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 
                 	// BB (adrianb) Code might be simpler if we did store return value.
 
-                	genx.pGens->arypAstDefer.c = 0;
+                	pGenx->arypAstDefer.c = 0;
                 }
             }
 
-			genx.pGens->fInProcedure = false;
+			pGenx->fInProcedure = false;
 		}
 		break;
 
@@ -8703,9 +8824,15 @@ void GenerateRecursive(const SGenerateCtx & genx, SAst * pAst, LLVMValueRef * pL
 	ASTK_TypeProcedure,		// () or (arg) or (arg) -> ret or (arg, arg...) -> ret, ret... etc.
 	ASTK_TypePolymorphic,	// $identifier
 	ASTK_TypeVararg,		// ..
+#endif
 
-	ASTK_ImportDirective,
-	ASTK_RunDirective,
+	// ASTK_ImportDirective
+
+	case ASTK_RunDirective:
+		*pLvalref = LvalrefGenerateConstant(pGenx, pAst);	
+		break;
+
+#if 0
 	ASTK_ForeignLibraryDirective,
 #endif
 
@@ -8720,23 +8847,23 @@ void GenerateAll(SWorkspace * pWork)
 	if (pWork->aryModule.c == 0)
 		return;
 
-	pWork->lcontext = LLVMContextCreate();
-	pWork->lbuilder = LLVMCreateBuilderInContext(pWork->lcontext);
+	pWork->genGlobal.lcontext = LLVMContextCreate();
 
 	// Just create one module named after the root file
 	// BB (adrianb) Is this ok for debugging?
 
-	pWork->lmodule = LLVMModuleCreateWithNameInContext(pWork->aryModule[0].pChzFile, pWork->lcontext);
+	auto lmodule = LLVMModuleCreateWithNameInContext(pWork->aryModule[0].pChzFile, pWork->genGlobal.lcontext);
+	pWork->genGlobal.lmodule = lmodule;
+
 	// BB (adrianb) How do I get this string from arbitrary platform? Also C generates a target data layout.
 	//  Apparently the default target triple is wrong for some reason :/.
 	{
 		//auto pChzTriple = LLVMGetDefaultTargetTriple();
-		LLVMSetTarget(pWork->lmodule, "x86_64-apple-macosx10.11.0");
+		LLVMSetTarget(lmodule, "x86_64-apple-macosx10.11.0");
 		//LLVMDisposeMessage(pChzTriple);
 	}
 
-	SGenerateState gens = {};
-	SGenerateCtx genx = { pWork, pWork->lmodule, &gens };
+	SGenerateCtx genx = { pWork, &pWork->genGlobal, lmodule, LLVMCreateBuilderInContext(pWork->genGlobal.lcontext) };
 
 	for (auto pModule : IterPointer(pWork->aryModule))
 	{
@@ -8752,46 +8879,47 @@ void GenerateAll(SWorkspace * pWork)
 
 			// BB (adrianb) Need to generate unique name?
 
-			LLVMTypeRef ltyperef = LtyperefGenerate(pWork, pAstdecl->tid);
+			LLVMTypeRef ltyperef = LtyperefGenerate(&genx, pAstdecl->tid);
 
-			LLVMValueRef lvalrefGlobal = LLVMAddGlobal(pWork->lmodule, ltyperef, pAstdecl->pChzName);
-			RegisterStorage(pWork, pAstdecl, lvalrefGlobal);
+			LLVMValueRef lvalrefGlobal = LLVMAddGlobal(lmodule, ltyperef, pAstdecl->pChzName);
+			RegisterStorage(genx.pGen, pAstdecl, lvalrefGlobal);
 
 			// BB (adrianb) Handle UninitializedValue.
 
 			if (pAstdecl->pAstValue)
 			{
 				// Globals always have initializers
-				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateConstant(genx, pAstdecl->pAstValue));
+				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateConstant(&genx, pAstdecl->pAstValue));
 			}
 			else
 			{
-				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(genx, pAstdecl->tid, ltyperef));
+				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(&genx, pAstdecl->tid, ltyperef));
 			}
 
-			Reset(&gens);
+			Reset(&genx);
 		}
 
 		// Generate code for functions in this module
 
 		for (auto pAstproc : pModule->arypAstproc)
 		{
-			GenerateRecursive(genx, pAstproc, nullptr);
+			GenerateRecursive(&genx, pAstproc, nullptr);
 
-			Reset(&gens);
+			Reset(&genx);
 		}
 	}
 	
-	Destroy(&gens.arypAstDefer);
+	Destroy(&genx);
 
 	{
 		char * pChzError = nullptr;
-	    LLVMVerifyModule(pWork->lmodule, LLVMAbortProcessAction, &pChzError);
-	    LLVMDisposeMessage(pChzError);
+	    LLVMVerifyModule(lmodule, LLVMAbortProcessAction, &pChzError);
+	    if (pChzError)
+	    {
+	    	ShowErrRaw("Found error in module", pChzError);
+	    	LLVMDisposeMessage(pChzError);
+	    }
 	}
-
-	LLVMDisposeBuilder(pWork->lbuilder);
-	pWork->lbuilder = nullptr;
 }
 
 void PrintToString(SStringBuilder * pStrb, const char * pChzFmt, va_list vargs)
@@ -9035,7 +9163,8 @@ int main(int cpChzArg, const char * apChzArg[])
 		SStringBuilder strbBc = SStringBuilder("%s", PchzBaseName(work.aryModule[0].pChzFile)); //"output/";
 		PatchExt(&strbBc, ".bc");
 
-		if (LLVMWriteBitcodeToFile(work.lmodule, strbBc.aChz) != 0)
+		ASSERT(work.genGlobal.lmodule);
+		if (LLVMWriteBitcodeToFile(work.genGlobal.lmodule, strbBc.aChz) != 0)
 		{
 			printf("Failed to write bitcode file %s\n", strbBc.aChz);
 		}
@@ -9058,7 +9187,6 @@ int main(int cpChzArg, const char * apChzArg[])
 			else
 			{
 				char aChzOut[256];
-				aChzOut[0] = '\0';
 				for (;;)
 				{
 					if (feof(pFileCmdOut))
@@ -9110,7 +9238,7 @@ int main(int cpChzArg, const char * apChzArg[])
 		}
 	}
 
-	if (fWriteBitcode && work.lmodule)
+	if (fWriteBitcode && work.genGlobal.lmodule)
 	{
 		// BB (adrianb) Full path management. Write to output directory?
 
@@ -9118,7 +9246,7 @@ int main(int cpChzArg, const char * apChzArg[])
 		PatchExt(&strbLl, ".ll");
 
 		char * pChzError;
-		if (LLVMPrintModuleToFile(work.lmodule, strbLl.aChz, &pChzError) == 0)
+		if (LLVMPrintModuleToFile(work.genGlobal.lmodule, strbLl.aChz, &pChzError) == 0)
 		{
 			printf("Write out file %s\n", strbLl.aChz);
 		}

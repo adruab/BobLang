@@ -47,7 +47,7 @@
 #include "llvm-c/Analysis.h"
 #include "llvm-c/BitWriter.h"
 #include "llvm-c/TargetMachine.h"
-//#include "llvm-c/OrcBindings.h"
+#include "llvm-c/OrcBindings.h"
 
 // Compilation phases:
 // Parse to AST, no types
@@ -1160,7 +1160,12 @@ struct SWorkspace
 	SGenerate genGlobal;
 	SGenerate genJit;
 
-	//LLVMExecutionEngineRef lengineJit;
+	const char * pChzTriple;
+	LLVMTargetRef ltargetJit;
+	LLVMTargetMachineRef ltargetmachineJit;
+	LLVMOrcJITStackRef lorcjit;
+
+	SSet<SAst *> setpAstJitDone;
 };
 
 struct SStringWithLength
@@ -7565,9 +7570,9 @@ struct SGenerateCtx
 
 	// Current state
 
+	//LLVMContextRef lcontext;
 	LLVMModuleRef lmodule;
 	LLVMBuilderRef lbuilder;
-	LLVMContextRef lcontext;
 
 	SArray<SAst *> arypAstDefer;
 	bool fReturnMarked;
@@ -7585,6 +7590,9 @@ void Reset(SGenerateCtx * pGenx)
 
 void AddReferenced(SGenerateCtx * pGenx, SAst * pAst)
 {
+    if (pGenx->parypAstReferenced == nullptr)
+        return;
+
 	ASSERT(pAst->astk == ASTK_Procedure || pAst->astk == ASTK_DeclareSingle);
 	Append(pGenx->parypAstReferenced, pAst);
 }
@@ -7623,7 +7631,7 @@ SStorage * PstorageLookup(SGenerate * pGen, SAstDeclareSingle * pAstdecl)
 
 void RegisterStorage(SGenerate * pGen, SAstDeclareSingle * pAstdecl, LLVMValueRef lvalrefPtr)
 {
-	ASSERT(PstorageLookup(pGen, pAstdecl) == nullptr);
+	ASSERTCHZ(PstorageLookup(pGen, pAstdecl) == nullptr, "Found duplicate storage for declaration %s", pAstdecl->pChzName);
 	auto hv = HvFromKey(reinterpret_cast<u64>(pAstdecl));
 	
 	Add(&pGen->hashPastdeclStorage, hv, pAstdecl, {lvalrefPtr});
@@ -7736,8 +7744,6 @@ LLVMValueRef LvalrefEnsureProcedure(SGenerateCtx * pGenx, SAstProcedure * pAstpr
 
 	ASSERT(pAstproc->tid.pType && pAstproc->tid.pType->typek == TYPEK_Procedure);
 	LLVMTypeRef ltyperefProc = LtyperefGenerate(pGenx, pAstproc->tid);
-
-	// BB (adrianb) Generate a unique name so that externs in future JIT modules can agree on one?
 
 	auto lvalrefProc = LLVMAddFunction(pGenx->lmodule, pAstproc->pChzName, ltyperefProc);
 	
@@ -8052,48 +8058,165 @@ LLVMValueRef LvalrefConstruct(SGenerateCtx * pGenx, SValue val)
 	return {};
 }
 
-LLVMValueRef LvalrefRunCode(SWorkspace * pWork, SAst * pAst)
+void MarkReturned(SGenerateCtx * pGenx)
 {
+	pGenx->fReturnMarked = true;
+}
+
+// BB (adrianb) Want a way to detect if we emit any instructions after a return in a basic block so we can error on
+//  said expression. Maybe do an expression level detection? Does that make sense?
+
+void Branch(SGenerateCtx * pGenx, LLVMBasicBlockRef lbbref)
+{
+	// Don't branch if we've returned or it will count as terminator in middle of basic block
+
+	if (pGenx->fReturnMarked)
+	{
+		pGenx->fReturnMarked = false;
+		return;
+	}
+
+	LLVMBuildBr(pGenx->lbuilder, lbbref);
+}
+
+void PopScope(SGenerateCtx * pGenx, const SScopeCtx & scopectx)
+{
+	while (pGenx->arypAstDefer.c > scopectx.ipAstDeferMic)
+	{
+		auto pAstDefer = Tail(&pGenx->arypAstDefer);
+		Pop(&pGenx->arypAstDefer);
+		GenerateRecursive(pGenx, pAstDefer, nullptr);
+	}
+}
+
+void EarlyReturnPopScopes(SGenerateCtx * pGenx)
+{
+	for (int ipAst : IterCount(pGenx->arypAstDefer.c))
+	{
+		auto pAstDefer = Tail(&pGenx->arypAstDefer, ipAst);
+		GenerateRecursive(pGenx, pAstDefer, nullptr);
+	}
+}
+
+LLVMValueRef LvalrefGenerateDefaultValue(SGenerateCtx * pGenx, STypeId tid, LLVMTypeRef ltyperef);
+void GenerateGlobal(SGenerateCtx * pGenx, SAst * pAst);
+
+LLVMValueRef LvalrefRunCode(SGenerateCtx * pGenxParent, SAst * pAst)
+{
+	auto pWork = pGenxParent->pWork;
+
 	// Make sure we have a JIT environment constructed
 
 	auto pGenJit = &pWork->genJit;
-	if (!pGenJit->lcontext)
+	bool fCreateJit = !pWork->lorcjit;
+	if (fCreateJit)
 	{
+		ASSERT(!pGenJit->lcontext);
 		pGenJit->lcontext = LLVMContextCreate();
-		//LLVMLinkInMCJIT();
-		LLVMInitializeNativeTarget();
+
+		// BB (adrianb) Linking this in takes ~0.9 extra seconds! >:|
+		//  Maybe I should just build an interpreted setup.
+		//LLVMInitializeNativeTarget();
+
+		pGenJit->lmodule = LLVMModuleCreateWithNameInContext("JitModule", pGenJit->lcontext);
+
+		auto pChzTripleDefault = LLVMGetDefaultTargetTriple();
+
+		LLVMSetTarget(pGenJit->lmodule, pChzTripleDefault);
+
+        char * pChzError = nullptr;
+        if (LLVMGetTargetFromTriple(pChzTripleDefault, &pWork->ltargetJit, &pChzError))
+        {
+        	ShowErr(pAst->errinfo, "Can't get target for triple %s", pChzTripleDefault);
+        }
+
+    	pWork->ltargetmachineJit = LLVMCreateTargetMachine(pWork->ltargetJit, pChzTripleDefault, "", "", 
+    													   LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
+
+		pWork->lorcjit = LLVMOrcCreateInstance(pWork->ltargetmachineJit);
 	}
 
-	// Generate an anonymous function into its own module, collecting referenced procedures/globals
+	// Generate an anonymous procedure into the module, collecting referenced procedures/globals
 
-	// As part of any generate we might have multiple 
-
-	pGenJit->lmodule = LLVMModuleCreateWithNameInContext("anonymous", pGenJit->lcontext);
+	// BB (adrianb) We could put anonymous procedure into their own module, but would require externing any other
+	//  declarations, which requires names to match. Ugh.
 	
-	SArray<SAst *> arypAstReferenced;
+    SArray<SAst *> arypAstReferenced = {};
 
 	SGenerateCtx genx = { pWork, pGenJit, pGenJit->lmodule, LLVMCreateBuilderInContext(pGenJit->lcontext) };
 	genx.parypAstReferenced = &arypAstReferenced;
 
-	GenerateRecursive(&genx, pAst, nullptr);
+	genx.fInProcedure = true;
+
+	// BB (adrianb) Would love to just completely ignore this but you HAVE to have a name to lookup a symbol.
+
+	static int s_cRunCode = 0;
+	char aChzName[32];
+	sprintf(aChzName, "__run_proc%d", s_cRunCode++);
+
+	auto ltyperefVoid = LtyperefGenerate(&genx, pWork->tidVoid);
+	auto ltyperefResult = LtyperefGenerate(&genx, TidPointer(pWork, pAst->tid));
+
+	auto ltyperefRunProc = LLVMFunctionType(ltyperefVoid, &ltyperefResult, 1, false);
+	auto lvalrefRunProc = LLVMAddFunction(genx.lmodule, aChzName, ltyperefRunProc);
+	
+	// Start basic block for the procedure
+
+	LLVMBasicBlockRef lbblockEntry = LLVMAppendBasicBlockInContext(genx.pGen->lcontext, lvalrefRunProc, "entry");
+	LLVMPositionBuilderAtEnd(genx.lbuilder, lbblockEntry);
+    
+    LLVMValueRef lvalrefRet = {};
+    GenerateRecursive(&genx, pAst, &lvalrefRet);
+
+    if (pAst->tid.pType->typek != TYPEK_Void)
+    {
+    	LLVMBuildStore(genx.lbuilder, lvalrefRet, LLVMGetParam(lvalrefRunProc, 0));
+    }
+
+    MarkReturned(&genx);
+    EarlyReturnPopScopes(&genx);
+    LLVMBuildRetVoid(genx.lbuilder);
+
+	// Reset scope stack
+
+	genx.arypAstDefer.c = 0;
+
+	genx.fInProcedure = false;
+
+	Reset(&genx);
 
 	// Generate all referenced globals/procedures as extern into anonymous module
 
 	for (int ipAst = 0; ipAst < arypAstReferenced.c; ++ipAst)
 	{
 		auto pAstRef = arypAstReferenced[ipAst];
+		u32 hvAst = HvFromKey(reinterpret_cast<intptr_t>(pAstRef));
+		if (PtLookupImpl(&pWork->setpAstJitDone, hvAst, pAstRef))
+			continue;
+
+		Add(&pWork->setpAstJitDone, hvAst, pAstRef);
+
 		switch (pAstRef->astk)
 		{
 		case ASTK_Procedure:
 			{
-				// Get unique name mangled stuff for each ast entry so we can point at earlier ones.
+				auto pAstproc = PastCast<SAstProcedure>(pAstRef);
+				if (pAstproc->fIsForeign)
+					continue;
 
+				auto lvalrefProc = LvalrefEnsureProcedure(&genx, pAstproc);
+				if (LLVMCountBasicBlocks(lvalrefProc) != 0)
+					continue;
 
+				GenerateRecursive(&genx, pAstproc, nullptr);
 			}
 			break;
 
 		case ASTK_DeclareSingle:
 			{
+				// BB (adrianb) Track referenced globals.
+
+				GenerateGlobal(&genx, pAst);
 			}
 			break;
 
@@ -8101,42 +8224,35 @@ LLVMValueRef LvalrefRunCode(SWorkspace * pWork, SAst * pAst)
 			ASSERT(false);
 			break;
 		}
+
+		Reset(&genx);
 	}
 
-	// Generate all
-	// Build all newly touched declarations into a module and add it to execution engine (or create it).
-	// Then generate an anonymous function for our expression add it, run it, get the return value and remove it.
-	// BB (adrianb) If we return a struct how to get that? Always store the return value in a global 
-	//  and extract it that way?
+	auto lomodule = LLVMOrcAddLazilyCompiledIR(pWork->lorcjit, pGenJit->lmodule, nullptr, nullptr);
+	
+	// Run anonymous module, and capture return value
 
-#if 0
-	if (pWork->lengineJit == nullptr)
-	{
-		char * pChzErr = NULL;
-		if (LLVMCreateExecutionEngineForModule(&pWork->lengineJit, lmoduleAnonymous, &pChzErr) != 0) 
-		{
-			ShowErr(pAst->errinfo, "Can't create execution engine");
-		}
-		else if (pChzErr)
-		{
-			ShowErr(pAst->errinfo, "Creating execution engine provided this error: %s", pChzErr);
-		}
-	}
-#endif
+	auto addrRunProc = LLVMOrcGetSymbolAddress(pWork->lorcjit, aChzName);
+	ASSERT(addrRunProc);
+	auto pfnRun = reinterpret_cast<void (*)(void *)>(addrRunProc);
 
-#if 0
-	static bool s_fDont = false;
+	char aBRet[8] = {}; // BB (adrianb) Arbitrary size output based on tid
 
-	if (s_fDont)
-	{
-		LLVMOrcGetMangledSymbol(nullptr, nullptr, nullptr);
-	}
-#endif
+	pfnRun(aBRet);
+
+	LLVMOrcRemoveModule(pWork->lorcjit, lomodule);
+
+	printf("Run code produced: ");
+	for (auto b : aBRet)	
+		printf("%02x", b);
+	printf("\n");
+
+	// Construct a constant from the returned data based on type
 
 	Destroy(&genx);
 
-	ASSERT(false);
-	return {};
+	//ASSERT(false);
+	return LvalrefGenerateDefaultValue(pGenxParent, pAst->tid, LtyperefGenerate(pGenxParent, pAst->tid));
 }
 
 LLVMValueRef LvalrefGenerateConstant(SGenerateCtx * pGenx, SAst * pAst)
@@ -8169,12 +8285,14 @@ LLVMValueRef LvalrefGenerateConstant(SGenerateCtx * pGenx, SAst * pAst)
 
 	case ASTK_Procedure:
 		{
+			// Identifier reference to procedure
+
 			AddReferenced(pGenx, pAst);
 			return LvalrefEnsureProcedure(pGenx, PastCast<SAstProcedure>(pAst));
 		}
 
 	case ASTK_RunDirective:
-		return LvalrefRunCode(pGenx->pWork, PastCast<SAstRunDirective>(pAst)->pAstExpr);
+		return LvalrefRunCode(pGenx, PastCast<SAstRunDirective>(pAst)->pAstExpr);
 
 	default:
 		ShowErr(pAst->errinfo, "Can't generate constant for ast %s(%d)", PchzFromAstk(astk), astk);
@@ -8240,50 +8358,10 @@ LLVMValueRef LvalrefGenerateDefaultValue(SGenerateCtx * pGenx, STypeId tid, LLVM
 	return {};
 }
 
-void MarkReturned(SGenerateCtx * pGenx)
-{
-	pGenx->fReturnMarked = true;
-}
-
-// BB (adrianb) Want a way to detect if we emit any instructions after a return in a basic block so we can error on
-//  said expression. Maybe do an expression level detection? Does that make sense?
-
-void Branch(SGenerateCtx * pGenx, LLVMBasicBlockRef lbbref)
-{
-	// Don't branch if we've returned or it will count as terminator in middle of basic block
-
-	if (pGenx->fReturnMarked)
-	{
-		pGenx->fReturnMarked = false;
-		return;
-	}
-
-	LLVMBuildBr(pGenx->lbuilder, lbbref);
-}
-
-void PopScope(SGenerateCtx * pGenx, const SScopeCtx & scopectx)
-{
-	while (pGenx->arypAstDefer.c > scopectx.ipAstDeferMic)
-	{
-		auto pAstDefer = Tail(&pGenx->arypAstDefer);
-		Pop(&pGenx->arypAstDefer);
-		GenerateRecursive(pGenx, pAstDefer, nullptr);
-	}
-}
-
-void EarlyReturnPopScopes(SGenerateCtx * pGenx)
-{
-	for (int ipAst : IterCount(pGenx->arypAstDefer.c))
-	{
-		auto pAstDefer = Tail(&pGenx->arypAstDefer, ipAst);
-		GenerateRecursive(pGenx, pAstDefer, nullptr);
-	}
-}
-
 void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalref)
 {
 	auto pWork = pGenx->pWork;
-	auto lcontext = pGenx->lcontext; 
+	auto lcontext = pGenx->pGen->lcontext; 
 
 	LLVMValueRef lvalrefDontCare;
 	if (pLvalref == nullptr)
@@ -8298,7 +8376,8 @@ void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalre
 		*pLvalref = LvalrefGenerateConstant(pGenx, pAst);
 		break;
 
-	// ASTK_UninitializedValue,
+	// ASTK_UninitializedValue
+
 	case ASTK_Block:
 		{
 			SScopeCtx scopectx = Scopectx(pGenx);
@@ -8312,6 +8391,7 @@ void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalre
 
 	case ASTK_EmptyStatement:
 		// BB (adrianb) Set pLvalref to void?
+		ASSERT(pLvalref == &lvalrefDontCare);
 		break;
 
 	case ASTK_Identifier:
@@ -8816,15 +8896,13 @@ void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalre
 		}
 		break;
 
-#if 0
-	ASTK_TypeDefinition,
+	// ASTK_TypeDefinition
 
-	ASTK_TypePointer,		// *
-	ASTK_TypeArray,			// []
-	ASTK_TypeProcedure,		// () or (arg) or (arg) -> ret or (arg, arg...) -> ret, ret... etc.
-	ASTK_TypePolymorphic,	// $identifier
-	ASTK_TypeVararg,		// ..
-#endif
+	// ASTK_TypePointer
+	// ASTK_TypeArray
+	// ASTK_TypeProcedure
+	// ASTK_TypePolymorphic
+	// ASTK_TypeVararg
 
 	// ASTK_ImportDirective
 
@@ -8832,14 +8910,41 @@ void GenerateRecursive(SGenerateCtx * pGenx, SAst * pAst, LLVMValueRef * pLvalre
 		*pLvalref = LvalrefGenerateConstant(pGenx, pAst);	
 		break;
 
-#if 0
-	ASTK_ForeignLibraryDirective,
-#endif
+	// ASTK_ForeignLibraryDirective
 
 	default:
 		ASSERTCHZ(false, "Generate for astk %s(%d) NYI", PchzFromAstk(pAst->astk), pAst->astk);
 		break;
 	}
+}
+
+void GenerateGlobal(SGenerateCtx * pGenx, SAst * pAst)
+{
+	// BB (adrianb) Keep storage for constants when they are things like strings or structs or whatnot? 
+	auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
+	if (pAstdecl->fIsConstant)
+		return;
+
+	// BB (adrianb) Need to generate unique name?
+
+	LLVMTypeRef ltyperef = LtyperefGenerate(pGenx, pAstdecl->tid);
+
+	LLVMValueRef lvalrefGlobal = LLVMAddGlobal(pGenx->lmodule, ltyperef, pAstdecl->pChzName);
+	RegisterStorage(pGenx->pGen, pAstdecl, lvalrefGlobal);
+
+	// BB (adrianb) Handle UninitializedValue.
+
+	if (pAstdecl->pAstValue)
+	{
+		// Globals always have initializers
+		LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateConstant(pGenx, pAstdecl->pAstValue));
+	}
+	else
+	{
+		LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(pGenx, pAstdecl->tid, ltyperef));
+	}
+
+	Reset(pGenx);
 }
 
 void GenerateAll(SWorkspace * pWork)
@@ -8858,8 +8963,8 @@ void GenerateAll(SWorkspace * pWork)
 	// BB (adrianb) How do I get this string from arbitrary platform? Also C generates a target data layout.
 	//  Apparently the default target triple is wrong for some reason :/.
 	{
-		//auto pChzTriple = LLVMGetDefaultTargetTriple();
-		LLVMSetTarget(lmodule, "x86_64-apple-macosx10.11.0");
+		pWork->pChzTriple = "x86_64-apple-macosx10.11.0"; // LLVMGetDefaultTargetTriple();
+		LLVMSetTarget(lmodule, pWork->pChzTriple);
 		//LLVMDisposeMessage(pChzTriple);
 	}
 
@@ -8872,31 +8977,7 @@ void GenerateAll(SWorkspace * pWork)
 			if (pAst->astk != ASTK_DeclareSingle)
 				continue;
 
-			// BB (adrianb) Keep storage for constants when they are things like strings or structs or whatnot? 
-			auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
-			if (pAstdecl->fIsConstant)
-				continue;
-
-			// BB (adrianb) Need to generate unique name?
-
-			LLVMTypeRef ltyperef = LtyperefGenerate(&genx, pAstdecl->tid);
-
-			LLVMValueRef lvalrefGlobal = LLVMAddGlobal(lmodule, ltyperef, pAstdecl->pChzName);
-			RegisterStorage(genx.pGen, pAstdecl, lvalrefGlobal);
-
-			// BB (adrianb) Handle UninitializedValue.
-
-			if (pAstdecl->pAstValue)
-			{
-				// Globals always have initializers
-				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateConstant(&genx, pAstdecl->pAstValue));
-			}
-			else
-			{
-				LLVMSetInitializer(lvalrefGlobal, LvalrefGenerateDefaultValue(&genx, pAstdecl->tid, ltyperef));
-			}
-
-			Reset(&genx);
+			GenerateGlobal(&genx, pAst);
 		}
 
 		// Generate code for functions in this module
@@ -8913,12 +8994,12 @@ void GenerateAll(SWorkspace * pWork)
 
 	{
 		char * pChzError = nullptr;
-	    LLVMVerifyModule(lmodule, LLVMAbortProcessAction, &pChzError);
-	    if (pChzError)
+	    if (LLVMVerifyModule(lmodule, LLVMAbortProcessAction, &pChzError))
 	    {
-	    	ShowErrRaw("Found error in module", pChzError);
-	    	LLVMDisposeMessage(pChzError);
+	    	ShowErrRaw("Found error in module:\n%s", pChzError);
 	    }
+	    if (pChzError)
+	    	LLVMDisposeMessage(pChzError);
 	}
 }
 
@@ -9143,6 +9224,15 @@ int main(int cpChzArg, const char * apChzArg[])
 	}
 
 	const char * pChzFile = apChzArg[ipChz];
+
+    LLVMInitializeNativeTarget();
+	LLVMInitializeNativeAsmPrinter();
+	LLVMInitializeNativeAsmParser();
+	for (auto ltarget = LLVMGetFirstTarget(); ltarget; ltarget = LLVMGetNextTarget(ltarget))
+	{
+		printf("Target %s: %s\n", LLVMGetTargetName(ltarget), LLVMGetTargetDescription(ltarget));
+	}
+	fflush(stdout);
 
 	SWorkspace work;
 	InitWorkspace(&work);

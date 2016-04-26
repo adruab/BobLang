@@ -907,6 +907,18 @@ const SOperator g_aOperator[] =
 
 const char * g_pChzOperatorAll = "@:?=<>!.&+-|~*/%$^";
 
+const char * PchzOperatorClean(const char * pChz)
+{
+	// Convert into the world version so we can get correct precedence.
+
+	if (strcmp(pChz, "&&") == 0)
+		return "and";
+	if (strcmp(pChz, "||") == 0)
+		return "or";
+
+	return pChz;
+}
+
 int NOperatorLevel(const char * pChzOp)
 {
 	int cChOp = int(strlen(pChzOp));
@@ -955,7 +967,7 @@ int NOperatorLevel(const char * pChzOp)
 				const char * pChzDelim = strchr(pChzWords, ' ');
 				int cChWord = int((pChzDelim) ? pChzDelim - pChzWords : strlen(pChzWords));
 
-				if (strncmp(pChzOp, pChzWords, cChWord) == 0)
+				if (strncmp(pChzOp, pChzWords, cChWord) == 0 && pChzOp[cChWord] == '\0')
 					return iOperator;
 
 				pChzWords += cChWord;
@@ -1613,7 +1625,7 @@ void ParseToken(SWorkspace * pWork)
 
 	// What token should we start consuming?
 
-	// BB (adrianb) Deal with utf8 characters (always a letter?)
+	// BB (adrianb) Change to switch statement or table drive ala http://nothings.org/computer/lexing.html? 
 
 	char chStart = Ch(pWork);
 	if (chStart == '\0')
@@ -1632,6 +1644,9 @@ void ParseToken(SWorkspace * pWork)
 
 		const char * pChzIdent = PchzCopy(pWork, pChzStart, pWork->pChzCurrent - pChzStart);
 
+		const char * pChzOperator = PchzOperatorClean(pChzIdent);
+		int nOpLevel = NOperatorLevel(pChzOperator);
+
 		if (KEYWORD keyword = KeywordFromPchz(pChzIdent))
 		{
 			pTok->tokk = TOKK_Keyword;
@@ -1643,9 +1658,10 @@ void ParseToken(SWorkspace * pWork)
 			pTok->lit.n = (strcmp(pChzIdent, "true") == 0);
 			pTok->lit.litk = LITK_Bool;
 		}
-		else if (int nOpLevel = NOperatorLevel(pChzIdent))
+		else if (nOpLevel >= 0)
 		{
-			pTok->op.pChz = pChzIdent;
+			pTok->tokk = TOKK_Operator;
+			pTok->op.pChz = pChzOperator;
 			pTok->op.nLevel = nOpLevel;
 		}
 		else
@@ -1755,8 +1771,8 @@ void ParseToken(SWorkspace * pWork)
 		}
 
 		const char * pChzOp = PchzCopy(pWork, pChzStart, pWork->pChzCurrent - pChzStart);
-		pTok->op.pChz = pChzOp;
-		pTok->op.nLevel = NOperatorLevel(pChzOp);
+		pTok->op.pChz = PchzOperatorClean(pChzOp);
+		pTok->op.nLevel = NOperatorLevel(pTok->op.pChz);
 		ASSERT(pTok->op.nLevel >= 0);
 
 		EndToken(pTok, pWork);
@@ -2626,45 +2642,54 @@ SAst * PastTryParsePrimary(SWorkspace * pWork)
 
 SAst * PastTryParseBinaryOperator(SWorkspace * pWork, int iOperator)
 {
-	if (iOperator >= pWork->cOperator)
-	{
-		return PastTryParsePrimary(pWork);
-	}
+	SAst * apAst[32];
+	int cpAst = 0;
+	SToken aTokOperator[32];
+	int cTokOperator = 0;
 
-	SAst * pAstLeft = PastTryParseBinaryOperator(pWork, iOperator + 1);
-	if (!pAstLeft)
-		return nullptr;
-	
-	// BB (adrianb) Could add right associativity the same way we do with prefix operators.
+	// Push a primary on, always starts with one
 
 	for (;;)
 	{
-		// BB (adrianb) Detect newline here? Other wise *pN = 5\n *pN = 3 will parse to (= (* pN) (* 5 pN) ...
+		ASSERT(cpAst < DIM(apAst));
+		apAst[cpAst++] = PastTryParsePrimary(pWork);
 
+		// See if we should pop an old one
+
+LTryOp:
 		SToken tok = TokPeek(pWork);
-		if (tok.tokk != TOKK_Operator || iOperator != tok.op.nLevel)
-			break;
-
-		ConsumeToken(pWork);
-
-		SAst * pAstRight = PastTryParseBinaryOperator(pWork, iOperator + 1);
-		if (!pAstRight)
+        int nLevelCur = (cTokOperator > 0) ? aTokOperator[cTokOperator - 1].op.nLevel : -1;
+		if (tok.tokk != TOKK_Operator || tok.op.nLevel <= nLevelCur)
 		{
-			ShowErr(tok.errinfo, "Expected expression to follow operator %s", tok.op.pChz);
-			return nullptr;
+			if (cTokOperator > 0)
+			{
+				ASSERT(cpAst >= 2);
+				SAst * pAstRight = apAst[--cpAst];
+				SAst * pAstLeft = apAst[--cpAst];
+				tok = aTokOperator[--cTokOperator];
+
+				auto pAstop = PastCreate<SAstOperator>(pWork, tok.errinfo);
+				pAstop->pChzOp = tok.op.pChz;
+				pAstop->pAstLeft = pAstLeft;
+				pAstop->pAstRight = pAstRight;
+				apAst[cpAst++] = pAstop;
+
+				goto LTryOp;
+			}
+
+			break;
 		}
-
-		auto pAstop = PastCreate<SAstOperator>(pWork, tok.errinfo);
-		pAstop->pChzOp = tok.op.pChz;
-		pAstop->pAstLeft = pAstLeft;
-		pAstop->pAstRight = pAstRight;
-
-		// Left associative
-
-		pAstLeft = pAstop;
+		else
+		{
+			ASSERT(cTokOperator < DIM(aTokOperator));
+			ASSERTCHZ(tok.op.nLevel != INT_MAX, "Operator %s doesn't have precedence", tok.op.pChz);
+            ConsumeToken(pWork, 1);
+			aTokOperator[cTokOperator++] = tok;
+		}
 	}
 
-	return pAstLeft;
+	ASSERT(cpAst == 1);
+	return apAst[0];
 }
 
 SAst * PastTryParseExpression(SWorkspace * pWork)
@@ -6126,8 +6151,6 @@ static const SBinaryOperatorInst s_aBopi[] =
 	{ "==", FBOPI_AllIntegers | FBOPI_Bools | FBOPI_AllFloats | FBOPI_Pointers | FBOPI_ReturnBool }, // Floats for == et al?
 	{ "!=", FBOPI_AllIntegers | FBOPI_Bools | FBOPI_AllFloats | FBOPI_Pointers | FBOPI_ReturnBool },
 
-	{ "&&", FBOPI_Bools },
-	{ "||", FBOPI_Bools },
 	{ "and", FBOPI_Bools },
 	{ "or", FBOPI_Bools },
 
@@ -7673,7 +7696,7 @@ void EvalConstant(SWorkspace * pWork, SAst * pAst, void * pVRet)
 					}
 				}
 
-				if (strcmp(pChzOp, "&&") == 0 || strcmp(pChzOp, "and") == 0)
+				if (strcmp(pChzOp, "and") == 0)
 				{
 					void * pVLeft = alloca(CbSizeOf(pAstLeft->tid));
 					EvalConstant(pWork, pAstLeft, pVLeft);
@@ -7686,7 +7709,7 @@ void EvalConstant(SWorkspace * pWork, SAst * pAst, void * pVRet)
 					EvalConstant(pWork, pAstRight, pVRet);
 					return;
 				}
-				else if (strcmp(pChzOp, "||") == 0 || strcmp(pChzOp, "or") == 0)
+				else if (strcmp(pChzOp, "or") == 0)
 				{
 					void * pVLeft = alloca(CbSizeOf(pAstLeft->tid));
 					EvalConstant(pWork, pAstLeft, pVLeft);
@@ -8953,8 +8976,8 @@ REG RegGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 					}
 				}
 
-				bool fIsOrOp = strcmp(pChzOp, "||") == 0 || strcmp(pChzOp, "or") == 0;
-				if (fIsOrOp || strcmp(pChzOp, "&&") == 0 || strcmp(pChzOp, "and") == 0)
+				bool fIsOrOp = strcmp(pChzOp, "or") == 0;
+				if (fIsOrOp || strcmp(pChzOp, "and") == 0)
 				{
 					// Eval left, branch on it, eval right, branch to done, done phi based on first and 2nd branch
 
@@ -10547,6 +10570,18 @@ void RunUnitTests()
 			"(Block (+= 'n 0x5) (Return 'n))))", 
 		"(DeclareSingle (Proc s32 -> s32) infer-type (Procedure (Proc s32 -> s32) (args (DeclareSingle s32 (Type s32))) "
 			"(returns (Type s32)) (Block void (+= void s32 IntLit) (Return s32 s32))))");
+	
+	CompileAndCheckDeclaration("operator-logand-precidence", "a",
+		"a := 5 != 10 && true;",
+		"(DeclareSingle var a infer-type (and (!= 0x5 0xa) true))", 
+		"(DeclareSingle bool infer-type (and bool (!= bool IntLit IntLit) BoolLit))");
+
+	CompileAndCheckDeclaration("extern-printf", "printf",
+		"printf :: (format : * char, ..) -> int #foreign;",
+		"(DeclareSingle const printf infer-type (Procedure (#foreign) (args (DeclareSingle var format (TypePointer 'char))"
+		" (DeclareSingle var <no-name> ..)) (returns 'int)))",
+		"(DeclareSingle (Proc (* u8) -> s32) infer-type (Procedure (Proc (* u8) -> s32)"
+		" (args (DeclareSingle (* u8) (TypePointer (Type (* u8)) (Type u8))) (DeclareSingle .. (Type ..))) (returns (Type s32))))");
 
 	// Add support:
 	// - Value result JIT
@@ -10794,7 +10829,6 @@ int main(int cpChzArg, const char * apChzArg[])
 	- Add string, array, dynamic array.
 	- Add array literal syntax.
 	- Add enums.
-	- Short circuit logical operators.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
 	- #run. Use LLVM JIT, MCJIT is the only option until I can get 3.7.1 working. 
 		- How are side effects to globals persisted? Eg. init_crc64. After every #run copy out all globals? 

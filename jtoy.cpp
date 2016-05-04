@@ -1075,6 +1075,7 @@ struct SModule
 	const char * pChzFile; // BB (adrianb) Add full path?
 	const char * pChzContents;
 	bool fAllocContents;
+	bool fBuiltIn;
 	SAstBlock * pAstblockRoot;
 
 	SArray<SAstProcedure *> arypAstproc;
@@ -1166,6 +1167,8 @@ struct SWorkspace
 	SArray<STypeStruct *> arypTypestruct; // All structs
 	SHash<STypeId, SSymbolTable *> hashTidPsymtStruct; // Symbol tables for out of order struct type checking
 	SHash<SAst *, SResolveDecl *> hashPastPresdeclResolved;
+
+	STypeStruct * pTypestructString;
 
 	// Byte code generation
 
@@ -4162,7 +4165,8 @@ T * PtypeCast(SType * pType)
 template <class T>
 const T * PtypeCast(const SType * pType)
 {
-	ASSERT(pType->typek == T::s_typek);
+	ASSERTCHZ(pType->typek == T::s_typek, "Failed to cast type %s to %s", PchzFromTypek(pType->typek), 
+			  PchzFromTypek(T::s_typek));
 	return static_cast<const T *>(pType);
 }
 
@@ -5250,7 +5254,14 @@ void RegisterStruct(SWorkspace * pWork, STypeId tid, SSymbolTable * pSymt)
 	
 	Add(&pWork->hashTidPsymtStruct, hv, tid, pSymt);
 
-	Append(&pWork->arypTypestruct, PtypeCast<STypeStruct>(const_cast<SType *>(tid.pType)));
+	auto pTypestruct = PtypeCast<STypeStruct>(const_cast<SType *>(tid.pType));
+	Append(&pWork->arypTypestruct, pTypestruct);
+
+	if (strcmp(pTypestruct->pChzName, "_StringStruct") == 0)
+	{
+		ASSERT(pWork->pTypestructString == nullptr);
+		pWork->pTypestructString = pTypestruct;
+	}
 }
 
 STypeId TidWrap(SWorkspace * pWork, const STypeId & tid)
@@ -5282,7 +5293,22 @@ void AddBuiltinType(SWorkspace * pWork, const char * pChzName, const SType & typ
 		*pTid = tid;
 }
 
-void InitWorkspace(SWorkspace * pWork)
+struct SStringImage
+{
+	u8 * pCh;
+	s64 cCh;
+};
+
+enum FWINIT
+{
+	FWINIT_IncludeBuiltinModule = 0x1,
+
+	GRFWINIT_None = 0
+};
+
+typedef u32 GRFWINIT;
+
+void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 {
 	ClearStruct(pWork);
 	pWork->cOperator = DIM(g_aOperator);
@@ -5321,6 +5347,15 @@ void InitWorkspace(SWorkspace * pWork)
 	// BB (adrianb) Just make these implicit structs? Or explicit structs?
 	AddBuiltinType(pWork, "string", SType{TYPEK_String});
 	AddBuiltinType(pWork, "Any", SType{TYPEK_Any});
+
+	if (grfwinit & FWINIT_IncludeBuiltinModule)
+	{
+		SModule * pModule = PtAppendNew(&pWork->aryModule);
+		pModule->pChzFile = "builtin-code";
+		pModule->pChzContents = 
+		"_StringStruct :: struct { pCh : *u8; cCh : s64; };\n";
+		pModule->fBuiltIn = true;
+	}
 }
 
 void Destroy(SWorkspace * pWork)
@@ -6285,6 +6320,7 @@ bool FCanGetAddress(SAst * pAst)
 	ASTK astk = pAst->astk;
 	if (astk == ASTK_Operator)
 	{
+		// BB (adrianb) Validate that the right type inside is a non-constant? Or do that at generation time?
 		auto pAstop = PastCast<SAstOperator>(pAst);
 		auto pChzOp = pAstop->pChzOp;
 		if (pAstop->pAstLeft && strcmp(pChzOp, ".") == 0)
@@ -6510,23 +6546,46 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 				{
 					// Lookup struct from type on the left (either struct or pointer) and get member type
 
-					STypeId tidOwner = pAstop->pAstLeft->tid;
-					if (tidOwner.pType)
+					STypeId tidStruct = pAstop->pAstLeft->tid;
+					if (tidStruct.pType)
 					{
-						TYPEK typek = tidOwner.pType->typek;
-						if (typek == TYPEK_Pointer)
+						// BB (adrianb) Further null checks?
+						if (tidStruct.pType->typek == TYPEK_Pointer)
 						{
-							tidOwner = PtypeCast<STypePointer>(tidOwner.pType)->tidPointedTo;
+							tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
 						}
 
-						if (typek == TYPEK_Struct || 
-							(typek == TYPEK_TypeOf && 
-								TidUnwrap(pAstop->errinfo, tidOwner).pType->typek == TYPEK_Struct))
+						bool fConstantOnly = false;
+						if (tidStruct.pType->typek == TYPEK_TypeOf)
 						{
-							STypeId tidStruct = (typek == TYPEK_Struct)
-													? tidOwner
-													: TidUnwrap(pAstop->errinfo, tidOwner);
+							tidStruct = TidUnwrap(pAstop->errinfo, tidStruct);
+							fConstantOnly = true;
+						}
 
+						// Resolve string to builtin structure type
+						// BB (adrianb) Do something similar with enums? Arrays or just manually handle those?
+						if (tidStruct.pType->typek == TYPEK_String)
+						{
+							// BB (adrianb) Use top level symbol table directly?
+							auto pResdecl = PresdeclLookupSimple(pTrec->pSymtParent, "_StringStruct", RESLK_Local);
+							if (pResdecl)
+							{
+								if (pResdecl->pDecl->pAstdecl->tid.pType == nullptr)
+								{
+									pTcswitch->pDecl = pResdecl->pDecl;
+									ASSERT(pTcswitch->pDecl);
+									break;
+								}
+								else
+								{
+									// Remove the typeof around the string structure
+									tidStruct = TidUnwrap(pAstop->errinfo, pResdecl->pDecl->pAstdecl->tid);
+								}
+							}
+						}
+
+						if (tidStruct.pType->typek == TYPEK_Struct)
+						{
 							SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidStruct);
 							ASSERT(pSymtStruct);
 
@@ -6552,7 +6611,7 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 							}
 
 							auto pAstdeclResolved = pResdecl->pDecl->pAstdecl;
-							if (typek == TYPEK_TypeOf && !pAstdeclResolved->fIsConstant)
+							if (fConstantOnly && !pAstdeclResolved->fIsConstant)
 							{
 								ShowErr(pAstop->errinfo, 
 										"Can only reference constants when indirecting through struct type");
@@ -7567,6 +7626,7 @@ void EvalRunCode(SWorkspace * pWork, SAst * pAst, void * pVRet);
 void EvalConstant(SWorkspace * pWork, SAst * pAst, void * pVRet)
 {
 	// BB (adrianb) This is a lot of code to support simple expression constants.
+	//  If its not a literal, just replace with implicity wrapping code inside #run?
 
 	ASTK astk = pAst->astk;
 	switch (astk)
@@ -7605,6 +7665,13 @@ void EvalConstant(SWorkspace * pWork, SAst * pAst, void * pVRet)
 				switch (pAst->tid.pType->typek)
 				{
 				case TYPEK_Pointer: *static_cast<const char **>(pVRet) = lit.pChz; return;
+				case TYPEK_String: 
+				{
+					auto pStrimg = static_cast<SStringImage *>(pVRet);
+					pStrimg->pCh = reinterpret_cast<u8 *>(const_cast<char *>(lit.pChz));
+					pStrimg->cCh = strlen(lit.pChz);
+					return;
+				}
 				default: ASSERT(false); return;
 				}
 
@@ -7862,6 +7929,7 @@ enum INSTRK
 
 	INSTRK_Alloca,		// Pointer to stack space
 	INSTRK_LoadConst,	// Load from constant information
+	INSTRK_LoadConstComplex,	// Load complex constant from constant information
 	INSTRK_Load,		// Loads data from a pointer into register
 	INSTRK_Store,		// Stores register data into pointer (no output)
 
@@ -7911,6 +7979,7 @@ static const char * s_mpInstrkPchz[] =
 
 	"Alloca",
 	"LoadConst",
+	"LoadConstComplex",
 	"Load",
 	"Store",
 
@@ -8028,6 +8097,7 @@ struct SInstruction
 		SBranchCondData * pBranchcond;
 		SCallData * pCall;
 		SPhiData * pPhi;
+		void * pVComplexLoad;
 
 		struct
 		{
@@ -8257,6 +8327,30 @@ REG RegBuildArrayGEP(SGenerateCtx * pGenx, REG regAddrPrev, REG regIndex, SAst *
 	return pInst->regOut;
 }
 
+REG RegEnsureStructPointer(SGenerateCtx * pGenx, REG regAddr, SAst * pAstErr, const STypeStruct ** ppTypestruct)
+{
+	auto pRegt = Pregt(pGenx, regAddr);
+	auto pTypepointer = PtypeCast<STypePointer>(pRegt->tid.pType);
+
+	if (pTypepointer->tidPointedTo.pType->typek == TYPEK_Pointer)
+	{
+		pTypepointer = PtypeCast<STypePointer>(pTypepointer->tidPointedTo.pType);
+		regAddr = RegBuildUnary(pGenx, INSTRK_Load, pTypepointer->tidPointedTo, regAddr, pAstErr);
+	}
+
+	if (pTypepointer->tidPointedTo.pType->typek == TYPEK_String)
+	{
+		ASSERT(pGenx->pWork->pTypestructString);
+		*ppTypestruct = pGenx->pWork->pTypestructString;
+	}
+	else
+	{
+		*ppTypestruct = PtypeCast<STypeStruct>(pTypepointer->tidPointedTo.pType);
+	}
+
+	return regAddr;
+}
+
 REG RegGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst);
 
 REG RegGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
@@ -8283,12 +8377,9 @@ REG RegGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 				if (strcmp(pAstop->pChzOp, ".") == 0)
 				{
 					REG regAddrPrev;
-
-					STypeId tidStruct = pAstLeft->tid;
-					if (tidStruct.pType->typek == TYPEK_Pointer)
+					if (pAstLeft->tid.pType->typek == TYPEK_Pointer)
 					{
 						regAddrPrev = RegGenerateRecursive(pGenx, pAstLeft);
-						tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
 					}
 					else
 					{
@@ -8296,7 +8387,6 @@ REG RegGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 					}
 
 					auto pResdecl = PresdeclResolved(pWork, pAstRight);
-					STypeId tidPrev = tidStruct;
 
 					for (int ipDecl = 0; ipDecl <= pResdecl->arypDeclUsingPath.c; ++ipDecl)
 					{
@@ -8304,17 +8394,11 @@ REG RegGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 										pResdecl->pDecl : 
 										pResdecl->arypDeclUsingPath[ipDecl];
 
-						STypeId tidStruct = tidPrev;
-						if (tidStruct.pType->typek == TYPEK_Pointer)
-						{
-							regAddrPrev = RegBuildUnary(pGenx, INSTRK_Load, tidStruct, regAddrPrev, pAst);
-							tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
-						}
-
-						tidPrev = pDecl->pAstdecl->tid;
+						const STypeStruct * pTypestruct = nullptr;
+						regAddrPrev = RegEnsureStructPointer(pGenx, regAddrPrev, pAst, &pTypestruct);
 
 						regAddrPrev = RegBuildStructGEP(pGenx, regAddrPrev, pAstop->errinfo, pDecl->pChzName,
-														PtypeCast<STypeStruct>(tidStruct.pType), pAst);
+														pTypestruct, pAst);
 					}
 
 					return regAddrPrev;
@@ -8337,7 +8421,6 @@ REG RegGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 				auto pStorage0 = PstorageLookup(pWork, pAstdecl0);
 				
 				auto regAddrPrev = pStorage0->regStackPtr;
-				auto pAstdeclPrev = pAstdecl0;
 
 				for (int ipDecl = 1; ipDecl <= pResdecl->arypDeclUsingPath.c; ++ipDecl)
 				{
@@ -8345,15 +8428,11 @@ REG RegGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 									pResdecl->pDecl : 
 									pResdecl->arypDeclUsingPath[ipDecl];
 
-					STypeId tidStruct = pAstdeclPrev->tid;
-					if (tidStruct.pType->typek == TYPEK_Pointer)
-					{
-						regAddrPrev = RegBuildUnary(pGenx, INSTRK_Load, tidStruct, regAddrPrev, pAst);
-						tidStruct = PtypeCast<STypePointer>(tidStruct.pType)->tidPointedTo;
-					}
+					const STypeStruct * pTypestruct = nullptr;
+					regAddrPrev = RegEnsureStructPointer(pGenx, regAddrPrev, pAst, &pTypestruct);
 
 					regAddrPrev = RegBuildStructGEP(pGenx, regAddrPrev, pAst->errinfo, pDecl->pAstdecl->pChzName,
-													PtypeCast<STypeStruct>(tidStruct.pType), pAst);
+													pTypestruct, pAst);
 				}
 
 				return regAddrPrev;
@@ -8501,11 +8580,22 @@ REG RegGenerateBinaryAssignOperator(SGenerateCtx * pGenx, const SGenerateBinaryO
 
 REG RegLoadConst(SGenerateCtx * pGenx, SAst * pAst)
 {
+	auto typek = pAst->tid.pType->typek;
+	if (typek == TYPEK_String)
+	{
+		void * pVValue = PvAlloc(&pGenx->pWork->pagealloc, CbSizeOf(pAst->tid), CbAlignOf(pAst->tid));
+		EvalConstant(pGenx->pWork, pAst, pVValue);
+
+		auto pInst = PinstAdd(pGenx, INSTRK_LoadConstComplex, pAst->tid, pAst);
+		pInst->pVComplexLoad = pVValue;
+		return pInst->regOut;
+	}
+
 	void * pVValue = alloca(CbSizeOf(pAst->tid));
 	EvalConstant(pGenx->pWork, pAst, pVValue);
 
 	auto pInst = PinstAdd(pGenx, INSTRK_LoadConst, pAst->tid, pAst);
-	switch (pAst->tid.pType->typek)
+	switch (typek)
 	{
 	case TYPEK_Bool: pInst->cnst.n = *static_cast<bool *>(pVValue); break;
 	case TYPEK_S8: pInst->cnst.n = *static_cast<s8 *>(pVValue); break;
@@ -8943,7 +9033,6 @@ REG RegGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 				}
 				else if (strcmp(pChzOp, "*") == 0)
 				{
-					ASSERT(FIsInt(typekRight));
 					return RegGetLoadStoreAddress(pGenx, pAstRight);
 				}
 				else if (strcmp(pChzOp, "<<") == 0)
@@ -9571,10 +9660,8 @@ LLVMOpaqueType * PltypeGenerate(SIrContext * pIrx, STypeId tid)
 	case TYPEK_U64: return LLVMInt64TypeInContext(pLctx);
 	case TYPEK_Float: return LLVMFloatTypeInContext(pLctx);
 	case TYPEK_Double: return LLVMDoubleTypeInContext(pLctx);
+	case TYPEK_String: return PltypeGenerate(pIrx, STypeId{pWork->pTypestructString});
 
-#if 0
-	TYPEK_String,
-#endif
 	case TYPEK_Pointer: 
 		{
 			auto pTypeptr = PtypeCast<STypePointer>(pType);
@@ -9680,7 +9767,7 @@ void EvalDefaultValue(SWorkspace * pWork, STypeId tid, u8 * pBRet)
 	case TYPEK_U64:
 	case TYPEK_Float:
 	case TYPEK_Double:
-	//case TYPEK_String:
+	case TYPEK_String:
 	case TYPEK_Pointer:
 		memset(pBRet, 0, CbSizeOf(tid));
 		break;
@@ -9797,11 +9884,24 @@ LLVMOpaqueValue * PlvalConst(SIrContext * pIrx, STypeId tid, u8 * pB)
 	}
 }
 
+const char * PchzBuild(SWorkspace * pWork)
+{
+	for (const auto & module : pWork->aryModule)
+	{
+		if (module.fBuiltIn)
+			continue;
+		return module.pChzFile;
+	}
+
+	ASSERT(false);
+	return "<Unknown>";
+}
+
 void BuildIr(SWorkspace * pWork)
 {
 	pWork->pLctx = LLVMContextCreate();
 	
-	auto pLmod = LLVMModuleCreateWithNameInContext(pWork->aryModule[0].pChzFile, pWork->pLctx);
+	auto pLmod = LLVMModuleCreateWithNameInContext(PchzBuild(pWork), pWork->pLctx);
 	pWork->pLmod = pLmod;
 
 	// BB (adrianb) How do I get this string from arbitrary platform? Also C generates a target data layout.
@@ -10026,6 +10126,41 @@ void BuildIr(SWorkspace * pWork)
 					}
 					break;
 
+				case INSTRK_LoadConstComplex:
+					{
+						auto tid0 = Pregt(&irx, pInst->regOut)->tid;
+						switch (tid0.pType->typek)
+						{
+						case TYPEK_String:
+							{
+								auto pStrimg = static_cast<SStringImage *>(pInst->pVComplexLoad);
+								auto pLtypeS64 = PltypeGenerate(&irx, TidEnsure(pWork, {TYPEK_S64}));
+								auto pCh = reinterpret_cast<const char *>(pStrimg->pCh);
+								auto pLvalConstACh = LLVMConstStringInContext(pWork->pLctx, pCh, pStrimg->cCh, false);
+								auto pLvalGlobalACh = LLVMAddGlobal(pLmod, LLVMTypeOf(pLvalConstACh), ".str");
+								LLVMSetInitializer(pLvalGlobalACh, pLvalConstACh);
+
+								auto pLvalZero = LLVMConstInt(LLVMInt32TypeInContext(pWork->pLctx), 0, false);
+								LLVMOpaqueValue * apLvalZero[] = { pLvalZero, pLvalZero };
+
+								LLVMOpaqueValue * apLval[] =
+								{
+									LLVMBuildInBoundsGEP(pLbuilder, pLvalGlobalACh, apLvalZero, DIM(apLvalZero), ""),
+									LLVMConstInt(pLtypeS64, pStrimg->cCh, false),
+								};
+
+								auto pLtypeString = PltypeGenerate(&irx, TidEnsure(pWork, {TYPEK_String}));
+								SetVal(&irx, pInst->regOut, LLVMConstNamedStruct(pLtypeString, apLval, DIM(apLval)));
+							}
+							break;
+
+						default:
+							ASSERTCHZ(false, "Can't load complex const of type %s", StrPrintType(tid0).Pchz());
+							break;
+						}
+					}
+					break;
+
 				case INSTRK_Load:
 					{
 						auto pLval0 = Plval(&irx, pInst->unary.reg0);
@@ -10038,6 +10173,7 @@ void BuildIr(SWorkspace * pWork)
 						auto pLvalAddr = Plval(&irx, pInst->binary.reg0);
 						auto pLvalValue = Plval(&irx, pInst->binary.reg1);
 						ASSERT(pInst->regOut == REG_Invalid);
+
 						LLVMBuildStore(pLbuilder, pLvalValue, pLvalAddr);
 					}
 					break;
@@ -10374,7 +10510,7 @@ void BuildIr(SWorkspace * pWork)
 					{
 						auto pLvalArray = Plval(&irx, pInst->binary.reg0);
 						LLVMOpaqueValue * apLvalIndex[2] = {};
-						apLvalIndex[0] = LLVMConstInt(LLVMInt32Type(), 0, false);
+						apLvalIndex[0] = LLVMConstInt(LLVMInt32TypeInContext(pWork->pLctx), 0, false);
 						apLvalIndex[1] = Plval(&irx, pInst->binary.reg1);
 
 						SetVal(&irx, pInst->regOut, LLVMBuildGEP(pLbuilder, pLvalArray, apLvalIndex, DIM(apLvalIndex), 
@@ -10431,7 +10567,7 @@ void BuildIr(SWorkspace * pWork)
 		char * pChzError = nullptr;
 		if (LLVMVerifyModule(pLmod, LLVMReturnStatusAction, &pChzError))
 		{
-			SStringBuilder strbLl = SStringBuilder("%s", PchzBaseName(pWork->aryModule[0].pChzFile));
+			SStringBuilder strbLl = SStringBuilder("%s", PchzBaseName(PchzBuild(pWork)));
 			PatchExt(&strbLl, ".ll");
 			char * pChzErrWrite = nullptr;
 			LLVMPrintModuleToFile(pWork->pLmod, strbLl.aChz, &pChzErrWrite);
@@ -10449,12 +10585,13 @@ void PrintToString(SStringBuilder * pStrb, const char * pChzFmt, va_list vargs)
 
 void CompileAndCheckDeclaration(
 	const char * pChzTestName, const char * pChzDecl, 
-	const char * pChzCode, const char * pChzAst, const char * pChzType)
+	const char * pChzCode, const char * pChzAst, const char * pChzType,
+	GRFWINIT grfwinit = GRFWINIT_None)
 {
 	// BB (adrianb) Allow getting errors so we can unit test error checking?
 
 	SWorkspace work = {};
-	InitWorkspace(&work);
+	InitWorkspace(&work, grfwinit);
 
 	SModule * pModule = PtAppendNew(&work.aryModule);
 	pModule->pChzFile = PchzCopy(&work, pChzTestName, strlen(pChzTestName));
@@ -10583,6 +10720,11 @@ void RunUnitTests()
 		"(DeclareSingle (Proc (* u8) -> s32) infer-type (Procedure (Proc (* u8) -> s32)"
 		" (args (DeclareSingle (* u8) (TypePointer (Type (* u8)) (Type u8))) (DeclareSingle .. (Type ..))) (returns (Type s32))))");
 
+	CompileAndCheckDeclaration("global-string", "str",
+		"str := \"hello string\";",
+		"(DeclareSingle var str infer-type \"hello string\")",
+		"(DeclareSingle string infer-type StringLit)");
+
 	// Add support:
 	// - Value result JIT
 
@@ -10651,7 +10793,7 @@ int main(int cpChzArg, const char * apChzArg[])
 	const char * pChzFile = apChzArg[ipChz];
 
 	SWorkspace work = {};
-	InitWorkspace(&work);
+	InitWorkspace(&work, FWINIT_IncludeBuiltinModule);
 	AddModuleFile(&work, pChzFile);
 	ParseAll(&work);
 	TypeCheckAll(&work);
@@ -10667,7 +10809,7 @@ int main(int cpChzArg, const char * apChzArg[])
 		// BB (adrianb) Less verbose way of building these using dtors? Also avoid stack craziness?
 		//  E.g. string builder class that can destruct itself?
 
-		SStringBuilder strbBc = SStringBuilder("%s", PchzBaseName(work.aryModule[0].pChzFile)); //"output/";
+		SStringBuilder strbBc = SStringBuilder("%s", PchzBaseName(PchzBuild(&work))); //"output/";
 		PatchExt(&strbBc, ".bc");
 
 		ASSERT(work.pLmod);
@@ -10749,7 +10891,7 @@ int main(int cpChzArg, const char * apChzArg[])
 	{
 		// BB (adrianb) Full path management. Write to output directory?
 
-		SStringBuilder strbLl = SStringBuilder("%s", PchzBaseName(work.aryModule[0].pChzFile));
+		SStringBuilder strbLl = SStringBuilder("%s", PchzBaseName(PchzBuild(&work)));
 		PatchExt(&strbLl, ".ll");
 
 		char * pChzError;
@@ -10825,27 +10967,27 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
-	- Fix operator precedence. Reimplement as an enum (using characters for base?).
-	- Add string, array, dynamic array.
+	- Add array, dynamic array.
 	- Add array literal syntax.
 	- Add enums.
+	- Add unsized integer type (treated as 64 bit, 65?). So that 1 << 8 can morph into something else if need be.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
-	- #run. Use LLVM JIT, MCJIT is the only option until I can get 3.7.1 working. 
-		- How are side effects to globals persisted? Eg. init_crc64. After every #run copy out all globals? 
-		Can we wait until ALL #runs have been run and then copy out globals? What if they point to allocated memory
-		or something?
+	- #run. Using byte code evaluator and global memory locations.
 	- Named parameters? Default values?
-	- Dll loading. 
+	- Dll loading.
 		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
 	- Example program to test? OpenGL game?
-	- Flesh out operators - logical operators, bitwise operators
+	- Flesh out operators - bitwise operators
 	- using with procedures.
-	- Any/typeinfo.
-	- overloading.
-	- Polymorphic procedures with modify proc.
+	- Any/typeinfo. printf replacement
 	- SOA support.
 	- Inlining.  Does this happen at AST level?
-	- printf replacement
+	- overloading.
+	- Polymorphic procedures. With modify proc.
+	- #bake, #bake_values with procedures? 
+	- Polymorphic structs. With modify? 
+	- Mixins ala D, with static if.
+	- Closures?
 	- implicit context
 	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN
 	- Annotations?

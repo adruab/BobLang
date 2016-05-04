@@ -1,4 +1,4 @@
-; ModuleID = 'builtin-code'
+; ModuleID = 'test.jtoy'
 target triple = "x86_64-apple-macosx10.11.0"
 
 %Vector2 = type { float, float }
@@ -19,7 +19,7 @@ target triple = "x86_64-apple-macosx10.11.0"
 @9 = private unnamed_addr constant [10 x i8] c"\22i\22 = %d\0A\00"
 @10 = private unnamed_addr constant [23 x i8] c"factorial(%ld) == %ld\0A\00"
 @.str = global [6 x i8] c"hello\00"
-@11 = private unnamed_addr constant [30 x i8] c"string has %d characters %.*s\00"
+@11 = private unnamed_addr constant [31 x i8] c"string has %d characters %.*s\0A\00"
 @12 = private unnamed_addr constant [21 x i8] c"Leaving and pB = %d\0A\00"
 @13 = private unnamed_addr constant [20 x i8] c"Made it past early\0A\00"
 @14 = private unnamed_addr constant [21 x i8] c"Leaving and pB = %d\0A\00"
@@ -313,7 +313,7 @@ ifexit:                                           ; preds = %ifpass, %anddone
   %196 = load i64* %195
   %197 = getelementptr inbounds %_StringStruct* %str, i32 0, i32 0
   %198 = load i8** %197
-  %199 = call i32 (i8*, ...)* @printf(i8* getelementptr inbounds ([30 x i8]* @11, i32 0, i32 0), i64 %194, i64 %196, i8* %198)
+  %199 = call i32 (i8*, ...)* @printf(i8* getelementptr inbounds ([31 x i8]* @11, i32 0, i32 0), i64 %194, i64 %196, i8* %198)
   store i1 true, i1* %fEarly
   %200 = load i1* %fEarly
   br i1 %200, label %ifpass1, label %ifexit2

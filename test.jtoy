@@ -37,15 +37,61 @@ printf :: (format : * char, ..) -> int #foreign;
 
 Factorial :: (n : s64) -> s64 { if n == 0 return 1; return n * Factorial(n-1); }
 
+FInString :: (ch : char, str : string) -> bool
+{
+    iCh : u32 = 0;
+    while (iCh < str.cCh)
+    {
+        if (str.pCh[iCh] == ch)
+            return true;
+        ++iCh;
+    }
+    return false;
+}
+
+StrTokenize :: (str: * string, strDelim: string) -> string
+{
+    iCh : u32 = 0;
+    while (iCh < str.cCh)
+    {
+        if (!FInString(str.pCh[iCh], strDelim))
+            break;
+        ++iCh;
+    }
+    
+    iChMic := iCh;
+
+    while (iCh < str.cCh)
+    {
+        if (FInString(str.pCh[iCh], strDelim))
+            break;
+        ++iCh;
+    }
+
+    // BB (adrianb) Provide string/array slicing syntax?
+
+    strToken : string;
+    strToken.pCh = str.pCh + iChMic;
+    strToken.cCh = iCh - iChMic;
+
+    str.pCh += iCh;
+    str.cCh -= iCh;
+
+    return strToken;
+}
+
 main :: ()
 {
+    n : s32 = 5;
     i := 0; // BB (adrianb) What's the right type for this? s64?
     c := CLoop();
     a :: 2;
     b := 900;
 
-    aVec : [2] Vector2;
+    aVecF : [2] Vector2;
     aSprite : [2] Sprite;
+
+    aVec : [] Vector2 = aVecF;
 
     aSprite[1].x = 5.5;
     aSprite[1].y = 10.5;
@@ -64,11 +110,20 @@ main :: ()
     << pB = 400;
 
     vec2 : Vector2;
-    vec2.x = 50;
-    vec2.y = 313;
+    vec2p := *vec2;
+    vec2p.x = 50;
+    vec2p.y = 313;
 
     printf("vec = (%f, %f) dim %d\n", vec.x, vec.y, vec.dim);
     printf("vec2 = (%f, %f)\n", vec2.x, vec2.y);
+    printf("aVec[%d] = [", aVec.c);
+    while i < aVec.c
+    {
+        printf(" (%f, %f),", aVec[i].x, aVec[i].y);
+        ++i;
+    }
+    printf("]\n");
+    printf("aVecF[%p, %d] = [(%f, %f), (%f, %f)]\n", aVecF.a, aVecF.c, aVecF[0].x, aVec[0].y, aVec[1].x, aVec[1].y);
     printf("aVec = [(%f, %f), (%f, %f)]\n", aVec[0].x, aVec[0].y, aVec[1].x, aVec[1].y);
     printf("aSprite = [([(%f, %f), (%f, %f)], (%f, %f), %f, %lld), ([(%f, %f), (%f, %f)], (%f, %f), %f, %lld)]\n", 
            aSprite[0].aVec[0].x, aSprite[0].aVec[0].y, aSprite[0].aVec[1].x, aSprite[0].aVec[1].y, aSprite[0].x, 
@@ -89,6 +144,7 @@ main :: ()
 
     // BB (adrianb) Should error on i < c because types don't match...?
 
+    i = 0;
     while i < c
     {
         printf("\"i\" = %d\n", a + << pB + -i);
@@ -96,6 +152,38 @@ main :: ()
     }
 
     printf("factorial(%ld) == %ld\n", CLoop(), Factorial(CLoop()));
+
+    //printf("Run gives %d\n", s_nFactorialResult);
+    //s_nFactorialArg :: 5;
+    //s_nFactorialResult :: #run Factorial(s_nFactorialArg);
+
+    //printf("Run gives %d\n", s_nFactorialResult);
+    //s_nFactorialArg :: 5;
+    //s_factWrap :: () -> s64 { return #run Factorial(s_nFactorialArg); }
+    //s_nFactorialResult :: #run s_factWrap();
+
+    p1 : *int = null;
+    p2 := p1 + 1;
+    p3 := p1 + 1;
+    if ((p2 != null) && ((p1 != null) || (p3 == null)))
+    {
+        << p1 = 3;
+    }
+
+    str := "hello";
+    printf("string has %d characters %.*s\n", str.cCh, str.cCh, str.pCh);
+
+    strSet := "the quick  brown .  fox \t jumps.over\n the lazy dog";
+    
+    printf("Tokenize \"%.*s\"\n", strSet.cCh, strSet.pCh);
+    while (true)
+    { 
+        strTok := StrTokenize(*strSet, " \t\r\n.");
+        if strTok.cCh == 0
+            break;
+        printf(" \"%.*s\"", strTok.cCh, strTok.pCh);
+    }
+    printf("\n\n");
 
     fEarly := true; //false;
     if (fEarly)

@@ -11,6 +11,10 @@
 					"cmd":
 					[
 						"./build/jtoy",
+						"--run-unit-tests",
+						"--print-syntax",
+						"--print-types",
+						"--write-bitcode",
 						"test.jtoy"
 					],
 					"file_regex": "^\\.\\./([^:]*):(\\d*)",
@@ -26,6 +30,9 @@
 		},
 		{
 			"path": "/usr/local/Cellar/libffi/3.0.13/lib/libffi-3.0.13"
+		},
+		{
+			"path": "/Users/adrianbentley/Documents/Projects/llvm-3.7.1/llvm/include"
 		}
 	]
 }

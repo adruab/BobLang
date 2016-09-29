@@ -5529,6 +5529,7 @@ void Destroy(SWorkspace * pWork)
 	Destroy(&pWork->aryModule);
 
 	Destroy(&pWork->hashPastPresdeclResolved);
+	Destroy(&pWork->arypTypestruct);
 
 	Destroy(&pWork->setpChz);
 	Destroy(&pWork->aryTokNext);
@@ -8198,8 +8199,8 @@ void EvalCode(SEvalCtx * pEval, SAst * pAst, void * pVRet)
 				double g;
 				switch (typekSrc)
 				{
-				case TYPEK_Float: g = *static_cast<float *>(pVRet); return;
-				case TYPEK_Double: g = *static_cast<double *>(pVRet); return;
+				case TYPEK_Float: g = *static_cast<float *>(pVExpr); break;
+				case TYPEK_Double: g = *static_cast<double *>(pVExpr); break;
 				default: ASSERT(false); g = 0; break;
 				}
 
@@ -9936,6 +9937,7 @@ void GenerateAll(SGenerateCtx * pGenx)
 			LLVMPrintModuleToFile(pGenx->pLmod, strbLl.aChz, &pChzErrWrite);
 			ShowErrRaw("Found error in module %s:\n%s", strbLl.aChz, pChzError);
 		}
+		LLVMDisposeMessage(pChzError);
 	}
 }
 
@@ -10088,8 +10090,7 @@ void RunUnitTests()
 	CompileAndCheckDeclaration("global-string", "str",
 		"str := \"hello string\";",
 		"(DeclareSingle var str infer-type \"hello string\")",
-		"(DeclareSingle string infer-type StringLit)",
-		FWINIT_IncludeBuiltinModule);
+		"(DeclareSingle string infer-type StringLit)");
 
 	// Add support:
 	// - Value result JIT
@@ -10105,8 +10106,8 @@ void RunUnitTests()
 
 int main(int cpChzArg, const char * apChzArg[])
 {
-	static char s_aChzStdoutBuf[BUFSIZ];
-	setbuf(stdout, s_aChzStdoutBuf);
+	static char s_aChzStdoutBuf[BUFSIZ] = {};
+	setvbuf(stdout, s_aChzStdoutBuf, _IOFBF, DIM(s_aChzStdoutBuf));
 
 #if 0
 	TestDefer();
@@ -10218,7 +10219,7 @@ int main(int cpChzArg, const char * apChzArg[])
 						break;
 
 					int cCh = fread(aChzOut, 1, DIM(aChzOut), pFileCmdOut);
-					printf("%*s", cCh, aChzOut);
+					printf("%.*s", cCh, aChzOut);
 				}
 
 				auto pcloseresult = pclose(pFileCmdOut);

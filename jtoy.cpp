@@ -25,6 +25,7 @@
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <execinfo.h>
 
 #if 0
 #include <ffi.h>
@@ -67,6 +68,26 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
+#define ClearStruct(p) memset(p, 0, sizeof(*p))
+#define DIM(a) (int(sizeof(a)/sizeof(a[0])))
+
+#define JOIN2(a,b) a##b
+#define JOIN(a,b) JOIN2(a,b)
+
+
+
+void PrintBacktrace(int cIgnore)
+{
+	void * apV[32] = {};
+	int cpV = backtrace(apV, DIM(apV));
+	char ** apChz = backtrace_symbols(apV, cpV);
+	for (int i = cIgnore + 1; i < cpV; ++i) 
+	{
+		fprintf(stderr, "  %s\n", apChz[i]);
+	}
+	free(apChz);
+}
+
 #if WIN32
 #define BREAK_ALWAYS() __debugbreak()
 #define PUSH_MSVC_WARNING_DISABLE(n) \
@@ -87,6 +108,7 @@ typedef int64_t s64;
 			fprintf(stderr, "%s:%d assert failed: ", __FILE__, __LINE__); \
 			fprintf(stderr, __VA_ARGS__); \
 			fprintf(stderr, "\n"); \
+			PrintBacktrace(0); \
 			fflush(stderr); \
 			BREAK_ALWAYS(); \
 		} \
@@ -96,12 +118,6 @@ typedef int64_t s64;
 
 #define VERIFY(f) ASSERT(f)    
 #define CASSERT(f) static_assert(f, #f " failed")
-
-#define ClearStruct(p) memset(p, 0, sizeof(*p))
-#define DIM(a) (int(sizeof(a)/sizeof(a[0])))
-
-#define JOIN2(a,b) a##b
-#define JOIN(a,b) JOIN2(a,b)
 
 template <typename T>
 T min (T a, T b)
@@ -196,8 +212,6 @@ void TestDefer()
 	n = 10;
 }
 #endif
-
-
 
 void ShowErrVa(const char * pChzFormat, va_list va)
 {
@@ -2149,7 +2163,7 @@ struct SAst
 template <typename T>
 T * PastCast(SAst * pAst)
 {
-	ASSERT(pAst->astk == T::s_astk);
+	ASSERTCHZ(pAst->astk == T::s_astk, "Expected ast of type %s", PchzFromAstk(T::s_astk));
 	return static_cast<T *>(pAst);
 }
 
@@ -5174,46 +5188,70 @@ struct STypeCheckSwitch // tag = tcswitch
 	SDeclaration * pDecl;
 };
 
-enum RESLK
+enum FRESL
 {
-	RESLK_Local,
-	RESLK_WithUsing
+	FRESL_IgnoreProcedures = 0x01,
 };
 
-SResolveDecl * PresdeclLookupSimple(SSymbolTable * pSymt, const char * pChzName, RESLK reslk)
+typedef u32 GRFRESL;
+
+SResolveDecl * PresdeclLookup(SSymbolTable * pSymt, const char * pChzName, GRFRESL grfresl, const SErrorInfo & errinfo)
 {
+	// BB (adrianb) Need to distinguish between looking up one level only and looking up globally?	
+
+	SResolveDecl * pResdeclFound = nullptr;
 	for (auto pResdecl : pSymt->arypResdecl)
 	{
 		if (strcmp(pResdecl->pDecl->pChzName, pChzName) == 0)
-			return pResdecl;
+		{
+			if (grfresl & FRESL_IgnoreProcedures)
+			{
+				auto pAstdecl = pResdecl->pDecl->pAstdecl;
+				if (pAstdecl->pAstValue && pAstdecl->pAstValue->astk == ASTK_Procedure)
+					continue;
+			}
+
+			if (pResdeclFound)
+			{
+				// BB (adrianb) Print all candidates?
+				ShowErr(errinfo, "Ambiguous symbol lookup");
+			}
+
+			pResdeclFound = pResdecl;
+		}
 	}
+
+	if (pResdeclFound)
+		return pResdeclFound;
 
 	// BB (adrianb) Add or strip using rights when lookup up in parent scopes? For some scopes this might be fine.
 	//  Others maybe not.
 
 	if (pSymt->pSymtParent)
-		return PresdeclLookupSimple(pSymt->pSymtParent, pChzName, reslk);
+		return PresdeclLookup(pSymt->pSymtParent, pChzName, grfresl, errinfo);
 
 	return nullptr;
 }
 
-void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, SAstDeclareSingle * pAstdecl,
-					SDeclaration ** ppDeclRet = nullptr, const SArray<SDeclaration *> & arypDeclUsingPath = {})
+void AddResolveDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, SDeclaration * pDecl,
+							const SArray<SDeclaration *> & arypDeclUsingPath)
 {
-	// BB (adrianb) Check that we aren't doing this during type checking? Or if we do it's a using decl?
-	// BB (adrianb) Need to deal with overloading somehow.
+	auto pAstdecl = pDecl->pAstdecl;
+	ASSERT(pAstdecl);
+	auto pChzName = pAstdecl->pChzName;
 
-	if (PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing))
+	// BB (adrianb) Better error for multiple declarations, including using path.
+
+	GRFRESL grfresl = 0;
+	if (pAstdecl->pAstValue && pAstdecl->pAstValue->astk == ASTK_Procedure)
 	{
-		ShowErr((pAstdecl) ? pAstdecl->errinfo : SErrorInfo(), "Duplicate symbol found");
+		grfresl = FRESL_IgnoreProcedures;
 	}
 
-	auto pDecl = PtAlloc<SDeclaration>(&pWork->pagealloc);
-	pDecl->pChzName = pChzName;
-	pDecl->pAstdecl = pAstdecl;
-
-	if (ppDeclRet)
-		*ppDeclRet = pDecl;
+	if (PresdeclLookup(pSymt, pChzName, grfresl, {}))
+	{
+		ShowErr(pAstdecl->errinfo, "Duplicate symbol found");
+	}
 	
 	auto pResdecl = PtAlloc<SResolveDecl>(&pWork->pagealloc);
 	pResdecl->pDecl = pDecl;
@@ -5222,16 +5260,33 @@ void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzN
 	Append(&pSymt->arypResdecl, pResdecl);
 }
 
+void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, SAstDeclareSingle * pAstdecl,
+					SDeclaration ** ppDeclRet = nullptr, const SArray<SDeclaration *> & arypDeclUsingPath = {})
+{
+	ASSERT(pAstdecl);
+
+	auto pDecl = PtAlloc<SDeclaration>(&pWork->pagealloc);
+	pDecl->pChzName = pChzName;
+	pDecl->pAstdecl = pAstdecl;
+
+	if (ppDeclRet)
+		*ppDeclRet = pDecl;
+
+	AddResolveDeclaration(pWork, pSymt, pDecl, arypDeclUsingPath);
+}
+
 SSymbolTable * PsymtStructLookup(SWorkspace * pWork, STypeId tid);
 
 bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch * pTcswitch)
 {
+	// Finish importing using declarations before finishing this resolve, first parent then us
+
 	if (pSymt->pSymtParent)
 	{
 		if (!FTryResolveUsing(pWork, pSymt->pSymtParent, pTcswitch))
 			return false;
 	}
-		
+
 	for (; pSymt->ipResdeclUsing < pSymt->arypResdecl.c; ++pSymt->ipResdeclUsing)
 	{
 		auto pResdecl = pSymt->arypResdecl[pSymt->ipResdeclUsing];
@@ -5277,20 +5332,7 @@ bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch
 
 				apDeclUsing[cpDeclUsing - 1] = pResdecl->pDecl;
 
-				const char * pChzName = pResdeclUse->pDecl->pAstdecl->pChzName;
-				if (PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing))
-				{
-					// BB (adrianb) Need better error reporting info for both conflicting symbol paths?
-
-					auto pAstdeclRoot = apDeclUsing[0]->pAstdecl;
-					ShowErr(pAstdeclRoot->errinfo, "Duplicate symbol %s imported through using declaration", pChzName);
-				}
-
-				auto pResdeclUsing = PtAlloc<SResolveDecl>(&pWork->pagealloc);
-				pResdeclUsing->pDecl = pResdeclUse->pDecl;
-				pResdeclUsing->arypDeclUsingPath = { apDeclUsing, cpDeclUsing };
-				
-				Append(&pSymt->arypResdecl, pResdeclUsing);
+				AddResolveDeclaration(pWork, pSymt, pResdeclUse->pDecl, { apDeclUsing, cpDeclUsing });
 			}
 		}
 		else
@@ -5303,13 +5345,16 @@ bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch
 }
 
 bool FTryResolveSymbolWithUsing(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, 
-								STypeCheckSwitch * pTcswitch, SResolveDecl ** ppResdecl)
+								const SErrorInfo & errinfo, STypeCheckSwitch * pTcswitch, 
+								SResolveDecl ** ppResdecl)
 {
 	// Resolve using declarations all the way up the chain
 	if (!FTryResolveUsing(pWork, pSymt, pTcswitch))
 		return false;
 
-	auto pResdecl = PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing);
+	// BB (adrianb) Error on ambiguous symbol.
+
+	auto pResdecl = PresdeclLookup(pSymt, pChzName, 0, errinfo);
 	if (pResdecl && pResdecl->pDecl->pAstdecl->tid.pType == nullptr)
 	{
 		pTcswitch->pDecl = pResdecl->pDecl;
@@ -5317,6 +5362,112 @@ bool FTryResolveSymbolWithUsing(SWorkspace * pWork, SSymbolTable * pSymt, const 
 	}
 
 	*ppResdecl = pResdecl;
+	return true;
+}
+
+bool FCanCoerce(SAst * pAst, const STypeId & tidTo);
+
+bool FTryResolveOverloadWithUsing(SWorkspace * pWork, SSymbolTable * pSymtStart, SAstCall * pAstcall, 
+									STypeCheckSwitch * pTcswitch, SResolveDecl ** ppResdecl)
+{
+	auto pAstident = PastCast<SAstIdentifier>(pAstcall->pAstFunc);
+	const char * pChzName = pAstident->pChz;
+
+	// Resolve using declarations all the way up the chain
+
+	if (!FTryResolveUsing(pWork, pSymtStart, pTcswitch))
+		return false;
+
+	enum MATCHK
+	{
+		MATCHK_None = 0,
+		MATCHK_Implicit,
+		MATCHK_Exact,
+		MATCHK_Variable,
+	};
+
+	SResolveDecl * pResdeclBest = nullptr;
+	auto matchkBest = MATCHK_None;
+	for (auto pSymtCur = pSymtStart; pSymtCur; pSymtCur = pSymtCur->pSymtParent)
+	{
+		for (auto pResdecl : pSymtCur->arypResdecl)
+		{
+			if (strcmp(pResdecl->pDecl->pChzName, pChzName) != 0)
+				continue;
+
+			// BB (adrianb) If we have templates we'll have to construct resdecl and decl so we can finish type check.
+
+			auto pAstdecl = pResdecl->pDecl->pAstdecl;
+			STypeId tidProc = pAstdecl->tid;
+			if (tidProc.pType == nullptr)
+			{
+				pTcswitch->pDecl = pResdecl->pDecl;
+				return false;
+			}
+
+			if (tidProc.pType->typek != TYPEK_Procedure)
+			{
+				ShowErr(pAstcall->errinfo, "Cannot call non-procedure");
+				break;
+			}
+
+			// See if this is a better match for arguments
+
+			auto matchk = MATCHK_None;
+			if (!pAstdecl->fIsConstant)
+			{
+				// BB (adrianb) Pointer to function.
+				matchk = MATCHK_Variable;
+			}
+			else
+			{
+				auto pTypeproc = PtypeCast<STypeProcedure>(tidProc.pType);
+				if (pTypeproc->cTidArg != pAstcall->arypAstArgs.c)
+				{
+					if (!pTypeproc->fUsesCVararg || pTypeproc->cTidArg > pAstcall->arypAstArgs.c)
+						continue;
+				}
+
+				matchk = MATCHK_Exact;
+				for (int iArg : IterCount(pTypeproc->cTidArg))
+				{
+					auto pAstArg = pAstcall->arypAstArgs[iArg];
+					auto tidExpected = pTypeproc->aTidArg[iArg];
+					if (pAstArg->tid == tidExpected)
+						continue;
+
+					// BB (adrianb) to do this for literals we need to choose those closest.
+					//  This implies a better match function.
+
+					if (!FCanCoerce(pAstArg, tidExpected))
+					{
+						matchk = MATCHK_None;
+					}
+
+					matchk = MATCHK_Implicit;
+				}
+			}
+
+			if (matchk == MATCHK_None || matchk < matchkBest)
+				continue;
+
+			if (matchkBest >= MATCHK_Exact)
+			{
+				ShowErr(pAstident->errinfo, "Can't choose between multiple exact matches for procedure overload");
+			}
+
+			matchkBest = matchk;
+			pResdeclBest = pResdecl;
+		}
+	}
+
+	if (!pResdeclBest)
+	{
+		// BB (adrianb) Write out candidates?
+		ShowErr(pAstcall->errinfo, "Couldn't find matching overload for procedure call");
+	}
+
+	*ppResdecl = pResdeclBest;
 	return true;
 }
 
@@ -5378,16 +5529,22 @@ STypeId TidPointer(SWorkspace * pWork, STypeId tid)
 	return TidEnsure(pWork, &typeptr);
 }
 
+SAstDeclareSingle * PastdeclCreateTyped(SWorkspace * pWork, const char * pChzName, STypeId tid)
+{
+	auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo());
+	pAstdecl->pChzName = pChzName;
+	pAstdecl->tid = tid;
+	// BB (adrianb) No type/value ast? Ok?
+
+	return pAstdecl;
+}
+
 void AddBuiltinType(SWorkspace * pWork, const char * pChzName, const SType & typeIn, STypeId * pTid = nullptr)
 {
 	STypeId tid = TidEnsure(pWork, typeIn);
 	STypeId tidType = TidWrap(pWork, tid);
 
-	auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo());
-	pAstdecl->pChzName = pChzName;
-	pAstdecl->tid = tidType;
-	// BB (adrianb) No type/value ast? Ok?
-
+	auto pAstdecl = PastdeclCreateTyped(pWork, pChzName, tidType);
 	auto pSymt = &pWork->symtBuiltin;
 	AddDeclaration(pWork, pSymt, pChzName, pAstdecl);
 
@@ -5456,16 +5613,10 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 		pTypestructString->cMember = 2;
 		pTypestructString->cMemberMax = 2;
 
-		auto pAstdeclPch = PastCreate<SAstDeclareSingle>(pWork, {});
-		pAstdeclPch->pChzName = "pCh";
-		pAstdeclPch->tid = TidPointer(pWork, pWork->tidU8);
-		
+		auto pAstdeclPch = PastdeclCreateTyped(pWork, "pCh", TidPointer(pWork, pWork->tidU8));
 		AddDeclaration(pWork, pSymtString, "pCh", pAstdeclPch);
 
-		auto pAstdeclCch = PastCreate<SAstDeclareSingle>(pWork, {});
-		pAstdeclCch->pChzName = "cCh";
-		pAstdeclCch->tid = pWork->tidU32; // BB (adrianb) Use u64? More than 4 GiB?
-
+		auto pAstdeclCch = PastdeclCreateTyped(pWork, "cCh", pWork->tidU32); // BB (adrianb) Use u64? More than 4 GiB?
 		AddDeclaration(pWork, pSymtString, "cCh", pAstdeclCch);
 
 		pTypestructString->aMember[0].pAstdecl = pAstdeclPch;
@@ -5806,7 +5957,11 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 	case ASTK_Call:
 		{
 			auto pAstcall = PastCast<SAstCall>(pAst);
-			RecurseTypeCheck(recx, &pAstcall->pAstFunc);
+			
+			// Note, we manually recurse on overloading cases in TypeCheck for call
+			if (pAstcall->pAstFunc->astk != ASTK_Identifier)
+				RecurseTypeCheck(recx, &pAstcall->pAstFunc);
+
 			for (int ipAst : IterCount(pAstcall->arypAstArgs.c))
 				RecurseTypeCheck(recx, &pAstcall->arypAstArgs[ipAst]);
 		}
@@ -6561,9 +6716,9 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 			SResolveDecl * pResdecl;
 			if (pSymt->symtblk >= SYMTBLK_RegisterAllMic)
 			{
-				pResdecl = PresdeclLookupSimple(pSymt, pAstident->pChz, RESLK_Local);
+				pResdecl = PresdeclLookup(pSymt, pAstident->pChz, 0, pAst->errinfo);
 			}
-			else if (!FTryResolveSymbolWithUsing(pWork, pSymt, pAstident->pChz, pTcswitch, &pResdecl))
+			else if (!FTryResolveSymbolWithUsing(pWork, pSymt, pAstident->pChz, pAst->errinfo, pTcswitch, &pResdecl))
 			{
 				// We have switched to resolving another declaration
 				ASSERT(pTcswitch->pDecl);
@@ -6701,26 +6856,7 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 
 						// Resolve string to builtin structure type
 						// BB (adrianb) Do something similar with enums? Arrays or just manually handle those?
-						if (tidStruct.pType->typek == TYPEK_String)
-						{
-							// BB (adrianb) Use top level symbol table directly?
-							auto pResdecl = PresdeclLookupSimple(pTrec->pSymtParent, "_StringStruct", RESLK_Local);
-							if (pResdecl)
-							{
-								if (pResdecl->pDecl->pAstdecl->tid.pType == nullptr)
-								{
-									pTcswitch->pDecl = pResdecl->pDecl;
-									ASSERT(pTcswitch->pDecl);
-									break;
-								}
-								else
-								{
-									// Remove the typeof around the string structure
-									tidStruct = TidUnwrap(pAstop->errinfo, pResdecl->pDecl->pAstdecl->tid);
-								}
-							}
-						}
-
+						
 						auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
 						SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidStruct);
 						ASSERT(pSymtStruct);
@@ -6730,7 +6866,8 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 						if (pSymtStruct)
 						{
 							SResolveDecl * pResdecl;
-							if (!FTryResolveSymbolWithUsing(pWork, pSymtStruct, pAstident->pChz, pTcswitch, &pResdecl))
+							if (!FTryResolveSymbolWithUsing(pWork, pSymtStruct, pAstident->pChz, pAstident->errinfo, 
+															pTcswitch, &pResdecl))
 							{
 								// We have switched to resolving another declaration
 								ASSERT(pTcswitch->pDecl);
@@ -6752,6 +6889,8 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 
 							STypeId tid = pAstdeclResolved->tid;
 							ASSERT(tid.pType != nullptr);
+
+							// BB (adrianb) Why are we not suspending here?
 
 							pAstop->pAstRight->tid = tid;
 							pAstop->tid = tid;
@@ -6911,9 +7050,27 @@ LOperatorDone:
 
 	case ASTK_Call:
 		{
+			auto pAstcall = PastCast<SAstCall>(pAst);
+
+			// Resolve overloading
+
+			if (pAstcall->pAstFunc->astk == ASTK_Identifier)
+			{	
+				SResolveDecl * pResdecl;
+				if (!FTryResolveOverloadWithUsing(pWork, pTrec->pSymtParent, pAstcall, pTcswitch, &pResdecl))
+				{
+					// We have switched to resolving another declaration
+					ASSERT(pTcswitch->pDecl);
+					break;
+				}
+				
+				pAstcall->pAstFunc->tid = pResdecl->pDecl->pAstdecl->tid;
+
+				RegisterResolved(pWork, pAstcall->pAstFunc, pResdecl);
+			}
+
 			// Coerce arguments, use return type of pAstFunc
 
-			auto pAstcall = PastCast<SAstCall>(pAst);
 			auto pTypeproc = PtypeCast<STypeProcedure>(pAstcall->pAstFunc->tid.pType);
 
 			int cTidArg = pTypeproc->cTidArg;
@@ -7234,15 +7391,10 @@ LOperatorDone:
 
 			// BB (adrianb) Not filling in actual full AST.
 
-			auto pAstdeclA = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo{});
-			pAstdeclA->tid = TidPointer(pWork, typearray.tidElement);
-			pAstdeclA->pChzName = "a";
-
+			auto pAstdeclA = PastdeclCreateTyped(pWork, "a", TidPointer(pWork, typearray.tidElement));
 			AddDeclaration(pWork, pSymtArray, "a", pAstdeclA);
 
-			auto pAstdeclC = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo{});
-			pAstdeclC->tid = pWork->tidU32; // BB (adrianb) U64 to support >4GiB [] u8?
-			pAstdeclC->pChzName = "c";
+			auto pAstdeclC = PastdeclCreateTyped(pWork, "c", pWork->tidU32); // BB (adrianb) u64 - support >4GiB u8?
 
 			if (typearray.cSizeFixed >= 0)
 			{
@@ -9967,7 +10119,7 @@ void CompileAndCheckDeclaration(
 	Init(&genx, &work);
 	GenerateAll(&genx);
 
-	auto pResdecl = PresdeclLookupSimple(&work.symtRoot, pChzDecl, RESLK_WithUsing);
+	auto pResdecl = PresdeclLookup(&work.symtRoot, pChzDecl, 0, {});
 	if (!pResdecl)
 	{
 		ShowErr(SErrorInfo{pChzTestName}, "Can't find declaration %s", pChzDecl);
@@ -10343,27 +10495,28 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
-	- Default int literals to s64? or u64?
+	- Example program to test? OpenGL game?
+	
+	- Add overloading.
+	- Any/typeinfo. printf replacement
+	- Polymorphic procedures. 
 	- Add dynamic array.
 	- Add array literal syntax.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
 	- Add enums.
-	- Add unsized integer type (treated as 64 bit, 65?). So that 1 << 8 can morph into something else if need be.
-	- Add overloading.
-	- #run. Using tree evaluator and global memory allocations.
+	- General #run. Using tree evaluator and global memory allocations.
 	- Named parameters? Default values?
 	- Dll loading.
 		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
-	- Example program to test? OpenGL game?
 	- Flesh out operators - bitwise operators
+	- Default int literals to s64? or u64?
+	- Add unsized integer type (treated as 64 bit, 65?). So that 1 << 8 can morph into something else if need be.
 	- using with procedures, pointers.
-	- Any/typeinfo. printf replacement
 	- SOA support.
 	- Inlining.  In generation.
-	- overloading.
-	- Polymorphic procedures. With modify proc.
+	- Modify proc for polymorphic procedures.
 	- #bake, #bake_values with procedures?
-	- Polymorphic structs. With modify? 
+	- Polymorphic structs. With modify?
 	- Stuff from D: mixins, static if (esp mixins), lazy arguments
 	- Closures?
 	- implicit context

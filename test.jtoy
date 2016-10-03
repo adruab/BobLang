@@ -80,6 +80,21 @@ StrTokenize :: (str: * string, strDelim: string) -> string
     return strToken;
 }
 
+PrintN :: (n : s8)
+{
+    printf("s8 %d\n", n);
+}
+
+PrintN :: (n : s64)
+{
+    printf("s64 %ld\n", n);
+}
+
+PrintN :: (n1 : s64, n2 : s64)
+{
+    printf("s64x2 %ld %ld\n", n1, n2);
+}
+
 main :: ()
 {
     n : s32 = 5;
@@ -184,6 +199,18 @@ main :: ()
         printf(" \"%.*s\"", strTok.cCh, strTok.pCh);
     }
     printf("\n\n");
+
+    n8 : s8 = 7;
+    n16 : s16 = 1023;
+    n64 : s64 = 275;
+
+    PrintN(n8);
+    PrintN(n16);
+    PrintN(n64);
+    PrintN(n8, n8);
+
+    //PrintN(5); // Need to choose closest matchif (matchk > matchkBest)
+    //PrintN(7653);
 
     fEarly := true; //false;
     if (fEarly)

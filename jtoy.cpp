@@ -178,41 +178,6 @@ inline CDeferHolder<T> operator ++(const T & t) { return {t}; }
 
 #define defer const CDeferHolderBase & JOIN(_defer, __LINE__) __attribute__((unused)) = ++ [&]
 
-#if 0
-void TestDefer()
-{
-	void * pV1 = malloc(16);
-	void * pV2 = malloc(16);
-
-	int n = 5;
-	++n;
-
-	float g = 1.5f;
-	++g;
-
-	struct S
-	{
-		int n;
-
-		void operator ++()
-		{
-			++n;
-		}
-	};
-
-	auto s = S{n};
-	++s;
-
-	const int & b = n;
-	int a = -b;
-	(void) a;
-
-	defer { printf("Freeing pV1 and pV2; n=%d\n", n); free(pV1); free(pV2); };
-
-	n = 10;
-}
-#endif
-
 void ShowErrVa(const char * pChzFormat, va_list va)
 {
 	fflush(stdout);
@@ -1974,59 +1939,6 @@ bool FTryConsumeKeyword(SWorkspace * pWork, KEYWORD keyword, SToken * pTok = nul
 }
 
 
-
-#if 0 // in Compiler...
-BLOCK     : 1,
-LITERAL   : 2, // TODO literals morph into multiple types (e.g. small int, larger int, float).  Probably need an optional actual type in case we cast them.
-IDENT     : 3,
-PSTATEMENT : 4,
-
-OPERATOR_EXPRESSION : 5,
-// 6 is currently unused.
-PROCEDURE_CALL  : 7,
-ARRAY_SUBSCRIPT : 8,
-WHILE     : 9,
-IF        : 10,
-LOOP_CONTROL : 11, ???
-// 12 is currently unused.
-REMOVE    : 13, looks like a way to mark that you've removed an entry in a for loop, ew :/
-RETURN    : 14,
-EACH      : 15, ... aka for blah
-
-TYPE_DEFINITION : 16, #type
-TYPE_INSTANTIATION : 17, ??? ...
-ENUM : 18,
-
-PROCEDURE : 19,
-STRUCT : 20,
-COMMA_SEPARATED_ARGUMENTS : 21, ???
-EXTRACT : 22, ??? Is this the a,b,c := multifunc()?  With separate definitions for each?
-SEQUENCE : 23, ??? a..b?
-
-NEW_OR_DELETE : 24, ? Why is this one thing?
-
-DECLARATION : 25, 
-
-CAST_EXPRESSION : 26,
-USING : 27, // for using an external global variable?
-DIRECTIVE_INLINE : 28, // So we haven't performed any inlining yet?
-
-DIRECTIVE_IMPORT : 29,
-DIRECTIVE_LOAD : 30, auto-load dll?
-
-DIRECTIVE_RUN : 31,
-DIRECTIVE_CHECK_CALL : 32, Runs procedure with info from call? Used for printf, but who cares? Any other cases?
-DIRECTIVE_ASSERT : 33, ??? Compile time assert?
-DIRECTIVE_IF_DEFINED : 34, ??? Is there a way to define symbols from the command line or dynamically?  Or is this just so if you import something you can tell if its there?
-DIRECTIVE_BAKE : 35, ???
-DIRECTIVE_MODIFY : 36, For restricting 
-DIRECTIVE_FOREIGN_LIBRARY : 37, For loading a dll with some functions from it
-
-SIZE_OR_TYPE_INFO : 38, ??? 
-CONTEXT_OR_PUSH   : 39, ??? Implicit context demo?
-
-NOTE : 40, ??? annotations is some demo somewhere?
-#endif
 
 enum ASTK
 {
@@ -4875,32 +4787,6 @@ bool FAreSameType(const SType * pType0, const SType * pType1)
 			if (strcmp(pTypestruct0->pChzName, pTypestruct1->pChzName) != 0) 
 				return false;
 
-#if 0
-			if (pTypestruct0->cMember != pTypestruct1->cMember)
-				return false;
-
-			for (int iMember = 0; iMember < pTypestruct0->cMember; ++iMember)
-			{
-				auto pMember0 = &pTypestruct0->aMember[iMember];
-				auto pMember1 = &pTypestruct1->aMember[iMember];
-
-				if (strcmp(pMember0->pChzName, pMember1->pChzName) != 0) // BB (adrianb) Not required?
-					return false;
-
-				if (!FAreSameType(pMember0->pType, pMember1->pType))
-					return false;
-
-				// BB (adrianb) Skipping iBOffset and errinfo.
-
-				if (pMember0->fIsConstant != pMember1->fIsConstant ||
-					pMember0->fIsImported != pMember1->fIsImported ||
-					pMember0->fIsUsing != pMember1->fIsUsing)
-				{
-					return false;
-				}
-			}
-#endif
-
 			return true;
 		}
 
@@ -5007,23 +4893,6 @@ u32 HvFromType(const SType & type)
 			
 			// BB (adrianb) Not required? Or should this be the ONLY thing required?
 			hv = hv * 7901 + HvFromKey(pTypestruct->pChzName, INT_MAX);
-			#if 0
-			hv = hv * 7901 + pTypestruct->cMember;
-
-			for (int iMember = 0; iMember < pTypestruct->cMember; ++iMember)
-			{
-				auto pMember = &pTypestruct->aMember[iMember];
-
-				hv = hv * 7901 + HvFromKey(pMember->pChzName, INT_MAX); // BB (adrianb) Not required?
-				hv = hv * 7901 + HvFromKey(pMember->tid);
-
-				// BB (adrianb) Skipping iBOffset and errinfo.
-
-				hv = hv * 7901 + pMember->fIsConstant;
-				hv = hv * 7901 + pMember->fIsImported;
-				hv = hv * 7901 + pMember->fIsUsing;
-			}
-			#endif
 		}
 		break;
 
@@ -5498,14 +5367,6 @@ void RegisterStruct(SWorkspace * pWork, STypeId tid, SSymbolTable * pSymt)
 
 	auto pTypestruct = const_cast<STypeStruct *>(Ptypestruct(tid.pType));
 	Append(&pWork->arypTypestruct, pTypestruct);
-
-#if 0
-	if (strcmp(pTypestruct->pChzName, "_StringStruct") == 0)
-	{
-		ASSERT(pWork->pTypestructString == nullptr);
-		pWork->pTypestructString = pTypestruct;
-	}
-#endif
 }
 
 STypeId TidWrap(SWorkspace * pWork, const STypeId & tid)
@@ -5632,17 +5493,6 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 	}
 
 	//AddBuiltinType(pWork, "Any", SType{TYPEK_Any});
-
-#if 0
-	if (grfwinit & FWINIT_IncludeBuiltinModule)
-	{
-		SModule * pModule = PtAppendNew(&pWork->aryModule);
-		pModule->pChzFile = "builtin-code";
-		pModule->pChzContents = 
-		"_StringStruct :: struct { pCh : *u8; cCh : s64; };\n";
-		pModule->fBuiltIn = true;
-	}
-#endif
 }
 
 void Destroy(SWorkspace * pWork)
@@ -9289,65 +9139,6 @@ LLVMOpaqueValue * PlvalGenerateDefaultValue(SGenerateCtx * pGenx, STypeId tid, L
 	EvalDefaultValue(pGenx->pWork, tid, static_cast<u8*>(pVVal));
 
 	return PlvalConst(pGenx, tid, pVVal);
-
-#if 0
-	// Generate default value
-
-	TYPEK typek = tid.pType->typek;
-
-	if (FIsInt(typek))
-	{
-		return LLVMConstInt(pLtype, 0, true);
-	}
-	else if (FIsFloat(typek))
-	{
-		return LLVMConstReal(pLtype, 0.0);
-	}
-	else if (typek == TYPEK_Pointer)
-	{
-		return LLVMConstNull(pLtype);
-	}
-	else if (typek == TYPEK_Struct)
-	{
-		#if 0
-		auto pTypestruct = PtypeCast<STypeStruct>(tid.pType);
-		int cMember = pTypestruct->cMember;
-		auto aReg = static_cast<REG *>(alloca(sizeof(REG) * cMember));
-		for (int iMember : IterCount(cMember))
-		{
-			auto pAstdecl = pTypestruct->aMember[iMember].pAstdecl;
-			ASSERT(!pAstdecl->fIsConstant);
-
-			// BB (adrianb) Are values always set to correct type?
-
-			if (pAstdecl->pAstValue)
-				aReg[iMember] = PlvalGenerateConstant(pGenx, pAstdecl->pAstValue);
-			else
-				aReg[iMember] = RegGenerateDefaultValue(pGenx, pAstdecl->tid);
-		}
-
-		return LLVMConstStructInContext(pGenx->pGen->lcontext, aReg, cMember, false);
-		#endif
-	}
-	else if (typek == TYPEK_Array)
-	{
-		#if 0
-		auto pTypearray = PtypeCast<STypeArray>(tid.pType);
-		ASSERT(!pTypearray->fSoa && pTypearray->cSizeFixed >= 0);
-		s64 cElement = pTypearray->cSizeFixed;
-		auto aReg = static_cast<REG *>(alloca(sizeof(REG) * cElement));
-		for (int iElement : IterCount(cElement))
-		{
-			aReg[iElement] = RegGenerateDefaultValue(pGenx, pTypearray->tidElement);
-		}
-
-		return LLVMConstArray(ltyperefElement, aReg, cElement);
-		#endif
-	}
-	
-	ASSERTCHZ(false, "Declaration default value for type %s NYI", StrPrintType(tid.pType).Pchz());
-	return {};
-#endif
 }
 
 LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
@@ -9975,18 +9766,6 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 	return nullptr;
 }
 
-#if 0
-SGlobal * PglobalAdd(SWorkspace * pWork, SAst * pAstSource, STypeId tid)
-{
-	int iGlobal = pWork->aryGlobal.c;
-	auto pGlobal = PtAppendNew(&pWork->aryGlobal);
-	pGlobal->pAstSource = pAstSource;
-	pGlobal->regtAddr = { tid };
-	pGlobal->reg = REG((iGlobal + 1) | REG_Global);
-	return pGlobal;
-}
-#endif
-
 void GenerateAll(SGenerateCtx * pGenx)
 {
 	auto pWork = pGenx->pWork;
@@ -10268,10 +10047,6 @@ int main(int cpChzArg, const char * apChzArg[])
 	static char s_aChzStdoutBuf[BUFSIZ] = {};
 	setvbuf(stdout, s_aChzStdoutBuf, _IOFBF, DIM(s_aChzStdoutBuf));
 
-#if 0
-	TestDefer();
-#endif
-
 	// Process flags
 
 	bool fDoneUsefulWork = false;
@@ -10504,10 +10279,10 @@ int main(int cpChzArg, const char * apChzArg[])
 #if 0
 	- Example program to test? OpenGL game?
 	
-	- Add overloading.
 	- Any/typeinfo. printf replacement
 	- Polymorphic procedures. 
 	- Add dynamic array.
+	- Add overloading with best match?∫
 	- Add array literal syntax.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
 	- Add enums.

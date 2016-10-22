@@ -8907,8 +8907,15 @@ LLVMOpaqueValue * PlvalGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 		break;
 	}
 
-	ShowErr(pAst->errinfo, "Can't get address to load or store from");
-	return {};
+	// Implicitly create temporary local
+	// BB (adrianb) Disallow implictly storing some operators?
+	//  Are there any cases where we'll infinitely recurse?
+
+	auto pLvalAddr = LLVMBuildAlloca(pGenx->pLbuilderAlloc, PltypeGenerate(pGenx, pAst->tid), "_tempAddr");
+	auto pLval = PlvalGenerateRecursive(pGenx, pAst);
+	LLVMBuildStore(pLbuilder, pLval, pLvalAddr);
+
+	return pLvalAddr;
 }
 
 using PFNGENBINOP = LLVMOpaqueValue * (*)(LLVMOpaqueBuilder * pLbuilder, LLVMOpaqueValue * pLvalLeft, 

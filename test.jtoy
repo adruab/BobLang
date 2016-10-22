@@ -15,6 +15,9 @@ Namespace :: struct
     cVec :: 2;  
 };
 
+// Make type explicit. type Vector2 = struct ...
+// Then could define Vector2 constructor function (implicit?).
+
 Vector2 :: struct
 {
     dim :: 2;
@@ -30,8 +33,8 @@ Sprite :: struct
     zip : s64 = 98052;
 };
 
-vec : Vector2;
-gPi := 3.14159;
+g_vec : Vector2;
+g_gPi := 3.14159;
 
 printf :: (format : * char, ..) -> int #foreign;
 
@@ -78,6 +81,14 @@ StrTokenize :: (str: * string, strDelim: string) -> string
     str.cCh -= iCh;
 
     return strToken;
+}
+
+VecXY :: (x : float, y : float) -> Vector2
+{
+    vec : Vector2;
+    vec.x = x;
+    vec.y = y;
+    return vec;
 }
 
 PrintN :: (n : s8)
@@ -129,7 +140,7 @@ main :: ()
     vec2p.x = 50;
     vec2p.y = 313;
 
-    printf("vec = (%f, %f) dim %d\n", vec.x, vec.y, vec.dim);
+    printf("vec = (%f, %f) dim %d\n", g_vec.x, g_vec.y, g_vec.dim);
     printf("vec2 = (%f, %f)\n", vec2.x, vec2.y);
     printf("aVec[%d] = [", aVec.c);
     while i < aVec.c
@@ -146,10 +157,11 @@ main :: ()
            aSprite[1].aVec[0].x, aSprite[1].aVec[0].y, aSprite[1].aVec[1].x, aSprite[1].aVec[1].y, aSprite[1].x, 
                 aSprite[1].y, aSprite[1].g, aSprite[1].zip);
     printf("aG = [%f, %f, %f]\n", aG[0], aG[1], aG[2]);
-    printf("pi = %f\n", gPi);
-    gPi = 3;
-    printf("bad pi = %f\n", gPi);
+    printf("pi = %f\n", g_gPi);
+    g_gPi = 3;
+    printf("bad pi = %f\n", g_gPi);
     printf("a = %d %d %d\n", a, a, a);
+    printf("Member ret = %f\n", VecXY(3.3, 4.4).x);
 
     using pos : Vector2;
     x = 50.5;

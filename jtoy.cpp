@@ -2,7 +2,7 @@
 |
 | Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated 
 | documentation files (the "Software"), to deal in the Software without restriction, including without limitation the 
-| rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit 
+| rights to use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the Software, and to permit 
 | persons to whom the Software is furnished to do so, subject to the following conditions:
 | 
 | The above copyright notice and this permission notice shall be included in all copies or substantial portions of the 
@@ -1203,6 +1203,7 @@ struct SWorkspace
 	STypeId tidS64;					//  ...
 	STypeId tidU8;					//  ...
 	STypeId tidU32;					//  ...
+	STypeId tidU64;					//  ...
 	STypeId tidFloat;				//  ...
 	STypeId tidString;				//  ...
 
@@ -2362,7 +2363,7 @@ struct SAstForeignLibraryDirective : public SAst
 
 void Destroy(SAst * pAst)
 {
-	// BB (adrianb) Can we avoid using arrays inside ast values?
+	// BB (adrianb) Can we avoid using arrays inside ast values? Maybe use stack arrays instead?
 	//  E.g. construct a stack array and then point to it in the ast?
 
 	switch (pAst->astk)
@@ -2637,6 +2638,16 @@ SAst * PastTryParseBinaryOperator(SWorkspace * pWork, int iOperator)
 	{
 		ASSERT(cpAst < DIM(apAst));
 		apAst[cpAst++] = PastTryParsePrimary(pWork);
+
+		if (apAst[cpAst - 1] == nullptr)
+		{
+			if (cpAst > 1)
+			{
+				ShowErr(aTokOperator[cTokOperator - 1].errinfo, "Operator has no right side");
+			}
+
+			break;
+		}
 
 		// See if we should pop an old one
 
@@ -5448,7 +5459,7 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 	AddBuiltinType(pWork, "bool", SType{TYPEK_Bool}, &pWork->tidBool);
 
 	AddBuiltinType(pWork, "s64", SType{TYPEK_S64}, &pWork->tidS64);
-	AddBuiltinType(pWork, "u64", SType{TYPEK_U64});
+	AddBuiltinType(pWork, "u64", SType{TYPEK_U64}, &pWork->tidU64);
 	AddBuiltinType(pWork, "s32", SType{TYPEK_S32}, &pWork->tidS32);
 	AddBuiltinType(pWork, "u32", SType{TYPEK_U32}, &pWork->tidU32);
 	AddBuiltinType(pWork, "s16", SType{TYPEK_S16}, &pWork->tidS16);
@@ -6208,6 +6219,9 @@ bool FCanCoerce(SAst * pAst, const STypeId & tidTo)
 			return (!pTypeptr->fSoa && pTypePointedTo->typek == TYPEK_U8);
 		}
 	}
+
+	// Any array type to a generic array type
+	// BB (adrianb) Check pointed to type?
 	
 	if (pTypeTo->typek == TYPEK_Array && pAst->tid.pType->typek == TYPEK_Array)
 	{
@@ -6216,6 +6230,12 @@ bool FCanCoerce(SAst * pAst, const STypeId & tidTo)
 
 		return pTypearrayTo->cSizeFixed < 0 && !pTypearrayTo->fDynamicallySized &&
 				(pTypearrayFrom->cSizeFixed >= 0 || pTypearrayFrom->fDynamicallySized);
+	}
+
+	if ((pTypeTo->typek == TYPEK_Pointer && PtypeCast<STypePointer>(pTypeTo)->tidPointedTo.pType->typek == TYPEK_Void) 
+		&& pAst->tid.pType->typek == TYPEK_Pointer)
+	{
+		return true;
 	}
 
 	// BB (adrianb) More conversions?
@@ -6526,10 +6546,13 @@ void RegisterResolved(SWorkspace * pWork, SAst * pAstIdent, SResolveDecl * pResd
 }
 
 
+void TryDefaultType(SWorkspace * pWork, SAst * pAst)
+{
+	if (pAst && pAst->tid.pType == nullptr && pAst->astk == ASTK_Literal)
+		pAst->tid = TidFromLiteral(pWork, PastCast<SAstLiteral>(pAst)->lit);
+}
 
 void EvalConst(SWorkspace * pWork, SAst * pAst, void * pVRet);
-
-
 
 void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcswitch)
 {
@@ -6792,6 +6815,10 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 LOperatorDone:
 			if (pAstop->tid.pType == nullptr)
 			{
+				// Set default types so error gives somewhat sensible display
+
+				TryCoerceLit(pWork, pAstop->pAstRight);
+
 				if (pAstop->pAstLeft == nullptr)
 				{
 					ShowErr(pAstop->errinfo, "Invalid prefix operator %s given type %s, cannot be typechecked.", 
@@ -6799,6 +6826,8 @@ LOperatorDone:
 				}
 				else
 				{
+					TryCoerceLit(pWork, pAstop->pAstLeft);
+				
 					ShowErr(pAstop->errinfo, "Invalid operator %s given types %s and %s, cannot be typechecked.", 
 							pChzOp, StrPrintType(pAstop->pAstLeft->tid.pType).Pchz(), 
 							StrPrintType(pAstop->pAstRight->tid.pType).Pchz());
@@ -6845,9 +6874,45 @@ LOperatorDone:
 		break;
 
 	case ASTK_Cast:
-		// BB (adrianb) Check that it is possible?
-		ASSERT(false);
-		// Use type inside pAstType
+		{
+			auto pAstcast = PastCast<SAstCast>(pAst);
+
+			STypeId tidSrc = pAstcast->pAstExpr->tid;
+			STypeId tidDst = pAstcast->pAstType->tid;
+
+			if (tidDst.pType->typek != TYPEK_TypeOf)
+				ShowErr(pAst->errinfo, "Expected type");
+
+			tidDst = PtypeCast<STypeTypeOf>(tidDst.pType)->tid;
+
+			if (tidSrc == tidDst)
+				return;
+
+			TYPEK typekSrc = tidSrc.pType->typek;
+			TYPEK typekDst = tidDst.pType->typek;
+
+			bool fCanConvert = false;
+			if (FIsInt(typekSrc))
+			{
+				fCanConvert = FIsInt(typekDst) || FIsFloat(typekDst);
+			}
+			else if (FIsFloat(typekSrc))
+			{
+				fCanConvert = FIsInt(typekDst) || FIsFloat(typekDst);
+			}
+			else if (typekSrc == TYPEK_Pointer && typekDst == TYPEK_Pointer)
+			{
+				fCanConvert = true;
+			}
+
+			if (!fCanConvert)
+			{
+				ShowErr(pAst->errinfo, "Cannot convert from %s to %s", StrPrintType(tidSrc).Pchz(), 
+						StrPrintType(tidDst).Pchz());
+			}
+
+			pAst->tid = tidDst;
+		}
 		break;
 
 	case ASTK_New:
@@ -6905,7 +6970,23 @@ LOperatorDone:
 			// Resolve overloading
 
 			if (pAstcall->pAstFunc->astk == ASTK_Identifier)
-			{	
+			{
+				auto pChzIdent = PastCast<SAstIdentifier>(pAstcall->pAstFunc)->pChz;
+
+				if (strcmp(pChzIdent, "sizeof") == 0 || strcmp(pChzIdent, "alignof") == 0)
+				{
+					if (pAstcall->arypAstArgs.c != 1)
+					{
+						ShowErr(pAst->errinfo, "%s expects one argument", pChzIdent);
+					}
+
+					TryCoerceLit(pWork, pAstcall->arypAstArgs[0]);
+
+					pAstcall->tid = pWork->tidU64;
+
+					break;
+				}
+				
 				SResolveDecl * pResdecl;
 				if (!FTryResolveOverloadWithUsing(pWork, pTrec->pSymtParent, pAstcall, pTcswitch, &pResdecl))
 				{
@@ -7206,6 +7287,7 @@ LOperatorDone:
 			STypeArray typearray = {};
 			typearray.typek = TYPEK_Array;
 			typearray.cSizeFixed = -1;
+			typearray.fDynamicallySized = pAtypearray->fDynamicallySized;
 			typearray.tidElement = TidUnwrap(pAtypearray->pAstTypeInner->errinfo,
 											 pAtypearray->pAstTypeInner->tid);
 
@@ -7244,7 +7326,9 @@ LOperatorDone:
 			auto pAstdeclA = PastdeclCreateTyped(pWork, "a", TidPointer(pWork, typearray.tidElement));
 			AddDeclaration(pWork, pSymtArray, "a", pAstdeclA);
 
-			auto pAstdeclC = PastdeclCreateTyped(pWork, "c", pWork->tidU32); // BB (adrianb) u64 - support >4GiB u8?
+			// BB (adrianb) Use u64 to support >4GiB u8? For c and cMax.
+
+			auto pAstdeclC = PastdeclCreateTyped(pWork, "c", pWork->tidU32);
 
 			if (typearray.cSizeFixed >= 0)
 			{
@@ -7259,18 +7343,29 @@ LOperatorDone:
 
 			AddDeclaration(pWork, pSymtArray, "c", pAstdeclC);
 
+			SAstDeclareSingle * pAstdeclCMax = nullptr;
+
+			if (pTypearray->fDynamicallySized)
+			{
+				// Dynamic array just contains a cMax
+
+				pAstdeclCMax = PastdeclCreateTyped(pWork, "cMax", pWork->tidU32);
+				AddDeclaration(pWork, pSymtArray, "cMax", pAstdeclCMax);
+			}
+
 			auto pTypestruct = PtAlloc<STypeStruct>(&pWork->pagealloc);
 			pTypestruct->typek = TYPEK_Struct;
 			pTypestruct->pChzName = "_array";
 
-			pTypestruct->cMember = 2;
-			pTypestruct->cMemberMax = 2;
+			pTypestruct->cMemberMax = pTypestruct->cMember = (pAstdeclCMax) ? 3 : 2;
 
 			if (typearray.cSizeFixed < 0)
 			{
-				pTypestruct->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, 2);
+				pTypestruct->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, pTypestruct->cMember);
 				pTypestruct->aMember[0].pAstdecl = pAstdeclA;
 				pTypestruct->aMember[1].pAstdecl = pAstdeclC;
+				if (pAstdeclCMax)
+					pTypestruct->aMember[2].pAstdecl = pAstdeclCMax;
 			}
 
 			pTypearray->pTypestruct = pTypestruct;
@@ -8221,6 +8316,15 @@ void EvalCode(SEvalCtx * pEval, SAst * pAst, void * pVRet)
 				default: ASSERT(false); return;
 				}
 			}
+			else if (typekSrc == TYPEK_Pointer)
+			{
+				void * pV = *static_cast<void **>(pVExpr);
+				if (typekDst == TYPEK_Pointer)
+				{
+					*static_cast<void **>(pVRet) = pV;
+					return;
+				}
+			}
 
 			ShowErr(pAst->errinfo, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
 					StrPrintType(tidDst.pType).Pchz());
@@ -8428,6 +8532,8 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 		{
 			auto pTypeptr = PtypeCast<STypePointer>(pType);
 			ASSERT(!pTypeptr->fSoa);
+			if (pTypeptr->tidPointedTo.pType->typek == TYPEK_Void)
+				return LLVMPointerType(LLVMInt8TypeInContext(pLctx), 0);
 			return LLVMPointerType(PltypeGenerate(pGenx, pTypeptr->tidPointedTo), 0);
 		}
             
@@ -8437,16 +8543,24 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 
 	case TYPEK_Array:
 		{
+			// BB (adrianb) Have non-anonymous struct for an array type?
+
 			auto pTypearray = PtypeCast<STypeArray>(pType);
 			if (pTypearray->cSizeFixed >= 0)
 			{
 				ASSERT(!pTypearray->fSoa && !pTypearray->fDynamicallySized);
 				return LLVMArrayType(PltypeGenerate(pGenx, pTypearray->tidElement), pTypearray->cSizeFixed);
 			}
+			else if (pTypearray->fDynamicallySized)
+			{
+				auto pLtypePtr = PltypeGenerate(pGenx, TidPointer(pWork, pTypearray->tidElement));
+				LLVMOpaqueType * apLtype[] = { pLtypePtr, LLVMInt32TypeInContext(pGenx->pLctx), LLVMInt32TypeInContext(pGenx->pLctx) };
+				return LLVMStructTypeInContext(pGenx->pLctx, apLtype, DIM(apLtype), false);
+			}
 			else
 			{
 				auto pLtypePtr = PltypeGenerate(pGenx, TidPointer(pWork, pTypearray->tidElement));
-				LLVMOpaqueType * apLtype[] = { pLtypePtr, LLVMInt64TypeInContext(pGenx->pLctx) };
+				LLVMOpaqueType * apLtype[] = { pLtypePtr, LLVMInt32TypeInContext(pGenx->pLctx) };
 				return LLVMStructTypeInContext(pGenx->pLctx, apLtype, DIM(apLtype), false);
 			}
 		}
@@ -8562,7 +8676,7 @@ void GetMemberAddress(SGenerateCtx * pGenx, const char * pChzName,
 	if (pTidPointedTo->pType->typek == TYPEK_Array)
 	{
 		auto pTypearray = PtypeCast<STypeArray>(pTidPointedTo->pType);
-		if (pTypearray->cSizeFixed >= 0)
+        if (pTypearray->cSizeFixed >= 0)
 		{
 			ASSERT(strcmp(pChzName, "a") == 0);
 			*ppLvalPtr = LLVMBuildStructGEP(pLbuilder, *ppLvalPtr, 0, "");
@@ -8833,8 +8947,8 @@ static const SGenerateBinaryOperator s_aGbop[] =
 	{ "<", GenCmpInt<LLVMIntSLT>, GenCmpInt<LLVMIntULT>, GenCmpFloat<LLVMRealOLT>, nullptr, GenCmpInt<LLVMIntULT> },
 	{ ">", GenCmpInt<LLVMIntSGT>, GenCmpInt<LLVMIntUGT>, GenCmpFloat<LLVMRealOGT>, nullptr, GenCmpInt<LLVMIntUGT> },
 
-	{ "==", GenCmpInt<LLVMIntEQ>, nullptr, nullptr, nullptr, GenCmpInt<LLVMIntEQ> },
-	{ "!=", GenCmpInt<LLVMIntNE>, nullptr, nullptr, nullptr, GenCmpInt<LLVMIntNE> },
+	{ "==", GenCmpInt<LLVMIntEQ>, nullptr, GenCmpFloat<LLVMRealOEQ>, nullptr, GenCmpInt<LLVMIntEQ> },
+	{ "!=", GenCmpInt<LLVMIntNE>, nullptr, GenCmpFloat<LLVMRealONE>, nullptr, GenCmpInt<LLVMIntNE> },
 
 	{ "+", LLVMBuildAdd, nullptr, LLVMBuildFAdd, PlvalAddPtrInt, nullptr },
 	{ "-", LLVMBuildSub, nullptr, LLVMBuildFSub, PlvalSubPtrInt, PlvalSubPtr },
@@ -8844,8 +8958,8 @@ static const SGenerateBinaryOperator s_aGbop[] =
 };
 
 LLVMOpaqueValue * PlvalGenerateBinaryOperator(SGenerateCtx * pGenx, const SGenerateBinaryOperator & gbop, 
-										   SAst * pAstLeft, LLVMOpaqueValue * pLvalLeft, 
-										   SAst * pAstRight, LLVMOpaqueValue * pLvalRight)
+											   SAst * pAstLeft, LLVMOpaqueValue * pLvalLeft, 
+											   SAst * pAstRight, LLVMOpaqueValue * pLvalRight)
 {
 	auto pLbuilder = pGenx->pLbuilder;
 
@@ -9484,7 +9598,7 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 
 					LLVMOpaqueValue * apLvalGEP[] = { PlvalConstS32(pGenx, 0), PlvalConstS32(pGenx, 0) };
 					auto pLvalA = LLVMBuildGEP(pGenx->pLbuilder, pLvalPtrArray, apLvalGEP, DIM(apLvalGEP), "");
-					auto pLvalC = PlvalConstU64(pGenx, pTypearraySrc->cSizeFixed);
+					auto pLvalC = PlvalConstU32(pGenx, pTypearraySrc->cSizeFixed);
 					LLVMOpaqueValue * apLvalAry[] = { pLvalA, pLvalC };
 					return PlvalBuildStruct(pGenx, pLtypeArray, apLvalAry, DIM(apLvalAry));
 				}
@@ -9541,6 +9655,11 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 						return LLVMBuildFPToUI(pLbuilder, pLvalExpr, pLtypeDst, "");
 				}
 			}
+			else if (typekSrc == TYPEK_Pointer)
+			{
+				return LLVMBuildBitCast(pLbuilder, pLvalExpr, pLtypeDst, "");
+
+			}
 
 			ASSERTCHZ(false, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
 					  StrPrintType(tidDst.pType).Pchz());
@@ -9582,6 +9701,19 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 			// Do this for all functions? E.g. so out of order will work? Or just start the function
 			// and continue filling it later.
 
+			if (pAstcall->pAstFunc->astk == ASTK_Identifier)
+			{
+				auto pChzIdent = PastCast<SAstIdentifier>(pAstcall->pAstFunc)->pChz;
+				bool fIsSizeOf = strcmp(pChzIdent, "sizeof") == 0;
+				if (fIsSizeOf || strcmp(pChzIdent, "alignof") == 0)
+				{
+					STypeId tid = pAstcall->arypAstArgs[0]->tid;
+					if (tid.pType->typek == TYPEK_TypeOf)
+						tid = PtypeCast<STypeTypeOf>(tid.pType)->tid;
+					return PlvalConstU64(pGenx, (fIsSizeOf) ? CbSizeOf(tid) : CbAlignOf(tid));
+				}
+			}
+
 			auto pLvalProc = PlvalGenerateRecursive(pGenx, pAstcall->pAstFunc);
 
 			int cArg = pAstcall->arypAstArgs.c;
@@ -9592,7 +9724,10 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 				apLvalArg[iArg] = PlvalGenerateRecursive(pGenx, pAstcall->arypAstArgs[iArg]);
 			}
 
-			return LLVMBuildCall(pLbuilder, pLvalProc, apLvalArg, cArg, "");
+			auto pLvalRet = LLVMBuildCall(pLbuilder, pLvalProc, apLvalArg, cArg, "");
+			if (pAstcall->tid.pType->typek == TYPEK_Void)
+				return nullptr;
+			return pLvalRet;
 		}
 		break;
 
@@ -10042,10 +10177,20 @@ void RunUnitTests()
 	//  from workspace? E.g. page based arrays? Use global pointer for allocation?
 }
 
+void CrashHandler(int nSignal) 
+{
+	fprintf(stderr, "Crash: signal %d:\n", nSignal);
+	PrintBacktrace(0);
+	exit(1);
+}
+
 int main(int cpChzArg, const char * apChzArg[])
 {
 	static char s_aChzStdoutBuf[BUFSIZ] = {};
 	setvbuf(stdout, s_aChzStdoutBuf, _IOFBF, DIM(s_aChzStdoutBuf));
+
+	// install our signal handler
+   	signal(SIGSEGV, CrashHandler);
 
 	// Process flags
 
@@ -10277,34 +10422,35 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
-	- Example program to test? OpenGL game?
+	- Example program to test. Eventually Crystalis game.
+		- GL drawing (OSX window wrapper goo? or just use glew?). Or buy a new laptop?
+	- Alternate syntax. type, proc, struct, const, let, var etc.?
 	
-	- Any/typeinfo. printf replacement
-	- Polymorphic procedures. 
-	- Add dynamic array.
-	- Add overloading with best match?∫
+	- Dynamic array. Need append function. Call library functions from intenal codegen? Template functions would 
+		allow doing it all in library.
+	- Dll loading.
+		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
+	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN E.g. shaders
+	- Any/typeinfo. printf replacement.
+	- Polymorphic procedures.
+	- Add overloading with best match?
 	- Add array literal syntax.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
 	- Add enums.
 	- General #run. Using tree evaluator and global memory allocations.
 	- Named parameters? Default values?
-	- Dll loading.
-		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
 	- Flesh out operators - bitwise operators
-	- Default int literals to s64? or u64?
-	- Add unsized integer type (treated as 64 bit, 65?). So that 1 << 8 can morph into something else if need be.
-	- using with procedures, pointers.
+	- Solve 1 << 9 giving bogus value? Could default int literals to s64? Or unsized s65?
+	- using with procedures, pointers, implicit this parameter.
 	- SOA support.
 	- Inlining.  In generation.
 	- Modify proc for polymorphic procedures.
 	- #bake, #bake_values with procedures?
 	- Polymorphic structs. With modify?
-	- Stuff from D: mixins, static if (esp mixins), lazy arguments
+	- Stuff from D: mixins, static if (esp mixins), lazy arguments (e.g. assert implementation)
+	- Stuff from Nim: inline iterator (for loop)
 	- Closures?
 	- implicit context
-	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN
-	- Annotations?
-	- Expose typed compiler AST to compile time run procedures ala BANANAS demo. Ouch...
 	- Debugger GUI?
 	- Conditional compilation.
 

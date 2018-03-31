@@ -2,7 +2,7 @@
 |
 | Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated 
 | documentation files (the "Software"), to deal in the Software without restriction, including without limitation the 
-| rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit 
+| rights to use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the Software, and to permit 
 | persons to whom the Software is furnished to do so, subject to the following conditions:
 | 
 | The above copyright notice and this permission notice shall be included in all copies or substantial portions of the 
@@ -25,6 +25,7 @@
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <execinfo.h>
 
 #if 0
 #include <ffi.h>
@@ -53,6 +54,15 @@
 //  Running modify procs during type checking will require generating and executing code during type checking.
 //  How to keep fast?
 
+#if __INTELLISENSE__
+#undef va_start(arg, va)
+#define va_start(arg, va)
+#undef va_end(va)
+#define va_end(va)
+#undef va_copy(va0, va1)
+#define va_copy(arg0, va1)
+#define __INT_MAX__ 0x7fffffff
+#endif
 
 
 // Some basic typedefs
@@ -66,6 +76,26 @@ typedef int8_t s8;
 typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
+
+#define ClearStruct(p) memset(p, 0, sizeof(*p))
+#define DIM(a) (int(sizeof(a)/sizeof(a[0])))
+
+#define JOIN2(a,b) a##b
+#define JOIN(a,b) JOIN2(a,b)
+
+
+
+void PrintBacktrace(int cIgnore)
+{
+	void * apV[32] = {};
+	int cpV = backtrace(apV, DIM(apV));
+	char ** apChz = backtrace_symbols(apV, cpV);
+	for (int i = cIgnore + 1; i < cpV; ++i) 
+	{
+		fprintf(stderr, "  %s\n", apChz[i]);
+	}
+	free(apChz);
+}
 
 #if WIN32
 #define BREAK_ALWAYS() __debugbreak()
@@ -87,6 +117,7 @@ typedef int64_t s64;
 			fprintf(stderr, "%s:%d assert failed: ", __FILE__, __LINE__); \
 			fprintf(stderr, __VA_ARGS__); \
 			fprintf(stderr, "\n"); \
+			PrintBacktrace(0); \
 			fflush(stderr); \
 			BREAK_ALWAYS(); \
 		} \
@@ -96,12 +127,6 @@ typedef int64_t s64;
 
 #define VERIFY(f) ASSERT(f)    
 #define CASSERT(f) static_assert(f, #f " failed")
-
-#define ClearStruct(p) memset(p, 0, sizeof(*p))
-#define DIM(a) (int(sizeof(a)/sizeof(a[0])))
-
-#define JOIN2(a,b) a##b
-#define JOIN(a,b) JOIN2(a,b)
 
 template <typename T>
 T min (T a, T b)
@@ -154,50 +179,20 @@ public:
 	T t;
 };
 
-// BB (adrianb) Seems bad to overload all uses of unary ++, but doesn't seem to affect
-//  ++ on ints or floats at least.
+enum class DeferTag
+{
+	kConst = 1
+};
 
 template <class T>
-inline CDeferHolder<T> operator ++(const T & t) { return {t}; }
+inline CDeferHolder<T> operator +(DeferTag defertag, const T & t) { return {t}; }
 
-#define defer const CDeferHolderBase & JOIN(_defer, __LINE__) __attribute__((unused)) = ++ [&]
+#define defer const CDeferHolderBase & JOIN(_defer, __LINE__) __attribute__((unused)) = DeferTag::kConst + [&]
 
-#if 0
-void TestDefer()
+void ExitErr(int nErr = -1)
 {
-	void * pV1 = malloc(16);
-	void * pV2 = malloc(16);
-
-	int n = 5;
-	++n;
-
-	float g = 1.5f;
-	++g;
-
-	struct S
-	{
-		int n;
-
-		void operator ++()
-		{
-			++n;
-		}
-	};
-
-	auto s = S{n};
-	++s;
-
-	const int & b = n;
-	int a = -b;
-	(void) a;
-
-	defer { printf("Freeing pV1 and pV2; n=%d\n", n); free(pV1); free(pV2); };
-
-	n = 10;
+	exit(nErr);
 }
-#endif
-
-
 
 void ShowErrVa(const char * pChzFormat, va_list va)
 {
@@ -206,7 +201,7 @@ void ShowErrVa(const char * pChzFormat, va_list va)
 	fprintf(stderr, "\n");
 	fflush(stderr);
 
-	exit(-1);
+	ExitErr();
 }
 
 void ShowErrRaw(const char * pChzFormat, ...)
@@ -426,20 +421,17 @@ struct SErrorInfo
 	int iChMac;
 };
 
-void ShowErr(const SErrorInfo & errinfo, const char * pChzFormat, ...)
+void LogErrVa(const SErrorInfo & errinfo, const char * pChzErr, const char * pChzFormat, va_list va)
 {
 	fflush(stdout);
 	if (errinfo.pChzFile)
 	{
-		fprintf(stderr, "%s:%d:%d : error: ", errinfo.pChzFile, errinfo.nLine, errinfo.nCol);
+		fprintf(stderr, "%s:%d:%d : %s: ", errinfo.pChzFile, errinfo.nLine, errinfo.nCol, pChzErr);
 	}
 	else
 	{
-		fprintf(stderr, "error: ");
+		fprintf(stderr, "%s: ", pChzErr);
 	}
-
-	va_list va;
-	va_start(va, pChzFormat);
 
 	vfprintf(stderr, pChzFormat, va);
 
@@ -492,7 +484,28 @@ void ShowErr(const SErrorInfo & errinfo, const char * pChzFormat, ...)
 	}
 
 	fflush(stderr);
-	exit(-1);
+	ExitErr();
+
+	va_end(va);
+}
+
+void ShowErr(const SErrorInfo & errinfo, const char * pChzFormat, ...)
+{
+	va_list va;
+	va_start(va, pChzFormat);
+
+	LogErrVa(errinfo, "error", pChzFormat, va);
+	ExitErr();
+
+	va_end(va);
+}
+
+void PrintErr(const SErrorInfo & errinfo, const char * pChzFormat, ...)
+{
+	va_list va;
+	va_start(va, pChzFormat);
+
+	LogErrVa(errinfo, "error", pChzFormat, va);
 
 	va_end(va);
 }
@@ -500,6 +513,8 @@ void ShowErr(const SErrorInfo & errinfo, const char * pChzFormat, ...)
 template <class T>
 struct SArray
 {
+	typedef T TElement;
+
 	T *	a;
 	int c;
 	int cMax;
@@ -565,34 +580,84 @@ T * PtAppendNew(SArray<T> * pAry, int c = 1)
 	return pT;
 }
 
-template <class T, class TOther>
-void Append(SArray<T> * pAry, const TOther & t)
+template <class T, int N>
+struct SFixArray
+{
+	typedef T TElement;
+	static const int cMax = N;
+
+	T	a[N];
+	int c;
+
+	T & operator [](int i)
+			{ 
+				ASSERT(i >= 0 && i < this->c);
+				return this->a[i];
+			}
+
+	const T & operator [](int i) const
+			{ 
+				ASSERT(i >= 0 && i < this->c);
+				return this->a[i];
+			}
+
+	const T * begin() const
+			{ return a; }
+	T * begin()
+			{ return a; }
+	T * end()
+			{ return a + c; }
+	const T * end() const
+			{ return a + c; }
+};
+
+template <class T, int N>
+T * PtAppendNew(SFixArray<T, N> * pAry, int c = 1)
+{
+	int cNew = pAry->c + c;
+	ASSERT(cNew <= pAry->cMax);
+
+	T * pT = pAry->a + pAry->c;
+	memset(pT, 0, c * sizeof(T));
+	pAry->c += c;
+
+	return pT;
+}
+
+template <class TAry>
+inline bool FIsFull(TAry * pAry)
+{
+	return pAry->c >= pAry->cMax;
+}
+
+template <class TAry, class TOther>
+inline void Append(TAry * pAry, const TOther & t)
 {
 	*PtAppendNew(pAry) = t;
 }
 
-template <class T>
-void SetSizeAtLeast(SArray<T> * pAry, int c)
+template <class TAry>
+void SetSizeAtLeast(TAry * pAry, int c)
 {
 	if (c > pAry->c)
 		(void) PtAppendNew(pAry, c - pAry->c);
 }
 
-template <class T>
-bool FIsEmpty(const SArray<T> * pAry)
+template <class TAry>
+inline bool FIsEmpty(const TAry * pAry)
 {
 	return pAry->c == 0;
 }
 
-template <class T>
-void Pop(SArray<T> * pAry)
+template <class TAry>
+inline void Pop(TAry * pAry)
 {
 	ASSERT(pAry->c > 0);
 	--pAry->c;
 }
 
-template <class T>
-void RemoveFront(SArray<T> * pAry, int c)
+template <class TAry>
+void RemoveFront(TAry * pAry, int c)
 {
 	ASSERT(c > 0);
 	ASSERT(pAry->c >= c);
@@ -605,15 +670,15 @@ void RemoveFront(SArray<T> * pAry, int c)
 	pAry->c -= c;
 }
 
-template <class T>
-T & Tail(SArray<T> * pAry, int i = 0)
+template <class TAry>
+inline typename TAry::TElement & Tail(TAry * pAry, int i = 0)
 {
 	ASSERT(i >= 0 && i < pAry->c);
 	return pAry->a[pAry->c - i - 1];
 }
 
-template <class T>
-int IFromP(const SArray<T> * pAry, const T * p)
+template <class TAry, class T>
+inline int IFromP(const TAry * pAry, const T * p)
 {
 	int i = p - pAry->a;
 	ASSERT(i >= 0 && i < pAry->c);
@@ -1138,9 +1203,10 @@ struct SModule
 	bool fBuiltIn;
 	SAstBlock * pAstblockRoot;
 
-	SArray<SAstProcedure *> arypAstproc;
+	SArray<SAstProcedure *> arypAstprocGen; // Procedures to generate code for
 
 	// BB (adrianb) Get access to the other modules' symbol tables explicitly ala python.
+	//  Wouldn't work for built in module.
 };
 
 struct STypeId // tag = tid
@@ -1177,12 +1243,33 @@ struct SResolveDecl;
 struct SProcedure;
 struct SGlobal;
 
+struct SPolyArg
+{
+	const char * pChz;
+	STypeId tid;
+	SErrorInfo errinfo;
+};
+
+struct SSpecializedProc
+{
+	SArray<SPolyArg> aryParg; 	// Type specializations
+	SResolveDecl * pResdecl;	// Declaration for type checking
+};
+
+struct SPolymorphicProc // tag = polyproc
+{
+	SAstDeclareSingle * pAstdeclProcOrig;
+	SArray<SSpecializedProc> arySpecproc;
+};
+
 struct SSymbolTable
 {
 	SYMTBLK symtblk;
 	SSymbolTable * pSymtParent;
 	SArray<SResolveDecl *> arypResdecl; // Declarations, may be finished or unfinished if out of order
 	int ipResdeclUsing;
+	
+	SArray<SPolymorphicProc> aryPolyproc; // Polymorphic procedures
 
 	SAstProcedure * pAstproc; // Function for procedure symbol tables
 	STypeStruct * pTypestruct; // Function for procedure symbol tables
@@ -1224,6 +1311,7 @@ struct SWorkspace
 	STypeId tidS64;					//  ...
 	STypeId tidU8;					//  ...
 	STypeId tidU32;					//  ...
+	STypeId tidU64;					//  ...
 	STypeId tidFloat;				//  ...
 	STypeId tidString;				//  ...
 
@@ -1961,59 +2049,6 @@ bool FTryConsumeKeyword(SWorkspace * pWork, KEYWORD keyword, SToken * pTok = nul
 
 
 
-#if 0 // in Compiler...
-BLOCK     : 1,
-LITERAL   : 2, // TODO literals morph into multiple types (e.g. small int, larger int, float).  Probably need an optional actual type in case we cast them.
-IDENT     : 3,
-PSTATEMENT : 4,
-
-OPERATOR_EXPRESSION : 5,
-// 6 is currently unused.
-PROCEDURE_CALL  : 7,
-ARRAY_SUBSCRIPT : 8,
-WHILE     : 9,
-IF        : 10,
-LOOP_CONTROL : 11, ???
-// 12 is currently unused.
-REMOVE    : 13, looks like a way to mark that you've removed an entry in a for loop, ew :/
-RETURN    : 14,
-EACH      : 15, ... aka for blah
-
-TYPE_DEFINITION : 16, #type
-TYPE_INSTANTIATION : 17, ??? ...
-ENUM : 18,
-
-PROCEDURE : 19,
-STRUCT : 20,
-COMMA_SEPARATED_ARGUMENTS : 21, ???
-EXTRACT : 22, ??? Is this the a,b,c := multifunc()?  With separate definitions for each?
-SEQUENCE : 23, ??? a..b?
-
-NEW_OR_DELETE : 24, ? Why is this one thing?
-
-DECLARATION : 25, 
-
-CAST_EXPRESSION : 26,
-USING : 27, // for using an external global variable?
-DIRECTIVE_INLINE : 28, // So we haven't performed any inlining yet?
-
-DIRECTIVE_IMPORT : 29,
-DIRECTIVE_LOAD : 30, auto-load dll?
-
-DIRECTIVE_RUN : 31,
-DIRECTIVE_CHECK_CALL : 32, Runs procedure with info from call? Used for printf, but who cares? Any other cases?
-DIRECTIVE_ASSERT : 33, ??? Compile time assert?
-DIRECTIVE_IF_DEFINED : 34, ??? Is there a way to define symbols from the command line or dynamically?  Or is this just so if you import something you can tell if its there?
-DIRECTIVE_BAKE : 35, ???
-DIRECTIVE_MODIFY : 36, For restricting 
-DIRECTIVE_FOREIGN_LIBRARY : 37, For loading a dll with some functions from it
-
-SIZE_OR_TYPE_INFO : 38, ??? 
-CONTEXT_OR_PUSH   : 39, ??? Implicit context demo?
-
-NOTE : 40, ??? annotations is some demo somewhere?
-#endif
-
 enum ASTK
 {
 	ASTK_Invalid = 0,
@@ -2149,7 +2184,7 @@ struct SAst
 template <typename T>
 T * PastCast(SAst * pAst)
 {
-	ASSERT(pAst->astk == T::s_astk);
+	ASSERTCHZ(pAst->astk == T::s_astk, "Expected ast of type %s", PchzFromAstk(T::s_astk));
 	return static_cast<T *>(pAst);
 }
 
@@ -2369,6 +2404,9 @@ struct SAstProcedure : public SAst
 
 	bool fIsInline;
 	bool fIsForeign;
+	bool fIsPolymorphic;
+
+	int iModuleOwner;
 	const char * pChzForeign;
 
 	SAstBlock * pAstblock;
@@ -2436,7 +2474,7 @@ struct SAstForeignLibraryDirective : public SAst
 
 void Destroy(SAst * pAst)
 {
-	// BB (adrianb) Can we avoid using arrays inside ast values?
+	// BB (adrianb) Can we avoid using arrays inside ast values? Maybe use stack arrays instead?
 	//  E.g. construct a stack array and then point to it in the ast?
 
 	switch (pAst->astk)
@@ -2711,6 +2749,16 @@ SAst * PastTryParseBinaryOperator(SWorkspace * pWork, int iOperator)
 	{
 		ASSERT(cpAst < DIM(apAst));
 		apAst[cpAst++] = PastTryParsePrimary(pWork);
+
+		if (apAst[cpAst - 1] == nullptr)
+		{
+			if (cpAst > 1)
+			{
+				ShowErr(aTokOperator[cTokOperator - 1].errinfo, "Operator has no right side");
+			}
+
+			break;
+		}
 
 		// See if we should pop an old one
 
@@ -3084,6 +3132,52 @@ SAst * PastParseMultiDeclarationOrAssign(SWorkspace * pWork)
 	return nullptr;
 }
 
+bool FHasPolymorphicType(SAst * pAst)
+{
+	if (!pAst)
+		return false;
+
+	switch (pAst->astk)
+	{
+	case ASTK_TypePolymorphic:
+		return true;
+
+	case ASTK_TypeArray:
+		return FHasPolymorphicType(PastCast<SAstTypeArray>(pAst)->pAstTypeInner);
+
+	case ASTK_TypePointer:
+		return FHasPolymorphicType(PastCast<SAstTypePointer>(pAst)->pAstTypeInner);
+
+	case ASTK_TypeProcedure:
+		{
+			auto pAtypeproc = PastCast<SAstTypeProcedure>(pAst);
+			for (SAst * pAstArg : pAtypeproc->arypAstDeclArg)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAstArg);
+				if (FHasPolymorphicType(pAstdecl->pAstType))
+					return true;
+			}
+
+			for (SAst * pAstRet : pAtypeproc->arypAstDeclRet)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAstRet);
+				if (FHasPolymorphicType(pAstdecl->pAstType))
+					return true;
+			}
+
+			return false;
+		}
+
+	case ASTK_Identifier:
+	case ASTK_TypeVararg:
+		return false;
+	
+	default:
+		ASSERTCHZ(false, "Can't check polymorphic for %s", PchzFromAstk(pAst->astk));
+		return false;
+	}
+}
+
 SAst * PastTryParseDeclaration(SWorkspace * pWork)
 {
 	int iTok = 0;
@@ -3147,6 +3241,7 @@ SAst * PastTryParseStructOrProcedureDeclaration(SWorkspace * pWork)
 				auto pAstproc = PastCreate<SAstProcedure>(pWork, tokIdent.errinfo);
 				pAstproc->pChzName = tokIdent.ident.pChz;
 				pAstproc->fIsInline = fInline;
+				pAstproc->iModuleOwner = pWork->iModuleParse;
 
 				pAstdecl->pChzName = pAstproc->pChzName;
 				// BB (adrianb) Only need this if we aren't creating asts for all declarations
@@ -3172,6 +3267,17 @@ SAst * PastTryParseStructOrProcedureDeclaration(SWorkspace * pWork)
 					ParseReturnValues(pWork, &pAstproc->arypAstDeclRet);
 				}
 
+				// Track if procedure is polymorphic
+				for (auto pAst : pAstproc->arypAstDeclArg)
+				{
+					SAst * pAstType = (pAst->astk == ASTK_DeclareSingle) ? PastCast<SAstDeclareSingle>(pAst)->pAstType : pAst;
+					if (FHasPolymorphicType(pAstType))
+					{
+						pAstproc->fIsPolymorphic = true;
+						break;
+					}
+				}
+
 				if (FTryConsumeKeyword(pWork, KEYWORD_ForeignDirective))
 				{
 					pAstproc->fIsForeign = true;
@@ -3195,10 +3301,6 @@ SAst * PastTryParseStructOrProcedureDeclaration(SWorkspace * pWork)
 							ShowErr(pAstdecl->errinfo, "No name given to register argument");
 						}
 					}
-
-					// Register for future consumption at the module level
-				
-					Append(&pWork->aryModule[pWork->iModuleParse].arypAstproc, pAstproc);
 				}
 
 				return pAstdecl;
@@ -4098,7 +4200,7 @@ void ParseAll(SWorkspace * pWork)
 				fflush(stdout);
 				fprintf(stderr, "Could read file %s\n", pChzFile);
 				fflush(stderr);
-				exit(-1);
+				ExitErr();
 			}
 		}
 		
@@ -4115,6 +4217,8 @@ void ParseAll(SWorkspace * pWork)
 		// Collect and add any imported files
 
 		// NOTE (adrianb) Do not reference pModule after this point as it may have moved.
+		// BB (adrianb) Separate modules are just for error reporting and file memory tracking.
+		//  Get rid of the procedure per module thing?
 
 		auto pAstblock = pModule->pAstblockRoot;
 		for (SAst * pAst : pAstblock->arypAst)
@@ -4320,9 +4424,32 @@ const STypeStruct * Ptypestruct(const SType * pType)
 	}
 }
 
+inline u64 HvMem(const char * aB, u32 cB)
+{
+	// Implementation of FNV 1a per https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function#FNV-1a_hash
+	// Recommended by https://aras-p.info/blog/2016/08/09/More-Hash-Function-Tests/ but YMMV
+
+	static const u64 s_nFNVOffsetBasis = 0xcbf29ce484222325ull;
+	static const u64 s_nFNVPrime = 0x100000001b3ull;
+	u64 hv = s_nFNVOffsetBasis;
+	for (u32 iB = 0; iB < cB; ++iB)
+	{
+		hv = hv ^ u64(u8(aB[iB]));
+		hv = hv * s_nFNVPrime;
+	}
+
+	return hv;
+}
+
+template <class T>
+inline u64 HvMem(const T & t)
+{
+	return HvMem(reinterpret_cast<const char *>(&t), sizeof(t));
+}
+
 inline u32 HvFromKey(u64 n)
 {
-	return u32(n) ^ u32(n >> 32);
+	return HvMem(n);
 }
 
 inline u32 HvFromKey(const STypeId & tid)
@@ -4428,13 +4555,15 @@ struct SStringBuilder
 
 void PrintV(SStringBuilder * pStrb, const char * pChzFmt, va_list vargs)
 {
-	auto vargCopy = *vargs;
+	va_list vargCopy;
+	va_copy(vargCopy, vargs);
+
 	int cCh = vsnprintf(pStrb->aChz + pStrb->cCh, pStrb->cChMax - pStrb->cCh, pChzFmt, vargs);
 	
 	int cChNeeded = pStrb->cCh + cCh + 1;
 	if (cChNeeded >= pStrb->cChMax)
 	{
-		*vargs = vargCopy;
+		va_copy(vargs, vargCopy);
 		int cChAlloc = pStrb->cChMax;
 		if (cChAlloc == 0)
 			cChAlloc = 32;
@@ -4861,32 +4990,6 @@ bool FAreSameType(const SType * pType0, const SType * pType1)
 			if (strcmp(pTypestruct0->pChzName, pTypestruct1->pChzName) != 0) 
 				return false;
 
-#if 0
-			if (pTypestruct0->cMember != pTypestruct1->cMember)
-				return false;
-
-			for (int iMember = 0; iMember < pTypestruct0->cMember; ++iMember)
-			{
-				auto pMember0 = &pTypestruct0->aMember[iMember];
-				auto pMember1 = &pTypestruct1->aMember[iMember];
-
-				if (strcmp(pMember0->pChzName, pMember1->pChzName) != 0) // BB (adrianb) Not required?
-					return false;
-
-				if (!FAreSameType(pMember0->pType, pMember1->pType))
-					return false;
-
-				// BB (adrianb) Skipping iBOffset and errinfo.
-
-				if (pMember0->fIsConstant != pMember1->fIsConstant ||
-					pMember0->fIsImported != pMember1->fIsImported ||
-					pMember0->fIsUsing != pMember1->fIsUsing)
-				{
-					return false;
-				}
-			}
-#endif
-
 			return true;
 		}
 
@@ -4993,23 +5096,6 @@ u32 HvFromType(const SType & type)
 			
 			// BB (adrianb) Not required? Or should this be the ONLY thing required?
 			hv = hv * 7901 + HvFromKey(pTypestruct->pChzName, INT_MAX);
-			#if 0
-			hv = hv * 7901 + pTypestruct->cMember;
-
-			for (int iMember = 0; iMember < pTypestruct->cMember; ++iMember)
-			{
-				auto pMember = &pTypestruct->aMember[iMember];
-
-				hv = hv * 7901 + HvFromKey(pMember->pChzName, INT_MAX); // BB (adrianb) Not required?
-				hv = hv * 7901 + HvFromKey(pMember->tid);
-
-				// BB (adrianb) Skipping iBOffset and errinfo.
-
-				hv = hv * 7901 + pMember->fIsConstant;
-				hv = hv * 7901 + pMember->fIsImported;
-				hv = hv * 7901 + pMember->fIsUsing;
-			}
-			#endif
 		}
 		break;
 
@@ -5169,51 +5255,87 @@ inline STypeId TidEnsure(SWorkspace * pWork, const SType & typeTry)
 	return TidEnsure(pWork, &typeTry);
 }
 
+STypeId TidUnwrap(const SErrorInfo & errinfo, STypeId tid)
+{
+	if (tid.pType->typek != TYPEK_TypeOf)
+	{
+		ShowErr(errinfo, "Cannot point to instance of type");
+	}
+
+	return static_cast<const STypeTypeOf *>(tid.pType)->tid;
+}
+
 struct STypeCheckSwitch // tag = tcswitch
 {
 	SDeclaration * pDecl;
 };
 
-enum RESLK
+enum FRESL
 {
-	RESLK_Local,
-	RESLK_WithUsing
+	FRESL_IgnoreProcedures = 0x01,
 };
 
-SResolveDecl * PresdeclLookupSimple(SSymbolTable * pSymt, const char * pChzName, RESLK reslk)
+typedef u32 GRFRESL;
+
+SResolveDecl * PresdeclLookup(SSymbolTable * pSymt, const char * pChzName, GRFRESL grfresl, const SErrorInfo & errinfo)
 {
+	// BB (adrianb) Need to distinguish between looking up one level only and looking up globally?	
+
+	SResolveDecl * pResdeclFound = nullptr;
 	for (auto pResdecl : pSymt->arypResdecl)
 	{
 		if (strcmp(pResdecl->pDecl->pChzName, pChzName) == 0)
-			return pResdecl;
+		{
+			if (grfresl & FRESL_IgnoreProcedures)
+			{
+				auto pAstdecl = pResdecl->pDecl->pAstdecl;
+				if (pAstdecl->pAstValue && pAstdecl->pAstValue->astk == ASTK_Procedure)
+					continue;
+			}
+
+			if (pResdeclFound)
+			{
+				// BB (adrianb) Print all candidates?
+				ShowErr(errinfo, "Ambiguous symbol lookup");
+			}
+
+			pResdeclFound = pResdecl;
+		}
 	}
+
+	if (pResdeclFound)
+		return pResdeclFound;
 
 	// BB (adrianb) Add or strip using rights when lookup up in parent scopes? For some scopes this might be fine.
 	//  Others maybe not.
 
 	if (pSymt->pSymtParent)
-		return PresdeclLookupSimple(pSymt->pSymtParent, pChzName, reslk);
+		return PresdeclLookup(pSymt->pSymtParent, pChzName, grfresl, errinfo);
 
 	return nullptr;
 }
 
-void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, SAstDeclareSingle * pAstdecl,
-					SDeclaration ** ppDeclRet = nullptr, const SArray<SDeclaration *> & arypDeclUsingPath = {})
+void AddResolveDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, SDeclaration * pDecl,
+							const SArray<SDeclaration *> & arypDeclUsingPath)
 {
-	// BB (adrianb) Check that we aren't doing this during type checking? Or if we do it's a using decl?
-	// BB (adrianb) Need to deal with overloading somehow.
+	auto pAstdecl = pDecl->pAstdecl;
+	ASSERT(pAstdecl);
+	auto pChzName = pAstdecl->pChzName;
 
-	if (PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing))
+	// BB (adrianb) Better error for multiple declarations, including using path.
+
+	GRFRESL grfresl = 0;
+	if (pAstdecl->pAstValue && pAstdecl->pAstValue->astk == ASTK_Procedure)
 	{
-		ShowErr((pAstdecl) ? pAstdecl->errinfo : SErrorInfo(), "Duplicate symbol found");
+		grfresl = FRESL_IgnoreProcedures;
 	}
 
-	auto pDecl = PtAlloc<SDeclaration>(&pWork->pagealloc);
-	pDecl->pChzName = pChzName;
-	pDecl->pAstdecl = pAstdecl;
-
-	if (ppDeclRet)
-		*ppDeclRet = pDecl;
+	if (SResolveDecl * pResdeclOrig = PresdeclLookup(pSymt, pChzName, grfresl, {}))
+	{
+		PrintErr(pAstdecl->errinfo, "Duplicate symbol found");
+		PrintErr(pResdeclOrig->pDecl->pAstdecl->errinfo, "Original symbol");
+		ExitErr();
+	}
 	
 	auto pResdecl = PtAlloc<SResolveDecl>(&pWork->pagealloc);
 	pResdecl->pDecl = pDecl;
@@ -5222,16 +5344,33 @@ void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzN
 	Append(&pSymt->arypResdecl, pResdecl);
 }
 
+void AddDeclaration(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, SAstDeclareSingle * pAstdecl,
+					SDeclaration ** ppDeclRet = nullptr, const SArray<SDeclaration *> & arypDeclUsingPath = {})
+{
+	ASSERT(pAstdecl);
+
+	auto pDecl = PtAlloc<SDeclaration>(&pWork->pagealloc);
+	pDecl->pChzName = pChzName;
+	pDecl->pAstdecl = pAstdecl;
+
+	if (ppDeclRet)
+		*ppDeclRet = pDecl;
+
+	AddResolveDeclaration(pWork, pSymt, pDecl, arypDeclUsingPath);
+}
+
 SSymbolTable * PsymtStructLookup(SWorkspace * pWork, STypeId tid);
 
 bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch * pTcswitch)
 {
+	// Finish importing using declarations before finishing this resolve, first parent then us
+
 	if (pSymt->pSymtParent)
 	{
 		if (!FTryResolveUsing(pWork, pSymt->pSymtParent, pTcswitch))
 			return false;
 	}
-		
+
 	for (; pSymt->ipResdeclUsing < pSymt->arypResdecl.c; ++pSymt->ipResdeclUsing)
 	{
 		auto pResdecl = pSymt->arypResdecl[pSymt->ipResdeclUsing];
@@ -5277,20 +5416,7 @@ bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch
 
 				apDeclUsing[cpDeclUsing - 1] = pResdecl->pDecl;
 
-				const char * pChzName = pResdeclUse->pDecl->pAstdecl->pChzName;
-				if (PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing))
-				{
-					// BB (adrianb) Need better error reporting info for both conflicting symbol paths?
-
-					auto pAstdeclRoot = apDeclUsing[0]->pAstdecl;
-					ShowErr(pAstdeclRoot->errinfo, "Duplicate symbol %s imported through using declaration", pChzName);
-				}
-
-				auto pResdeclUsing = PtAlloc<SResolveDecl>(&pWork->pagealloc);
-				pResdeclUsing->pDecl = pResdeclUse->pDecl;
-				pResdeclUsing->arypDeclUsingPath = { apDeclUsing, cpDeclUsing };
-				
-				Append(&pSymt->arypResdecl, pResdeclUsing);
+				AddResolveDeclaration(pWork, pSymt, pResdeclUse->pDecl, { apDeclUsing, cpDeclUsing });
 			}
 		}
 		else
@@ -5303,13 +5429,16 @@ bool FTryResolveUsing(SWorkspace * pWork, SSymbolTable * pSymt, STypeCheckSwitch
 }
 
 bool FTryResolveSymbolWithUsing(SWorkspace * pWork, SSymbolTable * pSymt, const char * pChzName, 
-								STypeCheckSwitch * pTcswitch, SResolveDecl ** ppResdecl)
+								const SErrorInfo & errinfo, STypeCheckSwitch * pTcswitch, 
+								SResolveDecl ** ppResdecl)
 {
 	// Resolve using declarations all the way up the chain
 	if (!FTryResolveUsing(pWork, pSymt, pTcswitch))
 		return false;
 
-	auto pResdecl = PresdeclLookupSimple(pSymt, pChzName, RESLK_WithUsing);
+	// BB (adrianb) Error on ambiguous symbol.
+
+	auto pResdecl = PresdeclLookup(pSymt, pChzName, 0, errinfo);
 	if (pResdecl && pResdecl->pDecl->pAstdecl->tid.pType == nullptr)
 	{
 		pTcswitch->pDecl = pResdecl->pDecl;
@@ -5319,6 +5448,227 @@ bool FTryResolveSymbolWithUsing(SWorkspace * pWork, SSymbolTable * pSymt, const 
 	*ppResdecl = pResdecl;
 	return true;
 }
+
+bool FCanCoerce(const SAst * pAst, const STypeId & tidTo);
+
+enum MATCHK
+{
+	MATCHK_Suspend,
+	MATCHK_None,
+	MATCHK_Coerce,
+	MATCHK_Exact,
+};
+
+MATCHK MatchkTryPolymorph(SWorkspace * pWork, SSymbolTable * pSymt, SAst * pAstType, STypeId tidArg, 
+						  bool fExtract, SArray<SPolyArg> * paryParg, STypeCheckSwitch * pTcswitch)
+{
+	// BB (adrianb) Declarations store the unwrapped type of their pAstType. Do we need to do something different for that here?
+	if (pAstType->tid.pType)
+		return (tidArg == TidUnwrap(pAstType->errinfo, pAstType->tid)) ? MATCHK_Exact : MATCHK_None;
+
+	switch (pAstType->astk)
+	{
+	case ASTK_TypePolymorphic:
+		{
+			if (!fExtract)
+				return MATCHK_Exact;
+
+			auto pAtpoly = PastCast<SAstTypePolymorphic>(pAstType);
+			for (int i = 0; i < paryParg->c; ++i)
+			{
+				if (strcmp((*paryParg)[i].pChz, pAtpoly->pChzName) == 0)
+				{
+					ShowErr(pAstType->errinfo, "Duplicate polymorphic parameter");
+				}
+			}
+			
+			*PtAppendNew(paryParg) = {pAtpoly->pChzName, tidArg, pAtpoly->errinfo};
+			return MATCHK_Exact;
+		}
+
+	case ASTK_Identifier:
+		{
+			// Won't know if we can match until the match is done
+			if (fExtract)
+				return MATCHK_Exact;
+
+			// See if this is one of our polymorphic types
+			auto pChz = PastCast<SAstIdentifier>(pAstType)->pChz;
+			for (int i = 0; i < paryParg->c; ++i)
+			{
+				if (strcmp((*paryParg)[i].pChz, pChz) == 0)
+					return (tidArg == (*paryParg)[i].tid) ? MATCHK_Exact : MATCHK_None;
+			}
+			
+			// Ensure the type for type stuff
+			SResolveDecl * pResdecl;
+			if (!FTryResolveSymbolWithUsing(pWork, pSymt, pChz, pAstType->errinfo, pTcswitch, &pResdecl))
+			{
+				// We have switched to resolving another declaration
+				ASSERT(pTcswitch->pDecl);
+				return MATCHK_Suspend;
+			}
+
+			pAstType->tid = pResdecl->pDecl->pAstdecl->tid;
+
+			STypeId tidValue = TidUnwrap(pAstType->errinfo, pAstType->tid);
+			return (tidArg == tidValue) ? MATCHK_Exact : MATCHK_None;
+		}
+
+	case ASTK_TypeArray:
+		{
+			if (tidArg.pType->typek != TYPEK_Array)
+				return MATCHK_None;
+
+			auto pTypearray = PtypeCast<STypeArray>(tidArg.pType);
+			auto pAstarray = PastCast<SAstTypeArray>(pAstType);
+
+			if (pAstarray->fSoa != pAstarray->fSoa)
+				return MATCHK_None;
+
+			// Simple array matches all other array arguments (either exact or coerce)
+			if (!pAstarray->fDynamicallySized && !pAstarray->pAstSize)
+			{
+				MATCHK matchk = MatchkTryPolymorph(pWork, pSymt, pAstarray->pAstTypeInner, pTypearray->tidElement, fExtract, paryParg, pTcswitch);
+				if (matchk != MATCHK_Exact)
+					return matchk;
+				
+				return (!pTypearray->fDynamicallySized && !pTypearray->cSizeFixed) ? MATCHK_Exact : MATCHK_Coerce;
+			}
+
+			// BB (adrianb) Support size matching in templates. Also polymorphic on size?
+			if (pAstarray->pAstSize)
+				return MATCHK_None;
+
+			// Dynamic size match is ok BB (adrianb) Don't really want to pass a dynamic array by value. Error check call sites?
+			if (pAstarray->fDynamicallySized != pAstarray->fDynamicallySized)
+				return MATCHK_None;
+
+			return MatchkTryPolymorph(pWork, pSymt, pAstarray->pAstTypeInner, pTypearray->tidElement, fExtract, paryParg, pTcswitch);
+		}
+
+	case ASTK_TypePointer:
+		{
+			if (tidArg.pType->typek != TYPEK_Pointer)
+				return MATCHK_None;
+
+			auto pTypeptr = PtypeCast<STypePointer>(tidArg.pType);
+			auto pAstptr = PastCast<SAstTypePointer>(pAstType);
+
+			if (pAstptr->fSoa != pAstptr->fSoa)
+				return MATCHK_None;
+
+			return MatchkTryPolymorph(pWork, pSymt, pAstptr->pAstTypeInner, pTypeptr->tidPointedTo, fExtract, paryParg, pTcswitch);
+		}
+
+	case ASTK_TypeProcedure:
+		{
+			if (tidArg.pType->typek != TYPEK_Procedure)
+				return MATCHK_None;
+			
+			auto pTypeproc = PtypeCast<STypeProcedure>(tidArg.pType);
+			auto pAtypeproc = PastCast<SAstTypeProcedure>(pAstType);
+
+			if (pTypeproc->cTidArg != pAtypeproc->arypAstDeclArg.c || pTypeproc->cTidRet != pAtypeproc->arypAstDeclRet.c)
+				return MATCHK_None;
+			
+			for (int i = 0; i < pTypeproc->cTidArg; ++i)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAtypeproc->arypAstDeclArg[i]);
+				MATCHK matchk = MatchkTryPolymorph(pWork, pSymt, pAstdecl->pAstType, pTypeproc->aTidArg[i], fExtract, paryParg, pTcswitch);
+				// BB (adrianb) Just return matchk? Requires never hitting coerce.
+				if (matchk == MATCHK_Suspend)
+					return MATCHK_Suspend;
+				if (matchk != MATCHK_Exact)
+					return MATCHK_None;
+			}
+
+			for (int i = 0; i < pTypeproc->cTidRet; ++i)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAtypeproc->arypAstDeclRet[i]);
+				MATCHK matchk = MatchkTryPolymorph(pWork, pSymt, pAstdecl->pAstType, pTypeproc->aTidRet[i], fExtract, paryParg, pTcswitch);
+				if (matchk == MATCHK_Suspend)
+					return MATCHK_Suspend;
+				if (matchk != MATCHK_Exact)
+					return MATCHK_None;
+			}
+
+			return MATCHK_Exact;
+		}
+
+	case ASTK_TypeVararg:
+		return (tidArg.pType->typek == TYPEK_Vararg) ? MATCHK_Exact : MATCHK_None;
+
+	default:
+		ASSERTCHZ(false, "Unrecognized ast %s", PchzFromAstk(pAstType->astk));
+		return MATCHK_None;
+	}	
+}
+
+MATCHK MatchkTryPolymorph(SWorkspace * pWork, SSymbolTable * pSymt, SAst * pAstType, const SAst * pAstArg, 
+						  bool fExtract, SArray<SPolyArg> * paryParg, STypeCheckSwitch * pTcswitch)
+{
+	// Use comparison for non-literals
+	STypeId tidArg = pAstArg->tid;
+	if (tidArg.pType)
+		return MatchkTryPolymorph(pWork, pSymt, pAstType, tidArg, fExtract, paryParg, pTcswitch);
+
+	// For literals, run simple heuritics
+	switch (pAstType->astk)
+	{
+	case ASTK_TypePointer:
+		{
+			if (!FHasPolymorphicType(PastCast<SAstTypePointer>(pAstType)->pAstTypeInner))
+				return MATCHK_None;
+			else
+				return MATCHK_Coerce;
+		}
+
+	case ASTK_Identifier:
+		{
+			if (pAstType->tid.pType)
+				return FCanCoerce(pAstArg, TidUnwrap(pAstType->errinfo, pAstType->tid)) ? MATCHK_Exact : MATCHK_None;
+
+			// BB (adrianb) Care about duplication here?
+			// Won't know if we can match until the match is done
+			if (fExtract)
+				return MATCHK_Exact;
+
+			// See if this is one of our polymorphic types
+			auto pChz = PastCast<SAstIdentifier>(pAstType)->pChz;
+			for (int i = 0; i < paryParg->c; ++i)
+			{
+				if (strcmp((*paryParg)[i].pChz, pChz) == 0)
+					return FCanCoerce(pAstArg, (*paryParg)[i].tid) ? MATCHK_Exact : MATCHK_None;
+			}
+			
+			// Lookup the identifier so we can actually 
+			SResolveDecl * pResdecl;
+			if (!FTryResolveSymbolWithUsing(pWork, pSymt, pChz, pAstType->errinfo, pTcswitch, &pResdecl))
+			{
+				// We have switched to resolving another declaration
+				ASSERT(pTcswitch->pDecl);
+				return MATCHK_Suspend;
+			}
+
+			pAstType->tid = pResdecl->pDecl->pAstdecl->tid;
+			STypeId tidValue = TidUnwrap(pAstType->errinfo, pAstType->tid);
+			return FCanCoerce(pAstArg, tidValue) ? MATCHK_Exact : MATCHK_None;
+		}
+
+	default:
+		return MATCHK_None;
+	}
+}
+
+struct SRecurseCtx // tag = recx
+{
+	SWorkspace * pWork;
+	SArray<STypeRecurse> * paryTrec;
+	SSymbolTable * pSymtParent;
+
+	SArray<SPolyArg> * paryParg;		// Indicates that we need to duplicate and reparametrize entire AST
+};
 
 SSymbolTable * PsymtCreate(SYMTBLK symtblk, SWorkspace * pWork, SSymbolTable * pSymtParent)
 {
@@ -5347,14 +5697,6 @@ void RegisterStruct(SWorkspace * pWork, STypeId tid, SSymbolTable * pSymt)
 
 	auto pTypestruct = const_cast<STypeStruct *>(Ptypestruct(tid.pType));
 	Append(&pWork->arypTypestruct, pTypestruct);
-
-#if 0
-	if (strcmp(pTypestruct->pChzName, "_StringStruct") == 0)
-	{
-		ASSERT(pWork->pTypestructString == nullptr);
-		pWork->pTypestructString = pTypestruct;
-	}
-#endif
 }
 
 STypeId TidWrap(SWorkspace * pWork, const STypeId & tid)
@@ -5362,11 +5704,11 @@ STypeId TidWrap(SWorkspace * pWork, const STypeId & tid)
 	if (tid.pType->typek == TYPEK_TypeOf)
 		return tid;
 
-	STypeTypeOf typeof;
-	typeof.typek = TYPEK_TypeOf;
-	typeof.tid = tid;
+	STypeTypeOf ttypeof = {};
+	ttypeof.typek = TYPEK_TypeOf;
+	ttypeof.tid = tid;
 
-	return TidEnsure(pWork, &typeof);
+	return TidEnsure(pWork, &ttypeof);
 }
 
 STypeId TidPointer(SWorkspace * pWork, STypeId tid)
@@ -5378,16 +5720,22 @@ STypeId TidPointer(SWorkspace * pWork, STypeId tid)
 	return TidEnsure(pWork, &typeptr);
 }
 
+SAstDeclareSingle * PastdeclCreateTyped(SWorkspace * pWork, const char * pChzName, STypeId tid)
+{
+	auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo());
+	pAstdecl->pChzName = pChzName;
+	pAstdecl->tid = tid;
+	// BB (adrianb) No type/value ast? Ok?
+
+	return pAstdecl;
+}
+
 void AddBuiltinType(SWorkspace * pWork, const char * pChzName, const SType & typeIn, STypeId * pTid = nullptr)
 {
 	STypeId tid = TidEnsure(pWork, typeIn);
 	STypeId tidType = TidWrap(pWork, tid);
 
-	auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo());
-	pAstdecl->pChzName = pChzName;
-	pAstdecl->tid = tidType;
-	// BB (adrianb) No type/value ast? Ok?
-
+	auto pAstdecl = PastdeclCreateTyped(pWork, pChzName, tidType);
 	auto pSymt = &pWork->symtBuiltin;
 	AddDeclaration(pWork, pSymt, pChzName, pAstdecl);
 
@@ -5430,7 +5778,7 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 	AddBuiltinType(pWork, "bool", SType{TYPEK_Bool}, &pWork->tidBool);
 
 	AddBuiltinType(pWork, "s64", SType{TYPEK_S64}, &pWork->tidS64);
-	AddBuiltinType(pWork, "u64", SType{TYPEK_U64});
+	AddBuiltinType(pWork, "u64", SType{TYPEK_U64}, &pWork->tidU64);
 	AddBuiltinType(pWork, "s32", SType{TYPEK_S32}, &pWork->tidS32);
 	AddBuiltinType(pWork, "u32", SType{TYPEK_U32}, &pWork->tidU32);
 	AddBuiltinType(pWork, "s16", SType{TYPEK_S16}, &pWork->tidS16);
@@ -5456,16 +5804,10 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 		pTypestructString->cMember = 2;
 		pTypestructString->cMemberMax = 2;
 
-		auto pAstdeclPch = PastCreate<SAstDeclareSingle>(pWork, {});
-		pAstdeclPch->pChzName = "pCh";
-		pAstdeclPch->tid = TidPointer(pWork, pWork->tidU8);
-		
+		auto pAstdeclPch = PastdeclCreateTyped(pWork, "pCh", TidPointer(pWork, pWork->tidU8));
 		AddDeclaration(pWork, pSymtString, "pCh", pAstdeclPch);
 
-		auto pAstdeclCch = PastCreate<SAstDeclareSingle>(pWork, {});
-		pAstdeclCch->pChzName = "cCh";
-		pAstdeclCch->tid = pWork->tidU32; // BB (adrianb) Use u64? More than 4 GiB?
-
+		auto pAstdeclCch = PastdeclCreateTyped(pWork, "cCh", pWork->tidU32); // BB (adrianb) Use u64? More than 4 GiB?
 		AddDeclaration(pWork, pSymtString, "cCh", pAstdeclCch);
 
 		pTypestructString->aMember[0].pAstdecl = pAstdeclPch;
@@ -5481,17 +5823,6 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 	}
 
 	//AddBuiltinType(pWork, "Any", SType{TYPEK_Any});
-
-#if 0
-	if (grfwinit & FWINIT_IncludeBuiltinModule)
-	{
-		SModule * pModule = PtAppendNew(&pWork->aryModule);
-		pModule->pChzFile = "builtin-code";
-		pModule->pChzContents = 
-		"_StringStruct :: struct { pCh : *u8; cCh : s64; };\n";
-		pModule->fBuiltIn = true;
-	}
-#endif
 }
 
 void Destroy(SWorkspace * pWork)
@@ -5499,6 +5830,8 @@ void Destroy(SWorkspace * pWork)
 	// BB (adrianb) Almost all of this junk is to deal with dynamically sized arrays.
 	//  If the arrays could somehow be statically sized (or chunked) we could just allocate
 	//  them out of page memory and clear only that.
+	//  Or just implement a real heap and use that and free the heap directly!
+	//  E.g. https://gist.github.com/pervognsen/16f682a59262e6b21d932469c1b13648
 
 	for (auto pAst : pWork->arypAstAll)
 	{
@@ -5508,6 +5841,17 @@ void Destroy(SWorkspace * pWork)
 
 	for (auto pSymt : pWork->arypSymtAll)
 	{
+		for (auto * pPolyproc : IterPointer(pSymt->aryPolyproc))
+		{
+			for (auto * pSpecproc : IterPointer(pPolyproc->arySpecproc))
+			{
+				Destroy(&pSpecproc->aryParg);
+				Destroy(&pSpecproc->pResdecl->pDecl->aryTrec);
+			}
+			Destroy(&pPolyproc->arySpecproc);
+		}
+		Destroy(&pSymt->aryPolyproc);
+
 		for (auto pResdecl : pSymt->arypResdecl)
 		{
 			Destroy(&pResdecl->pDecl->aryTrec);
@@ -5524,7 +5868,7 @@ void Destroy(SWorkspace * pWork)
 			free(const_cast<char *>(pModule->pChzContents));
 		pModule->pChzContents = nullptr;
 
-		Destroy(&pModule->arypAstproc);
+		Destroy(&pModule->arypAstprocGen);
 	}
 	Destroy(&pWork->aryModule);
 
@@ -5545,14 +5889,6 @@ void Destroy(SWorkspace * pWork)
 
 // BB (adrianb) Make the compiler/parser a global?
 
-struct SRecurseCtx // tag = recx
-{
-	SWorkspace * pWork;
-	SModule * pModule;
-	SArray<STypeRecurse> * paryTrec;
-	SSymbolTable * pSymtParent;
-};
-
 SRecurseCtx RecxNewScope(const SRecurseCtx & recx)
 {
 	auto pSymt = PsymtCreate(SYMTBLK_Scope, recx.pWork, recx.pSymtParent);
@@ -5571,6 +5907,46 @@ void AppendAst(const SRecurseCtx & recx, SAst ** ppAst)
 	pTrec->pSymtParent = recx.pSymtParent;
 }
 
+template <class T, class TOther>
+T * PastPrepare(const SRecurseCtx & recx, TOther ** ppAst)
+{
+	// Either cast, or create a new copy and overwrite
+
+	if (!recx.paryParg)
+		return PastCast<T>(*ppAst);
+
+	T * pT = PastCreateManual<T>(recx.pWork, (*ppAst)->astk, (*ppAst)->errinfo);
+	*pT = *PastCast<T>(*ppAst);
+	*ppAst = pT;
+	return pT;
+}
+
+template<>
+SAst * PastPrepare<SAst, SAst>(const SRecurseCtx & recx, SAst ** ppAst)
+{
+	// Either cast, or create a new copy and overwrite
+
+	if (!recx.paryParg)
+		return *ppAst;
+
+	SAst * pAst = PastCreateManual<SAst>(recx.pWork, (*ppAst)->astk, (*ppAst)->errinfo);
+	*ppAst = pAst;
+	return pAst;
+}
+
+template <class T>
+void Prepare(const SRecurseCtx & recx, SArray<T> * paryT)
+{
+	if (!recx.paryParg)
+		return;
+
+	SArray<T> aryTOld = *paryT;
+	*paryT = {};
+	T * aT = PtAppendNew(paryT, aryTOld.c);
+	for (int i = 0; i < aryTOld.c; ++i)
+		aT[i] = aryTOld[i];
+}
+
 // Register and recurse or just recurse
 
 void RecurseTypeCheck(const SRecurseCtx & recxIn, SAst ** ppAst);
@@ -5581,6 +5957,33 @@ void RecurseProcArgRet(SRecurseCtx * pRecxProc, SAstProcedure * pAstproc)
 	pSymtProc->pAstproc = pAstproc;
 	pRecxProc->pSymtParent = pSymtProc;
 
+	// If we're specializing a polymorphic procedure, define the type (should allow arg type to be resolved)
+
+	if (pRecxProc->paryParg)
+	{
+		for (const auto & parg : *pRecxProc->paryParg)
+		{
+			auto pAstident = PastCreateManual<SAstIdentifier>(pRecxProc->pWork, ASTK_Identifier, parg.errinfo);
+			auto pAstdecl = PastCreateManual<SAstDeclareSingle>(pRecxProc->pWork, ASTK_DeclareSingle, parg.errinfo);
+			pAstdecl->pAstValue = pAstident;
+
+			STypeId tidTypeOfArg = TidWrap(pRecxProc->pWork, parg.tid);
+
+			pAstident->pChz = parg.pChz;
+			pAstdecl->pChzName = parg.pChz;
+			pAstident->tid = tidTypeOfArg;
+			pAstdecl->tid = tidTypeOfArg;
+
+			SDeclaration * pDecl;
+			AddDeclaration(pRecxProc->pWork, pRecxProc->pSymtParent, parg.pChz, pAstdecl, &pDecl);
+
+			//recx.paryTrec = &pDecl->aryTrec; // BB (adrianb) Don't need this since we're short circuiting recursion for this declaration right?
+		}
+	}
+
+	// Recurse to arguments and return values first
+
+	Prepare(*pRecxProc, &pAstproc->arypAstDeclArg);
 	for (SAst ** ppAstDecl : IterPointer(pAstproc->arypAstDeclArg))
 	{
 		RecurseTypeCheck(*pRecxProc, ppAstDecl);
@@ -5588,13 +5991,14 @@ void RecurseProcArgRet(SRecurseCtx * pRecxProc, SAstProcedure * pAstproc)
 
 	// BB (adrianb) Need to make sure return values cannot have names? or their names are ignored?
 
-	for (SAst * pAst : pAstproc->arypAstDeclRet)
+	Prepare(*pRecxProc, &pAstproc->arypAstDeclRet);
+	for (SAst ** ppAst : IterPointer(pAstproc->arypAstDeclRet))
 	{
-		auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
+		auto pAstdecl = PastPrepare<SAstDeclareSingle>(*pRecxProc, ppAst);
 		ASSERT(pAstdecl->pAstType && pAstdecl->pAstValue == nullptr);
 
 		// Purposely not type checking value or declaration as whole to avoid registering it.
-		// BB (adrianb) Keep only the type after parsing? We don't need anything afaik.
+		// BB (adrianb) Keep only the type after parsing? We don't need anything else afaik.
 		
 		RecurseTypeCheck(*pRecxProc, &pAstdecl->pAstType);
 	}
@@ -5602,14 +6006,27 @@ void RecurseProcArgRet(SRecurseCtx * pRecxProc, SAstProcedure * pAstproc)
 
 void RecurseTypeCheckDecl(const SRecurseCtx & recxIn, SAst ** ppAst)
 {
-	SAst * pAst = *ppAst;
-
-	switch (pAst->astk)
+	switch ((*ppAst)->astk)
 	{
 	case ASTK_DeclareSingle:
 		{
-			auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
+			auto pAstdecl = PastPrepare<SAstDeclareSingle>(recxIn, ppAst);
 			SRecurseCtx recx = recxIn;
+
+			// Polymorphic functions don't participate in type checking until we've resolved their types
+			//  Then it needs to do this whole process in the middle of type checking (minus the symbol registration
+			//  as that goes through a different table).
+
+			if (pAstdecl->fIsConstant && pAstdecl->pAstValue && pAstdecl->pAstValue->astk == ASTK_Procedure)
+			{
+				auto pAstproc = PastCast<SAstProcedure>(pAstdecl->pAstValue);
+				if (pAstproc->fIsPolymorphic)
+				{
+					ASSERT(!recxIn.paryParg);
+					Append(&recx.pSymtParent->aryPolyproc, SPolymorphicProc{pAstdecl});
+					break;
+				}
+			}
 
 			// Register for out-of-order when a constant, top level, or in a struct.
 
@@ -5632,10 +6049,13 @@ void RecurseTypeCheckDecl(const SRecurseCtx & recxIn, SAst ** ppAst)
 			{
 				if (pAstdecl->pAstValue->astk == ASTK_Procedure)
 				{
+					if (!pAstdecl->fIsConstant)
+						ShowErr(pAstdecl->errinfo, "Cannot have non constant polymorphic procedure");
+
 					// Recurse differently for procedures to support recursion
 					//  Type check: arg/ret, proc, declaration, body
 
-					auto pAstproc = PastCast<SAstProcedure>(pAstdecl->pAstValue);
+					auto pAstproc = PastPrepare<SAstProcedure>(recx, &pAstdecl->pAstValue);
 					SRecurseCtx recxProc = recx;
 					RecurseProcArgRet(&recxProc, pAstproc);
 					AppendAst(recx, &pAstdecl->pAstValue);
@@ -5658,15 +6078,17 @@ void RecurseTypeCheckDecl(const SRecurseCtx & recxIn, SAst ** ppAst)
 		break;
 
 	case ASTK_EmptyStatement:
+		(void) PastPrepare<SAst>(recxIn, ppAst);
 		break;
 			
 	case ASTK_ImportDirective:
+		(void) PastPrepare<SAstImportDirective>(recxIn, ppAst);
 		if (recxIn.pSymtParent->symtblk == SYMTBLK_TopLevel)
 			break;
 		// Intentional fallthrough...
 
 	default:
-		ShowErr(pAst->errinfo, "Non-declaration cannot be handled in this scope");
+		ShowErr((*ppAst)->errinfo, "Non-declaration cannot be handled in this scope");
 		break;
 	}
 }
@@ -5677,34 +6099,44 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 	//  And the node just knows which is which if it needs to do anything? We could almost
 	//  get rid of this function if so. Still need to specify where to create new scopes
 
-	SAst * pAst = *ppAst;
+	SAst * pAstOld = *ppAst;
 
-	switch (pAst->astk)
+	switch (pAstOld->astk)
 	{
 	// BB (adrianb) These should remain literals until usage coercion.
 	case ASTK_Literal:
+		(void) PastPrepare<SAstLiteral>(recx, ppAst);
+		break;
+
 	case ASTK_Null:
+		(void) PastPrepare<SAst>(recx, ppAst);
 		break;
 
 	case ASTK_UninitializedValue:
-		return;
+		(void) PastPrepare<SAst>(recx, ppAst);
+		return; // Return doesn't typecheck the value here
 	
 	case ASTK_Block:
 		{
 			SRecurseCtx recxInner = RecxNewScope(recx);
-			auto pAstblock = PastCast<SAstBlock>(pAst);
+			auto pAstblock = PastPrepare<SAstBlock>(recxInner, ppAst);
+			Prepare(recxInner, &pAstblock->arypAst);
 			for (int ipAst : IterCount(pAstblock->arypAst.c))
 				RecurseTypeCheck(recxInner, &pAstblock->arypAst[ipAst]);
 		}
 		break;
 
 	case ASTK_EmptyStatement:
+		(void) PastPrepare<SAst>(recx, ppAst);
+		break;
+
 	case ASTK_Identifier:
+		(void) PastPrepare<SAstIdentifier>(recx, ppAst);
 		break;
 
 	case ASTK_Operator:
 		{
-			auto pAstop = PastCast<SAstOperator>(pAst);
+			auto pAstop = PastPrepare<SAstOperator>(recx, ppAst);
 
 			if (pAstop->pAstLeft)
 				RecurseTypeCheck(recx, &pAstop->pAstLeft);
@@ -5715,12 +6147,16 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 			{
 				RecurseTypeCheck(recx, &pAstop->pAstRight);
 			}
+			else
+			{
+				(void) PastPrepare<SAstIdentifier>(recx, &pAstop->pAstRight);
+			}
 		}
 		break;
 
 	case ASTK_If:
 		{
-			auto pAstif = PastCast<SAstIf>(pAst);
+			auto pAstif = PastPrepare<SAstIf>(recx, ppAst);
 			RecurseTypeCheck(recx, &pAstif->pAstCondition);
 			RecurseTypeCheck(RecxNewScope(recx), &pAstif->pAstPass);
 			if (pAstif->pAstElse)
@@ -5730,7 +6166,7 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 
 	case ASTK_While:
 		{
-			auto pAstwhile = PastCast<SAstWhile>(pAst);
+			auto pAstwhile = PastPrepare<SAstWhile>(recx, ppAst);
 			RecurseTypeCheck(recx, &pAstwhile->pAstCondition);
 
 			SRecurseCtx recxWhile = RecxNewScope(recx);
@@ -5745,59 +6181,79 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 			// { it/name : type; goto check; incr; if (!check) jump end; block; goto incr; end }
 
 			SRecurseCtx recxFor = RecxNewScope(recx);
-			auto pAstfor = PastCast<SAstFor>(pAst);
+			auto pAstfor = PastPrepare<SAstFor>(recxFor, ppAst);
 			// NOTE (adrianb) pAstIter is just a identifier which absorbs the type on the right or so
 			RecurseTypeCheck(recx, &pAstfor->pAstIterRight);
 			AppendAst(recxFor, ppAst); // Type check for and iterator names and such.
 
 			SRecurseCtx recxLoop = RecxNewScope(recxFor);
 			RecurseTypeCheck(recxLoop, &pAstfor->pAstLoop);
-			return;
+			return; // BB (adrianb) Why return here?
 		}
 
 	case ASTK_LoopControl:
+		(void) PastPrepare<SAstLoopControl>(recx, ppAst);
 		break;
 
 	case ASTK_Using:
 		ASSERT(false);
+		(void) PastPrepare<SAstUsing>(recx, ppAst);
 		// BB (adrianb) Should be processed up front with constant declarations?
 		return;
 		
 	case ASTK_Cast:
 		{
-			auto pAstcast = PastCast<SAstCast>(pAst);
+			auto pAstcast = PastPrepare<SAstCast>(recx, ppAst);
 			RecurseTypeCheck(recx, &pAstcast->pAstType);
 			RecurseTypeCheck(recx, &pAstcast->pAstExpr);
 		}
 		break;
 
 	case ASTK_New:
-		RecurseTypeCheck(recx, &PastCast<SAstNew>(pAst)->pAstType);
+		{
+			auto pAstnew = PastPrepare<SAstNew>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstnew->pAstType);
+		}
 		break;
 
 	case ASTK_Delete:
-		RecurseTypeCheck(recx, &PastCast<SAstDelete>(pAst)->pAstExpr);
+		{
+			auto pAstdelete = PastPrepare<SAstDelete>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstdelete->pAstExpr);
+		}
 		break;
 
 	case ASTK_Remove:
-		RecurseTypeCheck(recx, &PastCast<SAstRemove>(pAst)->pAstExpr);
+		{
+			auto pAstremove = PastPrepare<SAstRemove>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstremove->pAstExpr);
+		}
 		break;
 
 	case ASTK_Defer:
-		RecurseTypeCheck(recx, &PastCast<SAstDefer>(pAst)->pAstStmt);
+		{
+			auto pAstdefer = PastPrepare<SAstDefer>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstdefer->pAstStmt);
+		}
 		break;
 	
 	case ASTK_Inline:
-		RecurseTypeCheck(recx, &PastCast<SAstInline>(pAst)->pAstExpr);
+		{
+			auto pAstinline = PastPrepare<SAstInline>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstinline->pAstExpr);
+		}
 		break;
 	
 	case ASTK_PushContext:
-		RecurseTypeCheck(RecxNewScope(recx), reinterpret_cast<SAst **>(&PastCast<SAstPushContext>(pAst)->pAstblock));
+		{
+			auto pAstpush = PastPrepare<SAstPushContext>(recx, ppAst);
+			RecurseTypeCheck(recx, reinterpret_cast<SAst **>(&pAstpush->pAstblock));
+		}
 		break;
 
 	case ASTK_ArrayIndex:
 		{
-			auto pAstarrayindex = PastCast<SAstArrayIndex>(pAst);
+			auto pAstarrayindex = PastPrepare<SAstArrayIndex>(recx, ppAst);
 			RecurseTypeCheck(recx, &pAstarrayindex->pAstArray);
 			RecurseTypeCheck(recx, &pAstarrayindex->pAstIndex);
 		}
@@ -5805,8 +6261,15 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 	
 	case ASTK_Call:
 		{
-			auto pAstcall = PastCast<SAstCall>(pAst);
-			RecurseTypeCheck(recx, &pAstcall->pAstFunc);
+			auto pAstcall = PastPrepare<SAstCall>(recx, ppAst);
+			
+			// Note, we manually recurse on overloading cases in TypeCheck for call
+			if (pAstcall->pAstFunc->astk != ASTK_Identifier)
+				RecurseTypeCheck(recx, &pAstcall->pAstFunc);
+			else
+				(void) PastPrepare<SAstIdentifier>(recx, &pAstcall->pAstFunc);
+
+			Prepare(recx, &pAstcall->arypAstArgs);
 			for (int ipAst : IterCount(pAstcall->arypAstArgs.c))
 				RecurseTypeCheck(recx, &pAstcall->arypAstArgs[ipAst]);
 		}
@@ -5814,7 +6277,8 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 	
 	case ASTK_Return:
 		{
-			auto pAstret = PastCast<SAstReturn>(pAst);
+			auto pAstret = PastPrepare<SAstReturn>(recx, ppAst);
+			Prepare(recx, &pAstret->arypAstRet);
 			for (int ipAst : IterCount(pAstret->arypAstRet.c))
 				RecurseTypeCheck(recx, &pAstret->arypAstRet[ipAst]);
 		}
@@ -5836,7 +6300,7 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 
 	case ASTK_Struct:
 		{
-			auto pAststruct = PastCast<SAstStruct>(pAst);
+			auto pAststruct = PastPrepare<SAstStruct>(recx, ppAst);
 
 			SRecurseCtx recxStruct = recx;
 
@@ -5849,6 +6313,7 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 			
 			AppendAst(recxStruct, ppAst);
 
+			Prepare(recx, &pAststruct->arypAstDecl);
 			for (SAst ** ppAstDecl : IterPointer(pAststruct->arypAstDecl))
 			{
 				RecurseTypeCheck(recxStruct, ppAstDecl);
@@ -5863,29 +6328,8 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 
 	case ASTK_Procedure:
 		{
-			auto pAstproc = PastCast<SAstProcedure>(pAst);
-
-			// BB (adrianb) Check for any polymorphic-ness and store off for type matching and then type checking after.
-
-			// BB (adrianb) Assumed to be constant for the moment. Lambdas will need to do similar work.
-
-			SRecurseCtx recxProc = recx;
-
-			RecurseProcArgRet(&recxProc, pAstproc);
-
-			// Actually typecheck the function in the passed in context, this will set the type and register
-			//  arguments in the procedure symbol table.
-
-			AppendAst(recx, ppAst);
-
-			// Typecheck the body with its own non-reordering symbol table
-
-			if (pAstproc->pAstblock)
-			{
-				// This will always add a scope which we rely on.
-
-				RecurseTypeCheck(recxProc, reinterpret_cast<SAst **>(&pAstproc->pAstblock));
-			}
+			// We pull procedures out separately...
+			ASSERT(false);
 		}
 		return;
 
@@ -5895,12 +6339,15 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 #endif
 
 	case ASTK_TypePointer:
-		RecurseTypeCheck(recx, &PastCast<SAstTypePointer>(pAst)->pAstTypeInner);
+		{
+			auto pAstptr = PastPrepare<SAstTypePointer>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstptr->pAstTypeInner);
+		}
 		break;
 
 	case ASTK_TypeArray:
 		{
-			auto pAtypearray = PastCast<SAstTypeArray>(pAst);
+			auto pAtypearray = PastPrepare<SAstTypeArray>(recx, ppAst);
 			RecurseTypeCheck(recx, &pAtypearray->pAstTypeInner);
 			if (pAtypearray->pAstSize)
 				RecurseTypeCheck(recx, &pAtypearray->pAstSize);
@@ -5909,69 +6356,351 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 
 	case ASTK_TypeProcedure:
 		{
-			auto pAtypeproc = PastCast<SAstTypeProcedure>(pAst);
+			auto pAtypeproc = PastPrepare<SAstTypeProcedure>(recx, ppAst);
 
-			for (SAst * pAst : pAtypeproc->arypAstDeclArg)
+			Prepare(recx, &pAtypeproc->arypAstDeclArg);
+			for (SAst ** ppAstArg : IterPointer(pAtypeproc->arypAstDeclArg))
 			{
 				// Purposely not type checking value or declaration as whole to avoid registering it.
 				// BB (adrianb) Keep only the type after parsing? We don't need anything afaik.
 
 				// BB (adrianb) Does type need to carry default value?
-				
-				RecurseTypeCheck(recx, &PastCast<SAstDeclareSingle>(pAst)->pAstType);
+
+				auto pAstdecl = PastPrepare<SAstDeclareSingle>(recx, ppAstArg);
+				ASSERT(!pAstdecl->pAstValue);
+				RecurseTypeCheck(recx, &pAstdecl->pAstType);
 			}
 
-			for (SAst * pAst : pAtypeproc->arypAstDeclRet)
+			Prepare(recx, &pAtypeproc->arypAstDeclRet);
+			for (SAst ** ppAstRet : IterPointer(pAtypeproc->arypAstDeclRet))
 			{
 				// Purposely not type checking value or declaration as whole to avoid registering it.
 				// BB (adrianb) Keep only the type after parsing? We don't need anything afaik.
-				
-				RecurseTypeCheck(recx, &PastCast<SAstDeclareSingle>(pAst)->pAstType);
+
+				auto pAstdecl = PastPrepare<SAstDeclareSingle>(recx, ppAstRet);
+				ASSERT(!pAstdecl->pAstValue);
+				RecurseTypeCheck(recx, &pAstdecl->pAstType);
 			}
 		}
 		break;
 
 	case ASTK_TypePolymorphic:
-		ASSERT(false);
+		{
+			// The only time we typecheck a polymorphic node is when we're specializing.
+			//  Replace it with an identifier which should find the declaration added in RecurseProcArgRet
+
+			ASSERT(recx.paryParg);
+
+			auto pAstpoly = PastCast<SAstTypePolymorphic>(*ppAst);
+			auto pAstident = PastCreateManual<SAstIdentifier>(recx.pWork, ASTK_Identifier, (*ppAst)->errinfo);
+			pAstident->pChz = pAstpoly->pChzName;
+			*ppAst = pAstident;
+		}
 		break;
 
 	case ASTK_TypeVararg:
+		(void) PastPrepare<SAst>(recx, ppAst);
 		break;
 
 	case ASTK_ImportDirective:
+		(void) PastPrepare<SAstImportDirective>(recx, ppAst);
 		return;
 
 	case ASTK_RunDirective:
-		RecurseTypeCheck(recx, &PastCast<SAstRunDirective>(pAst)->pAstExpr);
+		{
+			auto pAstrun = PastPrepare<SAstRunDirective>(recx, ppAst);
+			RecurseTypeCheck(recx, &pAstrun->pAstExpr);
+		}
 		break;
 
-	// ASTK_ForeignLibraryDirective
-
+	case ASTK_DeclareMulti:
+	case ASTK_AssignMulti:
+	case ASTK_TypeDefinition:
+	case ASTK_ForeignLibraryDirective:
+	case ASTK_Invalid:
+	case ASTK_Max:
+#if 0
 	default:
-		ASSERTCHZ(false, "Unhandled typecheck ast %s(%d)", PchzFromAstk(pAst->astk), pAst->astk);
+#endif
+		ASSERTCHZ(false, "Unhandled typecheck ast %s(%d)", PchzFromAstk((*ppAst)->astk), (*ppAst)->astk);
 		break;
 	}
+
+	ASSERT(recx.paryParg == nullptr || pAstOld != *ppAst);
 
 	AppendAst(recx, ppAst);
 }
 
-STypeId TidUnwrap(const SErrorInfo & errinfo, STypeId tid)
+MATCHK MatchkTryResolveOverloadWithUsing(SWorkspace * pWork, SSymbolTable * pSymtStart, SAstCall * pAstcall, 
+										 STypeCheckSwitch * pTcswitch, SResolveDecl ** ppResdecl)
 {
-	if (tid.pType->typek != TYPEK_TypeOf)
+	auto pAstident = PastCast<SAstIdentifier>(pAstcall->pAstFunc);
+	const char * pChzName = pAstident->pChz;
+
+	// Resolve using declarations all the way up the chain
+
+	if (!FTryResolveUsing(pWork, pSymtStart, pTcswitch))
+		return MATCHK_Suspend;
+
+	SFixArray<SResolveDecl *, 8> arypResdeclMatch = {};
+	MATCHK matchkBest = MATCHK_None;
+	for (auto pSymtCur = pSymtStart; pSymtCur; pSymtCur = pSymtCur->pSymtParent)
 	{
-		ShowErr(errinfo, "Cannot point to instance of type");
+		for (auto pResdecl : pSymtCur->arypResdecl)
+		{
+			if (strcmp(pResdecl->pDecl->pChzName, pChzName) != 0)
+				continue;
+
+			// Make sure type of declaration is determined first
+			auto pAstdecl = pResdecl->pDecl->pAstdecl;
+			STypeId tidProc = pAstdecl->tid;
+			if (tidProc.pType == nullptr)
+			{
+				pTcswitch->pDecl = pResdecl->pDecl;
+				return MATCHK_Suspend;
+			}
+
+			if (tidProc.pType->typek != TYPEK_Procedure)
+			{
+				ShowErr(pAstcall->errinfo, "Cannot call non-procedure");
+				break;
+			}
+
+			// See if this is a better match for arguments
+
+			MATCHK matchk = MATCHK_None;
+			if (!pAstdecl->fIsConstant)
+			{
+				// BB (adrianb) Pointer to function. Still look at parameters for overload? Somehow?
+				//  Or just disallow any other match?
+				matchk = MATCHK_Exact;
+			}
+			else
+			{
+				auto pTypeproc = PtypeCast<STypeProcedure>(tidProc.pType);
+				if (pTypeproc->cTidArg != pAstcall->arypAstArgs.c)
+				{
+					if (!pTypeproc->fUsesCVararg || pTypeproc->cTidArg > pAstcall->arypAstArgs.c)
+						continue;
+				}
+
+				matchk = MATCHK_Exact;
+				for (int iArg : IterCount(pTypeproc->cTidArg))
+				{
+					auto pAstArg = pAstcall->arypAstArgs[iArg];
+					auto tidExpected = pTypeproc->aTidArg[iArg];
+					if (pAstArg->tid == tidExpected)
+						continue;
+
+					// BB (adrianb) to do this for literals we need to choose those closest.
+					//  This implies a better match function.
+
+					if (!FCanCoerce(pAstArg, tidExpected))
+					{
+						matchk = MATCHK_None;
+						break;
+					}
+
+					matchk = MATCHK_Coerce; // Implicit?
+				}
+			}
+
+			if (matchk < matchkBest)
+				continue;
+			
+			// BB (adrianb) Disambiguate multiple implicit matches? E.g. compare scores.
+
+			if (matchk > matchkBest)
+				arypResdeclMatch.c = 0;
+
+			// BB (adrianb) Provide an expansion mechanism so we can show all possibilities.
+
+			if (!FIsFull(&arypResdeclMatch))
+				Append(&arypResdeclMatch, pResdecl);
+
+			matchkBest = matchk;
+		}
+
+		// Try matching any 
+
+		if (matchkBest == MATCHK_None)
+		{
+			// BB (adrianb) Provide stack allocation instead/addition. Would need to alloc in those cases when we pull into a specialization.
+
+			SArray<SPolyArg> aryParg = {};
+			defer { Destroy(&aryParg); };
+
+			for (auto * pPolyproc : IterPointer(pSymtCur->aryPolyproc))
+			{
+				// Reset array
+
+				aryParg.c = 0;
+
+				// BB (adrianb) Use interred strings for faster compare?
+				auto * pAstdeclOrig = pPolyproc->pAstdeclProcOrig;
+				if (strcmp(pAstdeclOrig->pChzName, pChzName) != 0)
+					continue;
+				
+				// Match arguments and figure out inferred types
+				// BB (adrianb) Support varargs here? Need to look at args list to determine var arg presence.
+
+				// BB (adrianb) In all these continue cases, we should be appending if best match is none.
+				//  We don't currently have a SResolveDecl yet.
+
+				auto pAstprocPoly = PastCast<SAstProcedure>(pAstdeclOrig->pAstValue);
+				if (pAstprocPoly->arypAstDeclArg.c != pAstcall->arypAstArgs.c)
+					continue;
+
+				bool fMatches = true;
+
+				for (int i = 0; i < pAstcall->arypAstArgs.c; ++i)
+				{
+					auto pAstdeclArg = PastCast<SAstDeclareSingle>(pAstprocPoly->arypAstDeclArg[i]);
+					// BB (adrianb) Bundle work+symt+switch? It's a lot of typing to forward this stuff everywhere.
+					auto matchk = MatchkTryPolymorph(pWork, pSymtCur, pAstdeclArg->pAstType, pAstcall->arypAstArgs[i], true, &aryParg, pTcswitch);
+					if (matchk == MATCHK_Suspend)
+						return MATCHK_Suspend;
+					if (matchk != MATCHK_Exact)
+					{
+						fMatches = false;
+						break;
+					}
+				}
+
+				if (!fMatches)
+					continue;
+
+				// Check inferred types match destination
+				for (int i = 0; i < pAstcall->arypAstArgs.c; ++i)
+				{
+					auto pAstdeclArg = PastCast<SAstDeclareSingle>(pAstprocPoly->arypAstDeclArg[i]);
+					MATCHK matchk = MatchkTryPolymorph(pWork, pSymtCur, pAstdeclArg->pAstType, pAstcall->arypAstArgs[i], false, &aryParg, pTcswitch);
+					ASSERT(matchk != MATCHK_Suspend);
+					if (matchk != MATCHK_Exact)
+					{
+						fMatches = false;
+						break;
+					}
+				}
+
+				if (!fMatches)
+					continue;
+
+				// See if we've already specialized this routine
+
+				SResolveDecl * pResdeclFound = nullptr;
+				for (const auto & specproc : pPolyproc->arySpecproc)
+				{
+					ASSERT(specproc.aryParg.c == aryParg.c);
+					for (int i = 0;; ++i)
+					{
+						if (i >= aryParg.c)
+						{
+							ASSERT(pResdeclFound == nullptr);
+							pResdeclFound = specproc.pResdecl;
+							break;
+						}
+						
+						ASSERT(specproc.aryParg[i].pChz == aryParg[i].pChz);
+						if (specproc.aryParg[i].tid != aryParg[i].tid)
+							break;
+					}
+				}
+
+				if (!pResdeclFound)
+				{
+					// Add new specialization, take over allocated array
+
+					auto pSpecproc = PtAppendNew(&pPolyproc->arySpecproc);
+					pSpecproc->aryParg = aryParg;
+					aryParg = {};
+
+					// Duplicate the entire AST for the procedure, annotate the types on the polymorphic elements,
+					//  and unflag as polymorphic
+
+					SRecurseCtx recx = { pWork, nullptr, pSymtCur, &pSpecproc->aryParg };
+
+					SAstDeclareSingle * pAstdecl = pAstdeclOrig;
+					auto pAstdeclNew = PastPrepare<SAstDeclareSingle>(recx, &pAstdecl);
+					ASSERT(pAstdeclNew == pAstdecl);
+					
+					auto pDecl = PtAlloc<SDeclaration>(&pWork->pagealloc);
+					pDecl->pChzName = pChzName;
+					pDecl->pAstdecl = pAstdecl;
+
+					// NOTE (adrianb) Not calling AddResolveDeclaration because we are stored in this symbol table
+
+					auto pResdecl = PtAlloc<SResolveDecl>(&pWork->pagealloc);
+					pResdecl->pDecl = pDecl;
+					pSpecproc->pResdecl = pResdecl;
+					pResdeclFound = pResdecl;
+					
+					// Procedure handles its own declaration addition
+
+					if (recx.pSymtParent->symtblk != SYMTBLK_Procedure)
+						recx.paryTrec = &pDecl->aryTrec;
+
+					ASSERT(!pAstdecl->pAstType);
+					ASSERT(pAstdecl->pAstValue);
+					ASSERT(pAstdecl->pAstValue->astk == ASTK_Procedure);
+
+					// Recurse differently for procedures to support recursion
+					//  Type check: arg/ret, proc, declaration, body
+
+					auto pAstproc = PastPrepare<SAstProcedure>(recx, &pAstdecl->pAstValue);
+					pAstproc->fIsPolymorphic = false;
+					
+					SRecurseCtx recxProc = recx;
+					RecurseProcArgRet(&recxProc, pAstproc);
+					AppendAst(recx, &pAstdecl->pAstValue);
+					AppendAst(recx, reinterpret_cast<SAst **>(&pDecl->pAstdecl));
+
+					RecurseTypeCheck(recxProc, reinterpret_cast<SAst **>(&pAstproc->pAstblock));
+				}
+
+				auto pAstdecl =  pResdeclFound->pDecl->pAstdecl;
+				STypeId tidProc = pAstdecl->tid;
+				if (tidProc.pType == nullptr)
+				{
+					pTcswitch->pDecl = pResdeclFound->pDecl;
+					return MATCHK_Suspend;
+				}
+
+				if (matchkBest < MATCHK_Exact)
+					arypResdeclMatch.c = 0;
+				
+				matchkBest = MATCHK_Exact;
+				if (!FIsFull(&arypResdeclMatch))
+					Append(&arypResdeclMatch, pResdeclFound);
+			}
+		}
 	}
 
-	return static_cast<const STypeTypeOf *>(tid.pType)->tid;
+	if (matchkBest == MATCHK_None || arypResdeclMatch.c != 1)
+	{
+		PrintErr(pAstcall->errinfo, "Couldn't find specific overload for procedure call");
+		if (arypResdeclMatch.c > 0)
+		{
+			fprintf(stderr, "Options:");
+			for (auto pResdecl : arypResdeclMatch)
+			{
+				PrintErr(pResdecl->pDecl->pAstdecl->errinfo, "candidate procedure");
+			}
+		}
+		ExitErr();
+	}
+
+	*ppResdecl = arypResdeclMatch[0];
+	return MATCHK_Exact; // BB (adrianb) Is it exact?
 }
 
 STypeId TidWrapPointer(SWorkspace * pWork, STypeId tid) 
 {
-	STypeTypeOf typeof = {};
-	typeof.typek = TYPEK_TypeOf;
-	typeof.tid = TidPointer(pWork, tid);
+	STypeTypeOf ttypeof = {};
+	ttypeof.typek = TYPEK_TypeOf;
+	ttypeof.tid = TidPointer(pWork, tid);
 	
-	return TidEnsure(pWork, &typeof);
+	return TidEnsure(pWork, &ttypeof);
 }
 
 STypeId TidInferFromInt(SWorkspace * pWork, s64 n)
@@ -6064,7 +6793,7 @@ enum TFN
 	TFN_Nil = -1,
 };
 
-TFN TfnCanCoerce(SAst * pAst, TYPEK typek)
+TFN TfnCanCoerce(const SAst * pAst, TYPEK typek)
 {
 	if (pAst->astk == ASTK_Literal)
 	{
@@ -6164,7 +6893,7 @@ TFN TfnCanCoerce(SAst * pAst, TYPEK typek)
 	return TFN_Nil;
 }
 
-bool FCanCoerce(SAst * pAst, TYPEK typek)
+bool FCanCoerce(const SAst * pAst, TYPEK typek)
 {
 	TFN tfn = TfnCanCoerce(pAst, typek);
 	if (tfn != TFN_Nil)
@@ -6175,7 +6904,7 @@ bool FCanCoerce(SAst * pAst, TYPEK typek)
 	return pAst->tid.pType && pAst->tid.pType->typek == typek;
 }
 
-bool FCanCoerce(SAst * pAst, const STypeId & tidTo)
+bool FCanCoerce(const SAst * pAst, const STypeId & tidTo)
 {
 	if (tidTo == pAst->tid)
 		return true;
@@ -6203,6 +6932,9 @@ bool FCanCoerce(SAst * pAst, const STypeId & tidTo)
 			return (!pTypeptr->fSoa && pTypePointedTo->typek == TYPEK_U8);
 		}
 	}
+
+	// Any array type to a generic array type
+	// BB (adrianb) Check pointed to type?
 	
 	if (pTypeTo->typek == TYPEK_Array && pAst->tid.pType->typek == TYPEK_Array)
 	{
@@ -6211,6 +6943,12 @@ bool FCanCoerce(SAst * pAst, const STypeId & tidTo)
 
 		return pTypearrayTo->cSizeFixed < 0 && !pTypearrayTo->fDynamicallySized &&
 				(pTypearrayFrom->cSizeFixed >= 0 || pTypearrayFrom->fDynamicallySized);
+	}
+
+	if ((pTypeTo->typek == TYPEK_Pointer && PtypeCast<STypePointer>(pTypeTo)->tidPointedTo.pType->typek == TYPEK_Void) 
+		&& pAst->tid.pType->typek == TYPEK_Pointer)
+	{
+		return true;
 	}
 
 	// BB (adrianb) More conversions?
@@ -6521,10 +7259,13 @@ void RegisterResolved(SWorkspace * pWork, SAst * pAstIdent, SResolveDecl * pResd
 }
 
 
+void TryDefaultType(SWorkspace * pWork, SAst * pAst)
+{
+	if (pAst && pAst->tid.pType == nullptr && pAst->astk == ASTK_Literal)
+		pAst->tid = TidFromLiteral(pWork, PastCast<SAstLiteral>(pAst)->lit);
+}
 
 void EvalConst(SWorkspace * pWork, SAst * pAst, void * pVRet);
-
-
 
 void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcswitch)
 {
@@ -6561,9 +7302,9 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 			SResolveDecl * pResdecl;
 			if (pSymt->symtblk >= SYMTBLK_RegisterAllMic)
 			{
-				pResdecl = PresdeclLookupSimple(pSymt, pAstident->pChz, RESLK_Local);
+				pResdecl = PresdeclLookup(pSymt, pAstident->pChz, 0, pAst->errinfo);
 			}
-			else if (!FTryResolveSymbolWithUsing(pWork, pSymt, pAstident->pChz, pTcswitch, &pResdecl))
+			else if (!FTryResolveSymbolWithUsing(pWork, pSymt, pAstident->pChz, pAst->errinfo, pTcswitch, &pResdecl))
 			{
 				// We have switched to resolving another declaration
 				ASSERT(pTcswitch->pDecl);
@@ -6701,26 +7442,7 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 
 						// Resolve string to builtin structure type
 						// BB (adrianb) Do something similar with enums? Arrays or just manually handle those?
-						if (tidStruct.pType->typek == TYPEK_String)
-						{
-							// BB (adrianb) Use top level symbol table directly?
-							auto pResdecl = PresdeclLookupSimple(pTrec->pSymtParent, "_StringStruct", RESLK_Local);
-							if (pResdecl)
-							{
-								if (pResdecl->pDecl->pAstdecl->tid.pType == nullptr)
-								{
-									pTcswitch->pDecl = pResdecl->pDecl;
-									ASSERT(pTcswitch->pDecl);
-									break;
-								}
-								else
-								{
-									// Remove the typeof around the string structure
-									tidStruct = TidUnwrap(pAstop->errinfo, pResdecl->pDecl->pAstdecl->tid);
-								}
-							}
-						}
-
+						
 						auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
 						SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidStruct);
 						ASSERT(pSymtStruct);
@@ -6730,7 +7452,8 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 						if (pSymtStruct)
 						{
 							SResolveDecl * pResdecl;
-							if (!FTryResolveSymbolWithUsing(pWork, pSymtStruct, pAstident->pChz, pTcswitch, &pResdecl))
+							if (!FTryResolveSymbolWithUsing(pWork, pSymtStruct, pAstident->pChz, pAstident->errinfo, 
+															pTcswitch, &pResdecl))
 							{
 								// We have switched to resolving another declaration
 								ASSERT(pTcswitch->pDecl);
@@ -6752,6 +7475,8 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 
 							STypeId tid = pAstdeclResolved->tid;
 							ASSERT(tid.pType != nullptr);
+
+							// BB (adrianb) Why are we not suspending here?
 
 							pAstop->pAstRight->tid = tid;
 							pAstop->tid = tid;
@@ -6803,6 +7528,10 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 LOperatorDone:
 			if (pAstop->tid.pType == nullptr)
 			{
+				// Set default types so error gives somewhat sensible display
+
+				TryCoerceLit(pWork, pAstop->pAstRight);
+
 				if (pAstop->pAstLeft == nullptr)
 				{
 					ShowErr(pAstop->errinfo, "Invalid prefix operator %s given type %s, cannot be typechecked.", 
@@ -6810,6 +7539,8 @@ LOperatorDone:
 				}
 				else
 				{
+					TryCoerceLit(pWork, pAstop->pAstLeft);
+				
 					ShowErr(pAstop->errinfo, "Invalid operator %s given types %s and %s, cannot be typechecked.", 
 							pChzOp, StrPrintType(pAstop->pAstLeft->tid.pType).Pchz(), 
 							StrPrintType(pAstop->pAstRight->tid.pType).Pchz());
@@ -6856,9 +7587,45 @@ LOperatorDone:
 		break;
 
 	case ASTK_Cast:
-		// BB (adrianb) Check that it is possible?
-		ASSERT(false);
-		// Use type inside pAstType
+		{
+			auto pAstcast = PastCast<SAstCast>(pAst);
+
+			STypeId tidSrc = pAstcast->pAstExpr->tid;
+			STypeId tidDst = pAstcast->pAstType->tid;
+
+			if (tidDst.pType->typek != TYPEK_TypeOf)
+				ShowErr(pAst->errinfo, "Expected type");
+
+			tidDst = PtypeCast<STypeTypeOf>(tidDst.pType)->tid;
+
+			if (tidSrc == tidDst)
+				return;
+
+			TYPEK typekSrc = tidSrc.pType->typek;
+			TYPEK typekDst = tidDst.pType->typek;
+
+			bool fCanConvert = false;
+			if (FIsInt(typekSrc))
+			{
+				fCanConvert = FIsInt(typekDst) || FIsFloat(typekDst);
+			}
+			else if (FIsFloat(typekSrc))
+			{
+				fCanConvert = FIsInt(typekDst) || FIsFloat(typekDst);
+			}
+			else if (typekSrc == TYPEK_Pointer && typekDst == TYPEK_Pointer)
+			{
+				fCanConvert = true;
+			}
+
+			if (!fCanConvert)
+			{
+				ShowErr(pAst->errinfo, "Cannot convert from %s to %s", StrPrintType(tidSrc).Pchz(), 
+						StrPrintType(tidDst).Pchz());
+			}
+
+			pAst->tid = tidDst;
+		}
 		break;
 
 	case ASTK_New:
@@ -6911,9 +7678,43 @@ LOperatorDone:
 
 	case ASTK_Call:
 		{
+			auto pAstcall = PastCast<SAstCall>(pAst);
+
+			// Resolve overloading
+
+			if (pAstcall->pAstFunc->astk == ASTK_Identifier)
+			{
+				auto pChzIdent = PastCast<SAstIdentifier>(pAstcall->pAstFunc)->pChz;
+
+				if (strcmp(pChzIdent, "sizeof") == 0 || strcmp(pChzIdent, "alignof") == 0)
+				{
+					if (pAstcall->arypAstArgs.c != 1)
+					{
+						ShowErr(pAst->errinfo, "%s expects one argument", pChzIdent);
+					}
+
+					TryCoerceLit(pWork, pAstcall->arypAstArgs[0]);
+
+					pAstcall->tid = pWork->tidU64;
+
+					break;
+				}
+				
+				SResolveDecl * pResdecl;
+				if (MatchkTryResolveOverloadWithUsing(pWork, pTrec->pSymtParent, pAstcall, pTcswitch, &pResdecl) == MATCHK_Suspend)
+				{
+					// We have switched to resolving another declaration
+					ASSERT(pTcswitch->pDecl);
+					break;
+				}
+				
+				pAstcall->pAstFunc->tid = pResdecl->pDecl->pAstdecl->tid;
+
+				RegisterResolved(pWork, pAstcall->pAstFunc, pResdecl);
+			}
+
 			// Coerce arguments, use return type of pAstFunc
 
-			auto pAstcall = PastCast<SAstCall>(pAst);
 			auto pTypeproc = PtypeCast<STypeProcedure>(pAstcall->pAstFunc->tid.pType);
 
 			int cTidArg = pTypeproc->cTidArg;
@@ -7118,6 +7919,12 @@ LOperatorDone:
 
 			auto pAstproc = PastCast<SAstProcedure>(pAst);
 
+			if (!pAstproc->fIsForeign)
+			{
+				// Add the module to have code generated
+				Append(&pWork->aryModule[pAstproc->iModuleOwner].arypAstprocGen, pAstproc);
+			}
+
 			int cpAstArg = pAstproc->arypAstDeclArg.c;
 			STypeId * aTidArg = nullptr;
 			bool fUsesCVararg = false;
@@ -7199,6 +8006,7 @@ LOperatorDone:
 			STypeArray typearray = {};
 			typearray.typek = TYPEK_Array;
 			typearray.cSizeFixed = -1;
+			typearray.fDynamicallySized = pAtypearray->fDynamicallySized;
 			typearray.tidElement = TidUnwrap(pAtypearray->pAstTypeInner->errinfo,
 											 pAtypearray->pAstTypeInner->tid);
 
@@ -7234,15 +8042,12 @@ LOperatorDone:
 
 			// BB (adrianb) Not filling in actual full AST.
 
-			auto pAstdeclA = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo{});
-			pAstdeclA->tid = TidPointer(pWork, typearray.tidElement);
-			pAstdeclA->pChzName = "a";
-
+			auto pAstdeclA = PastdeclCreateTyped(pWork, "a", TidPointer(pWork, typearray.tidElement));
 			AddDeclaration(pWork, pSymtArray, "a", pAstdeclA);
 
-			auto pAstdeclC = PastCreate<SAstDeclareSingle>(pWork, SErrorInfo{});
-			pAstdeclC->tid = pWork->tidU32; // BB (adrianb) U64 to support >4GiB [] u8?
-			pAstdeclC->pChzName = "c";
+			// BB (adrianb) Use u64 to support >4GiB u8? For c and cMax.
+
+			auto pAstdeclC = PastdeclCreateTyped(pWork, "c", pWork->tidU32);
 
 			if (typearray.cSizeFixed >= 0)
 			{
@@ -7257,18 +8062,29 @@ LOperatorDone:
 
 			AddDeclaration(pWork, pSymtArray, "c", pAstdeclC);
 
+			SAstDeclareSingle * pAstdeclCMax = nullptr;
+
+			if (pTypearray->fDynamicallySized)
+			{
+				// Dynamic array just contains a cMax
+
+				pAstdeclCMax = PastdeclCreateTyped(pWork, "cMax", pWork->tidU32);
+				AddDeclaration(pWork, pSymtArray, "cMax", pAstdeclCMax);
+			}
+
 			auto pTypestruct = PtAlloc<STypeStruct>(&pWork->pagealloc);
 			pTypestruct->typek = TYPEK_Struct;
 			pTypestruct->pChzName = "_array";
 
-			pTypestruct->cMember = 2;
-			pTypestruct->cMemberMax = 2;
+			pTypestruct->cMemberMax = pTypestruct->cMember = (pAstdeclCMax) ? 3 : 2;
 
 			if (typearray.cSizeFixed < 0)
 			{
-				pTypestruct->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, 2);
+				pTypestruct->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, pTypestruct->cMember);
 				pTypestruct->aMember[0].pAstdecl = pAstdeclA;
 				pTypestruct->aMember[1].pAstdecl = pAstdeclC;
+				if (pAstdeclCMax)
+					pTypestruct->aMember[2].pAstdecl = pAstdeclCMax;
 			}
 
 			pTypearray->pTypestruct = pTypestruct;
@@ -7364,7 +8180,7 @@ void TypeCheckAll(SWorkspace * pWork)
 			
 	for (SModule * pModule : IterPointer(pWork->aryModule))
 	{
-		SRecurseCtx recx = { pWork, pModule, nullptr, &pWork->symtRoot };
+		SRecurseCtx recx = { pWork, nullptr, &pWork->symtRoot };
 	
 		for (auto ppAst : IterPointer(pModule->pAstblockRoot->arypAst))
 		{
@@ -7372,7 +8188,7 @@ void TypeCheckAll(SWorkspace * pWork)
 		}
 	}
 
-	// Run type checking in preprecursion order
+	// Run type checking in prerecursion order
 
 	SArray<SDeclaration *> arypResolveWait = {};
 
@@ -7894,11 +8710,19 @@ void EvalDefaultValue(SWorkspace * pWork, STypeId tid, u8 * pBRet)
 	case TYPEK_Array:
 		{
 			auto pTypearray = PtypeCast<STypeArray>(tid.pType);
-			ASSERT(!pTypearray->fSoa && pTypearray->cSizeFixed >= 0);
-			int cBMember = CbSizeOf(pTypearray->tidElement);
-			for (int i : IterCount(pTypearray->cSizeFixed))
+			ASSERT(!pTypearray->fSoa);
+			if (pTypearray->cSizeFixed >= 0)
 			{
-				EvalDefaultValue(pWork, pTypearray->tidElement, pBRet + i * cBMember);
+				int cBMember = CbSizeOf(pTypearray->tidElement);
+				for (int i : IterCount(pTypearray->cSizeFixed))
+				{
+					EvalDefaultValue(pWork, pTypearray->tidElement, pBRet + i * cBMember);
+				}
+			}
+			else
+			{
+				ASSERT(pTypearray->pTypestruct);
+				memset(pBRet, 0, CbSizeOf(tid));
 			}
 		}
 		break;
@@ -8219,6 +9043,15 @@ void EvalCode(SEvalCtx * pEval, SAst * pAst, void * pVRet)
 				default: ASSERT(false); return;
 				}
 			}
+			else if (typekSrc == TYPEK_Pointer)
+			{
+				void * pV = *static_cast<void **>(pVExpr);
+				if (typekDst == TYPEK_Pointer)
+				{
+					*static_cast<void **>(pVRet) = pV;
+					return;
+				}
+			}
 
 			ShowErr(pAst->errinfo, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
 					StrPrintType(tidDst.pType).Pchz());
@@ -8426,6 +9259,8 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 		{
 			auto pTypeptr = PtypeCast<STypePointer>(pType);
 			ASSERT(!pTypeptr->fSoa);
+			if (pTypeptr->tidPointedTo.pType->typek == TYPEK_Void)
+				return LLVMPointerType(LLVMInt8TypeInContext(pLctx), 0);
 			return LLVMPointerType(PltypeGenerate(pGenx, pTypeptr->tidPointedTo), 0);
 		}
             
@@ -8435,16 +9270,24 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 
 	case TYPEK_Array:
 		{
+			// BB (adrianb) Have non-anonymous struct for an array type?
+
 			auto pTypearray = PtypeCast<STypeArray>(pType);
 			if (pTypearray->cSizeFixed >= 0)
 			{
 				ASSERT(!pTypearray->fSoa && !pTypearray->fDynamicallySized);
 				return LLVMArrayType(PltypeGenerate(pGenx, pTypearray->tidElement), pTypearray->cSizeFixed);
 			}
+			else if (pTypearray->fDynamicallySized)
+			{
+				auto pLtypePtr = PltypeGenerate(pGenx, TidPointer(pWork, pTypearray->tidElement));
+				LLVMOpaqueType * apLtype[] = { pLtypePtr, LLVMInt32TypeInContext(pGenx->pLctx), LLVMInt32TypeInContext(pGenx->pLctx) };
+				return LLVMStructTypeInContext(pGenx->pLctx, apLtype, DIM(apLtype), false);
+			}
 			else
 			{
 				auto pLtypePtr = PltypeGenerate(pGenx, TidPointer(pWork, pTypearray->tidElement));
-				LLVMOpaqueType * apLtype[] = { pLtypePtr, LLVMInt64TypeInContext(pGenx->pLctx) };
+				LLVMOpaqueType * apLtype[] = { pLtypePtr, LLVMInt32TypeInContext(pGenx->pLctx) };
 				return LLVMStructTypeInContext(pGenx->pLctx, apLtype, DIM(apLtype), false);
 			}
 		}
@@ -8560,7 +9403,7 @@ void GetMemberAddress(SGenerateCtx * pGenx, const char * pChzName,
 	if (pTidPointedTo->pType->typek == TYPEK_Array)
 	{
 		auto pTypearray = PtypeCast<STypeArray>(pTidPointedTo->pType);
-		if (pTypearray->cSizeFixed >= 0)
+        if (pTypearray->cSizeFixed >= 0)
 		{
 			ASSERT(strcmp(pChzName, "a") == 0);
 			*ppLvalPtr = LLVMBuildStructGEP(pLbuilder, *ppLvalPtr, 0, "");
@@ -8755,8 +9598,15 @@ LLVMOpaqueValue * PlvalGetLoadStoreAddress(SGenerateCtx * pGenx, SAst * pAst)
 		break;
 	}
 
-	ShowErr(pAst->errinfo, "Can't get address to load or store from");
-	return {};
+	// Implicitly create temporary local
+	// BB (adrianb) Disallow implictly storing some operators?
+	//  Are there any cases where we'll infinitely recurse?
+
+	auto pLvalAddr = LLVMBuildAlloca(pGenx->pLbuilderAlloc, PltypeGenerate(pGenx, pAst->tid), "_tempAddr");
+	auto pLval = PlvalGenerateRecursive(pGenx, pAst);
+	LLVMBuildStore(pLbuilder, pLval, pLvalAddr);
+
+	return pLvalAddr;
 }
 
 using PFNGENBINOP = LLVMOpaqueValue * (*)(LLVMOpaqueBuilder * pLbuilder, LLVMOpaqueValue * pLvalLeft, 
@@ -8824,8 +9674,8 @@ static const SGenerateBinaryOperator s_aGbop[] =
 	{ "<", GenCmpInt<LLVMIntSLT>, GenCmpInt<LLVMIntULT>, GenCmpFloat<LLVMRealOLT>, nullptr, GenCmpInt<LLVMIntULT> },
 	{ ">", GenCmpInt<LLVMIntSGT>, GenCmpInt<LLVMIntUGT>, GenCmpFloat<LLVMRealOGT>, nullptr, GenCmpInt<LLVMIntUGT> },
 
-	{ "==", GenCmpInt<LLVMIntEQ>, nullptr, nullptr, nullptr, GenCmpInt<LLVMIntEQ> },
-	{ "!=", GenCmpInt<LLVMIntNE>, nullptr, nullptr, nullptr, GenCmpInt<LLVMIntNE> },
+	{ "==", GenCmpInt<LLVMIntEQ>, nullptr, GenCmpFloat<LLVMRealOEQ>, nullptr, GenCmpInt<LLVMIntEQ> },
+	{ "!=", GenCmpInt<LLVMIntNE>, nullptr, GenCmpFloat<LLVMRealONE>, nullptr, GenCmpInt<LLVMIntNE> },
 
 	{ "+", LLVMBuildAdd, nullptr, LLVMBuildFAdd, PlvalAddPtrInt, nullptr },
 	{ "-", LLVMBuildSub, nullptr, LLVMBuildFSub, PlvalSubPtrInt, PlvalSubPtr },
@@ -8835,8 +9685,8 @@ static const SGenerateBinaryOperator s_aGbop[] =
 };
 
 LLVMOpaqueValue * PlvalGenerateBinaryOperator(SGenerateCtx * pGenx, const SGenerateBinaryOperator & gbop, 
-										   SAst * pAstLeft, LLVMOpaqueValue * pLvalLeft, 
-										   SAst * pAstRight, LLVMOpaqueValue * pLvalRight)
+											   SAst * pAstLeft, LLVMOpaqueValue * pLvalLeft, 
+											   SAst * pAstRight, LLVMOpaqueValue * pLvalRight)
 {
 	auto pLbuilder = pGenx->pLbuilder;
 
@@ -9130,65 +9980,6 @@ LLVMOpaqueValue * PlvalGenerateDefaultValue(SGenerateCtx * pGenx, STypeId tid, L
 	EvalDefaultValue(pGenx->pWork, tid, static_cast<u8*>(pVVal));
 
 	return PlvalConst(pGenx, tid, pVVal);
-
-#if 0
-	// Generate default value
-
-	TYPEK typek = tid.pType->typek;
-
-	if (FIsInt(typek))
-	{
-		return LLVMConstInt(pLtype, 0, true);
-	}
-	else if (FIsFloat(typek))
-	{
-		return LLVMConstReal(pLtype, 0.0);
-	}
-	else if (typek == TYPEK_Pointer)
-	{
-		return LLVMConstNull(pLtype);
-	}
-	else if (typek == TYPEK_Struct)
-	{
-		#if 0
-		auto pTypestruct = PtypeCast<STypeStruct>(tid.pType);
-		int cMember = pTypestruct->cMember;
-		auto aReg = static_cast<REG *>(alloca(sizeof(REG) * cMember));
-		for (int iMember : IterCount(cMember))
-		{
-			auto pAstdecl = pTypestruct->aMember[iMember].pAstdecl;
-			ASSERT(!pAstdecl->fIsConstant);
-
-			// BB (adrianb) Are values always set to correct type?
-
-			if (pAstdecl->pAstValue)
-				aReg[iMember] = PlvalGenerateConstant(pGenx, pAstdecl->pAstValue);
-			else
-				aReg[iMember] = RegGenerateDefaultValue(pGenx, pAstdecl->tid);
-		}
-
-		return LLVMConstStructInContext(pGenx->pGen->lcontext, aReg, cMember, false);
-		#endif
-	}
-	else if (typek == TYPEK_Array)
-	{
-		#if 0
-		auto pTypearray = PtypeCast<STypeArray>(tid.pType);
-		ASSERT(!pTypearray->fSoa && pTypearray->cSizeFixed >= 0);
-		s64 cElement = pTypearray->cSizeFixed;
-		auto aReg = static_cast<REG *>(alloca(sizeof(REG) * cElement));
-		for (int iElement : IterCount(cElement))
-		{
-			aReg[iElement] = RegGenerateDefaultValue(pGenx, pTypearray->tidElement);
-		}
-
-		return LLVMConstArray(ltyperefElement, aReg, cElement);
-		#endif
-	}
-	
-	ASSERTCHZ(false, "Declaration default value for type %s NYI", StrPrintType(tid.pType).Pchz());
-	return {};
-#endif
 }
 
 LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
@@ -9534,7 +10325,7 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 
 					LLVMOpaqueValue * apLvalGEP[] = { PlvalConstS32(pGenx, 0), PlvalConstS32(pGenx, 0) };
 					auto pLvalA = LLVMBuildGEP(pGenx->pLbuilder, pLvalPtrArray, apLvalGEP, DIM(apLvalGEP), "");
-					auto pLvalC = PlvalConstU64(pGenx, pTypearraySrc->cSizeFixed);
+					auto pLvalC = PlvalConstU32(pGenx, pTypearraySrc->cSizeFixed);
 					LLVMOpaqueValue * apLvalAry[] = { pLvalA, pLvalC };
 					return PlvalBuildStruct(pGenx, pLtypeArray, apLvalAry, DIM(apLvalAry));
 				}
@@ -9591,6 +10382,11 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 						return LLVMBuildFPToUI(pLbuilder, pLvalExpr, pLtypeDst, "");
 				}
 			}
+			else if (typekSrc == TYPEK_Pointer)
+			{
+				return LLVMBuildBitCast(pLbuilder, pLvalExpr, pLtypeDst, "");
+
+			}
 
 			ASSERTCHZ(false, "Cannot cast between %s and %s", StrPrintType(tidSrc.pType).Pchz(), 
 					  StrPrintType(tidDst.pType).Pchz());
@@ -9632,6 +10428,19 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 			// Do this for all functions? E.g. so out of order will work? Or just start the function
 			// and continue filling it later.
 
+			if (pAstcall->pAstFunc->astk == ASTK_Identifier)
+			{
+				auto pChzIdent = PastCast<SAstIdentifier>(pAstcall->pAstFunc)->pChz;
+				bool fIsSizeOf = strcmp(pChzIdent, "sizeof") == 0;
+				if (fIsSizeOf || strcmp(pChzIdent, "alignof") == 0)
+				{
+					STypeId tid = pAstcall->arypAstArgs[0]->tid;
+					if (tid.pType->typek == TYPEK_TypeOf)
+						tid = PtypeCast<STypeTypeOf>(tid.pType)->tid;
+					return PlvalConstU64(pGenx, (fIsSizeOf) ? CbSizeOf(tid) : CbAlignOf(tid));
+				}
+			}
+
 			auto pLvalProc = PlvalGenerateRecursive(pGenx, pAstcall->pAstFunc);
 
 			int cArg = pAstcall->arypAstArgs.c;
@@ -9642,7 +10451,10 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 				apLvalArg[iArg] = PlvalGenerateRecursive(pGenx, pAstcall->arypAstArgs[iArg]);
 			}
 
-			return LLVMBuildCall(pLbuilder, pLvalProc, apLvalArg, cArg, "");
+			auto pLvalRet = LLVMBuildCall(pLbuilder, pLvalProc, apLvalArg, cArg, "");
+			if (pAstcall->tid.pType->typek == TYPEK_Void)
+				return nullptr;
+			return pLvalRet;
 		}
 		break;
 
@@ -9816,18 +10628,6 @@ LLVMOpaqueValue * PlvalGenerateRecursive(SGenerateCtx * pGenx, SAst * pAst)
 	return nullptr;
 }
 
-#if 0
-SGlobal * PglobalAdd(SWorkspace * pWork, SAst * pAstSource, STypeId tid)
-{
-	int iGlobal = pWork->aryGlobal.c;
-	auto pGlobal = PtAppendNew(&pWork->aryGlobal);
-	pGlobal->pAstSource = pAstSource;
-	pGlobal->regtAddr = { tid };
-	pGlobal->reg = REG((iGlobal + 1) | REG_Global);
-	return pGlobal;
-}
-#endif
-
 void GenerateAll(SGenerateCtx * pGenx)
 {
 	auto pWork = pGenx->pWork;
@@ -9916,7 +10716,7 @@ void GenerateAll(SGenerateCtx * pGenx)
 	{
 		// Generate code for functions in this module
 
-		for (auto pAstproc : pModule->arypAstproc)
+		for (auto pAstproc : pModule->arypAstprocGen)
 		{
 			(void) PlvalGenerateRecursive(pGenx, pAstproc);
 
@@ -9967,7 +10767,7 @@ void CompileAndCheckDeclaration(
 	Init(&genx, &work);
 	GenerateAll(&genx);
 
-	auto pResdecl = PresdeclLookupSimple(&work.symtRoot, pChzDecl, RESLK_WithUsing);
+	auto pResdecl = PresdeclLookup(&work.symtRoot, pChzDecl, 0, {});
 	if (!pResdecl)
 	{
 		ShowErr(SErrorInfo{pChzTestName}, "Can't find declaration %s", pChzDecl);
@@ -10098,10 +10898,18 @@ void RunUnitTests()
 	// Unit tests for:
 	// - All operators? Valid coercion cases?
 	// - Recursive functions, implicit return from void function
+	// - Sizeof/Alignof expected values.
 
 	// BB (adrianb) Unit tests for common errors? How? Error current calls exit, throw instead? Sandbox
 	//  allocation entirely within a custom malloc so we can just toss entire heap away? All arrays come
 	//  from workspace? E.g. page based arrays? Use global pointer for allocation?
+}
+
+void CrashHandler(int nSignal) 
+{
+	fprintf(stderr, "Crash: signal %d:\n", nSignal);
+	PrintBacktrace(0);
+	ExitErr();
 }
 
 int main(int cpChzArg, const char * apChzArg[])
@@ -10109,9 +10917,8 @@ int main(int cpChzArg, const char * apChzArg[])
 	static char s_aChzStdoutBuf[BUFSIZ] = {};
 	setvbuf(stdout, s_aChzStdoutBuf, _IOFBF, DIM(s_aChzStdoutBuf));
 
-#if 0
-	TestDefer();
-#endif
+	// install our signal handler
+   	signal(SIGSEGV, CrashHandler);
 
 	// Process flags
 
@@ -10343,39 +11150,42 @@ int main(int cpChzArg, const char * apChzArg[])
 }
 
 #if 0
-	- Default int literals to s64? or u64?
-	- Add dynamic array.
+	- Example program to test? Eventually Crystalis game.
+		- GL drawing (OSX window wrapper goo? or just use glew?). Or buy a new laptop?
+	- Example program to test? Path tracer. How to set pixels in OSX?
+	- Alternate syntax. type, proc, struct, const, let, var etc.? No semicolons?
+
+	- Destructors. Dynamic array, auto free pointers, implicit dtor for structs, general dtor for structs?
+	- Dll loading.
+		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
+	- Wrap llvm in a dll so we don't have to link the entire thing in all the time.
+	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN E.g. shaders
+	- Any/typeinfo. printf replacement.
+	- Add overloading with coercion best match?
 	- Add array literal syntax.
 	- Add struct init syntax? E.g. StructName(named parameter arguments)?
 	- Add enums.
-	- Add unsized integer type (treated as 64 bit, 65?). So that 1 << 8 can morph into something else if need be.
-	- Add overloading.
-	- #run. Using tree evaluator and global memory allocations.
+	- General #run. Using tree evaluator and global memory allocations. Or byte code evaluation?
 	- Named parameters? Default values?
-	- Dll loading.
-		- OSX can do this implicitly: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/CreatingDynamicLibraries.html
-	- Example program to test? OpenGL game?
 	- Flesh out operators - bitwise operators
-	- using with procedures, pointers.
-	- Any/typeinfo. printf replacement
+	- Solve 1 << 9 giving bogus value? Could default int literals to s64? Or unsized s65?
+	- using with procedures, pointers, implicit this parameter.
 	- SOA support.
 	- Inlining.  In generation.
-	- overloading.
-	- Polymorphic procedures. With modify proc.
+	- Modify proc for polymorphic procedures.
 	- #bake, #bake_values with procedures?
-	- Polymorphic structs. With modify? 
-	- Stuff from D: mixins, static if (esp mixins), lazy arguments
+	- Polymorphic structs. With modify?
+	- Stuff from D: mixins, static if (esp mixins), lazy arguments (e.g. assert implementation)
+	- Stuff from Nim: inline iterator (for loop)
 	- Closures?
 	- implicit context
-	- here strings? #string ENDTOKEN\nANYTHING HERE\nENDTOKEN
-	- Annotations?
-	- Expose typed compiler AST to compile time run procedures ala BANANAS demo. Ouch...
 	- Debugger GUI?
 	- Conditional compilation.
 
 Problems:
 	- Procedure ambiguity
 		- Arguments vs multiple return values: (func: (A,B)->B, name: A) {...} 
+			- Multiple return values should go in ()?
 		- Determine if a definition is intended to use parentheses or be a function definition 
 			need to peek 2+ more operators
 			- x :: (a + b)

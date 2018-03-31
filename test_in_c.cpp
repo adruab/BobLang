@@ -1,3 +1,4 @@
+#if 0
 //map :: (array: [] $T, f: (T) -> $R) -> [] R {
 //}
 
@@ -67,6 +68,69 @@ int main ()
     }
 
     printf("factorial(%lld) == %lld\n", 5ll, Factorial(5ll));
+
+    return 0;
+}
+
+extern void printf(const char *, ...);
+const char * g_pChz1 = "foo";
+const char * g_pChz2 = "foo";
+
+struct Vector
+{
+    float x;
+    float y;
+    int z;
+};
+
+Vector VecXY(float x)
+{
+    Vector vec = { 5 + x, 10 };
+    return vec;
+}
+
+void PrintN(short n)
+{
+}
+
+void PrintN(int n)
+{
+}
+
+void PrintN(long int n)
+{
+}
+#endif
+
+int main ()
+{
+#if 0
+    Vector aVecF[] = { {1, 2}, {1, 2} };
+
+    struct ArrayVec
+    {
+        Vector * a;
+        unsigned int c;
+    };
+
+    ArrayVec aVec = { aVecF, 2 };
+    aVec = aVec;
+
+    aVec.a[0] = VecXY(1);
+
+    aVec.a[1].x = 9003;
+    aVec.a[0].y = 46;
+
+    Vector * pVecNull = 0;
+    if (aVec.a == pVecNull)
+    {
+        return -1;
+    }
+
+    PrintN(2);
+#endif
+    int * pN = (int *) 16;
+    void * pV = pN;
 
     return 0;
 }

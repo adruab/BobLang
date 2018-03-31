@@ -17,31 +17,15 @@ demo_implicit_context/*
 
 Jai Demo 14 October 2015/*
 
-test_backup.jtoy
-
 test.bc
-
 test.ll
-
 test_in_c.ll
-
 test
 
 python_grammar.txt
-
-jtoy_old.cpp
-
-jtoy_with_code_gen.cpp
-
 nim_grammar.txt
 
-jtoy_alternate_operator.cpp
-
 Debugger/.DS_Store
-
-build/jtoy.dSYM/Contents/Resources/DWARF/jtoy
-
-build/jtoy
 
 shell.lnk
 
@@ -56,3 +40,9 @@ llvm_opt_installed.txt
 .DS_Store
 
 osx.sublime-workspace
+extern-printf.ll
+bob_alternate_operator.cpp
+bob_old.cpp
+bob_with_code_gen.cpp
+build/*
+test_backup.jtoy

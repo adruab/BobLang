@@ -218,8 +218,8 @@ void ShowHelp()
 {
 	printf(
 		"Syntax:\n"
-		"jtoy [options] filename\n"
-		"jtoy --run-unit-tests\n"
+		"bob [options] filename\n"
+		"bob --run-unit-tests\n"
 		"\n"
 		"Options:\n"
 		"  --print-ast,-p          Print scheme representation of syntax tree\n");

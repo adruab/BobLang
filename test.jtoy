@@ -37,6 +37,7 @@ g_vec : Vector2;
 g_gPi := 3.14159;
 
 printf :: (format : * char, ..) -> int #foreign;
+realloc :: (pV : * void, cB : u64) -> * void #foreign;
 
 Factorial :: (n : s64) -> s64 { if n == 0 return 1; return n * Factorial(n-1); }
 
@@ -106,6 +107,48 @@ PrintN :: (n1 : s64, n2 : s64)
     printf("s64x2 %ld %ld\n", n1, n2);
 }
 
+GrowArray :: (pAry : * [..] $T, cNew : u32)
+{
+    cMax := pAry.cMax;
+    if cMax == 0
+        cMax = 8;
+
+    while cMax < cNew
+    {
+        if cMax < 2048
+            cMax *= 2;
+        else
+            cMax += 1024;
+    }
+
+    pAry.a = cast (* T) realloc(pAry.a, sizeof(int) * cMax);
+    pAry.cMax = cMax;
+}
+
+Append :: (pAry : * [..] int, n : int)
+{
+    if pAry.c + 1 > pAry.cMax
+        GrowArray(pAry, pAry.c + 1);
+
+    // Construct a new entry with given value
+    // BB (adrianb) Do we need to default construct at all?
+
+    pAry.a[pAry.c] = n;
+    ++pAry.c;
+}
+
+AppendT :: (pAry : * [..] $T, t : T)
+{
+    if pAry.c + 1 > pAry.cMax
+        GrowArray(pAry, pAry.c + 1);
+
+    // Construct a new entry with given value
+    // BB (adrianb) Do we need to default construct at all?
+
+    pAry.a[pAry.c] = t;
+    ++pAry.c;
+}
+
 main :: ()
 {
     n : s32 = 5;
@@ -162,6 +205,13 @@ main :: ()
     printf("bad pi = %f\n", g_gPi);
     printf("a = %d %d %d\n", a, a, a);
     printf("Member ret = %f\n", VecXY(3.3, 4.4).x);
+    printf("Sizes %d, %d, %d, %d\n", sizeof(int), sizeof(aVec), sizeof(aSprite[0].x), sizeof(bool));
+    printf("Alignments %d, %d, %d, %d\n", alignof(int), alignof(aVec), alignof(aSprite[0].x), alignof(bool));
+
+    if VecXY(3, 4).x == 3.3
+    {
+        printf("Member match\n");
+    }
 
     using pos : Vector2;
     x = 50.5;
@@ -203,7 +253,7 @@ main :: ()
     strSet := "the quick  brown .  fox \t jumps.over\n the lazy dog";
     
     printf("Tokenize \"%.*s\"\n", strSet.cCh, strSet.pCh);
-    while (true)
+    while true
     { 
         strTok := StrTokenize(*strSet, " \t\r\n.");
         if strTok.cCh == 0
@@ -223,6 +273,21 @@ main :: ()
 
     //PrintN(5); // Need to choose closest matchif (matchk > matchkBest)
     //PrintN(7653);
+
+    // Parametric procedures
+
+    aryNParStatic : [] s64;
+
+    aryNPar : [..] s64;
+    AppendT(*aryNPar, 1);
+    AppendT(*aryNPar, 5);
+    AppendT(*aryNPar, 64000);
+    AppendT(*aryNPar, 0x12345678);
+    AppendT(*aryNPar, 0x1000000000);
+
+    PrintN(aryNPar.cMax);
+
+    printf("%d/%d: %ld %ld %ld %#lx %#lx\n", aryNPar.c, aryNPar.cMax, aryNPar[0], aryNPar[1], aryNPar[2], aryNPar[3], aryNPar[4]);
 
     fEarly := true; //false;
     if (fEarly)

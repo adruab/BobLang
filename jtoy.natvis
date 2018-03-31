@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>  
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">  
+<Type Name="SArray&lt;*&gt;">  
+    <DisplayString>{{ size={c} }}</DisplayString>  
+    <Expand>
+        <Item Name="[size]" ExcludeView="simple">c</Item>  
+        <Item Name="[capacity]" ExcludeView="simple">cMax</Item>  
+        <ArrayItems>
+            <Size>c</Size>  
+            <ValuePointer>a</ValuePointer>  
+        </ArrayItems>  
+    </Expand>  
+</Type>
+</AutoVisualizer> 

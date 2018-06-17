@@ -6,6 +6,6 @@ set BASE_DIR=%CD%
 if not exist build mkdir -p build
 pushd build
 
-cl %COMPILER_OPTIONS% -Fmmain.map %BASE_DIR%\jtoy.cpp ..\..\extern\llvm\MinSizeRel\lib\LLVMAnalysis.lib /link -opt:ref
+cl %COMPILER_OPTIONS% -Fmmain.map %BASE_DIR%\bob.cpp ..\..\extern\llvm\MinSizeRel\lib\LLVMAnalysis.lib /link -opt:ref
 
 popd

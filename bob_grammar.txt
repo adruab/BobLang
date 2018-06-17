@@ -1,14 +1,15 @@
-# Jtoy grammar file
+# Bob grammar file
 
 root: (import_directive|statement)*
-import_directive:
+term: \n|;
+import_directive: #import "filename" term
 
 statement: simple_statement | 
 		   block |
 		   while_statement |
 		   if_statement |
 		   for_statement
-simple_statement: (using_definition | definition | expression);
+simple_statement: (using_definition | definition | expression) term?
 block: { statement* }
 
 using_expression: using expression

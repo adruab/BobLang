@@ -1,2 +1,2 @@
-# JToyLang
-Toying with language definition
+# BobLang
+What about experimenting with programming language concepts

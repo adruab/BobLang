@@ -5,15 +5,15 @@
             "name": "Run Compiler",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceRoot}/build/jtoy",
+            "program": "${workspaceRoot}/build/bob",
             "args": [
                 "--run-unit-tests",
-                "test.jtoy"],
+                "test.bob"],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}",
             "environment": [],
             "externalConsole": false,
-            "visualizerFile": "${workspaceRoot}/jtoy.natvis",
+            "visualizerFile": "${workspaceRoot}/bob.natvis",
             "linux": {
                 "MIMode": "gdb",
                 "setupCommands": [

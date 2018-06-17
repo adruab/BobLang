@@ -7,9 +7,9 @@
         "Jai Demo*": true,
         "*sublime*": true,
         "*.bc": true,
-        "jtoy_old.cpp": true,
-        "jtoy_with_code_gen.cpp": true,
-        "jtoy_alternate_operator.cpp": true
+        "bob_old.cpp": true,
+        "bob_with_code_gen.cpp": true,
+        "bob_alternate_operator.cpp": true
     },
     "C_Cpp.loggingLevel": "Information",
     "files.associations": {

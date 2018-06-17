@@ -2,300 +2,317 @@
 //}
 
 //array_unordered_remove :: inline (array: *[..] $T, item: T) -> s64 {
-//    return 0;
+//    return 0
 //}
 
-REPEATING :: 0x1;
+REPEATING :: 0x1
 
 //file := cast (*Compiler_Message_File) message;
-#import "test2.jtoy";
+#import "test2.bob"
 
-Namespace :: struct
-{
-    cVec :: 2;  
-};
+Namespace :: struct {
+    cVec :: 2
+}
 
 // Make type explicit. type Vector2 = struct ...
 // Then could define Vector2 constructor function (implicit?).
 
-Vector2 :: struct
-{
-    dim :: 2;
-    x : float = 1;
-    y : float = 2;
-};
+Vector2 :: struct {
+    dim :: 2
+    x : float = 1
+    y : float = 2
+}
 
-Sprite :: struct
-{
-    aVec : [Namespace.cVec] Vector2;
-    using pos : Vector2;
-    g := 4.3;
-    zip : s64 = 98052;
-};
+Sprite :: struct {
+    aVec : [Namespace.cVec] Vector2
+    using pos : Vector2
+    g := 4.3
+    zip : s64 = 98052
+}
 
-g_vec : Vector2;
-g_gPi := 3.14159;
+g_vec : Vector2
+g_gPi := 3.14159
 
-printf :: (format : * char, ..) -> int #foreign;
-realloc :: (pV : * void, cB : u64) -> * void #foreign;
+printf :: (format : * char, ..) -> int #foreign
+realloc :: (pV : * void, cB : u64) -> * void #foreign
 
-Factorial :: (n : s64) -> s64 { if n == 0 return 1; return n * Factorial(n-1); }
+Factorial :: (n : s64) -> s64 { if n == 0 return 1; return n * Factorial(n-1) }
 
 FInString :: (ch : char, str : string) -> bool
 {
-    iCh : u32 = 0;
-    while (iCh < str.cCh)
-    {
-        if (str.pCh[iCh] == ch)
-            return true;
-        ++iCh;
+    iCh : u32 = 0
+    while iCh < str.cCh {
+        if str.pCh[iCh] == ch {
+            return true
+        }
+        ++iCh
     }
-    return false;
+    return false
 }
 
-StrTokenize :: (str: * string, strDelim: string) -> string
-{
-    iCh : u32 = 0;
-    while (iCh < str.cCh)
-    {
-        if (!FInString(str.pCh[iCh], strDelim))
-            break;
-        ++iCh;
+StrTokenize :: (str: * string, strDelim: string) -> string {
+    iCh : u32 = 0
+    while iCh < str.cCh {
+        if !FInString(str.pCh[iCh], strDelim) {
+            break
+        }
+        ++iCh
     }
     
-    iChMic := iCh;
+    iChMic := iCh
 
-    while (iCh < str.cCh)
-    {
-        if (FInString(str.pCh[iCh], strDelim))
-            break;
-        ++iCh;
+    while iCh < str.cCh {
+        if FInString(str.pCh[iCh], strDelim) {
+            break
+        }
+        ++iCh
     }
 
     // BB (adrianb) Provide string/array slicing syntax?
 
-    strToken : string;
-    strToken.pCh = str.pCh + iChMic;
-    strToken.cCh = iCh - iChMic;
+    strToken : string
+    strToken.pCh = str.pCh + iChMic
+    strToken.cCh = iCh - iChMic
 
-    str.pCh += iCh;
-    str.cCh -= iCh;
+    str.pCh += iCh
+    str.cCh -= iCh
 
-    return strToken;
+    return strToken
 }
 
-VecXY :: (x : float, y : float) -> Vector2
-{
-    vec : Vector2;
-    vec.x = x;
-    vec.y = y;
-    return vec;
+VecXY :: (x : float, y : float) -> Vector2 {
+    vec : Vector2
+    vec.x = x
+    vec.y = y
+    return vec
 }
 
-PrintN :: (n : s8)
-{
-    printf("s8 %d\n", n);
+PrintN :: (n : s8) {
+    printf("s8 %d\n", n)
 }
 
-PrintN :: (n : s64)
-{
-    printf("s64 %ld\n", n);
+PrintN :: (n : s64) {
+    printf("s64 %ld\n", n)
 }
 
-PrintN :: (n1 : s64, n2 : s64)
-{
-    printf("s64x2 %ld %ld\n", n1, n2);
+PrintN :: (n1 : s64, n2 : s64) {
+    printf("s64x2 %ld %ld\n", n1, n2)
 }
 
-GrowArray :: (pAry : * [..] $T, cNew : u32)
-{
-    cMax := pAry.cMax;
-    if cMax == 0
-        cMax = 8;
-
-    while cMax < cNew
-    {
-        if cMax < 2048
-            cMax *= 2;
-        else
-            cMax += 1024;
+GrowArray :: (pAry : * [..] $T, cNew : u32) {
+    cMax := pAry.cMax
+    if cMax == 0 {
+        cMax = 8
     }
 
-    pAry.a = cast (* T) realloc(pAry.a, sizeof(int) * cMax);
-    pAry.cMax = cMax;
+    while cMax < cNew {
+        if cMax < 2048 {
+            cMax *= 
+                2
+        } 
+        else {
+            cMax += 1024
+        }
+    }
+
+    pAry.a = cast (* T) realloc(pAry.a, sizeof(int) * cMax)
+    pAry.cMax = cMax
 }
 
-Append :: (pAry : * [..] int, n : int)
-{
-    if pAry.c + 1 > pAry.cMax
-        GrowArray(pAry, pAry.c + 1);
+Append :: (pAry : * [..] int, n : int) {
+    if pAry.c + 1 > pAry.cMax {
+        GrowArray(pAry, pAry.c + 1)
+    }
 
     // Construct a new entry with given value
     // BB (adrianb) Do we need to default construct at all?
 
-    pAry.a[pAry.c] = n;
-    ++pAry.c;
+    pAry.a[pAry.c] = n
+    ++pAry.c
 }
 
-AppendT :: (pAry : * [..] $T, t : T)
-{
-    if pAry.c + 1 > pAry.cMax
-        GrowArray(pAry, pAry.c + 1);
+AppendT :: (pAry : * [..] $T, t : T) {
+    if pAry.c + 1 > pAry.cMax {
+        GrowArray(pAry, pAry.c + 1)
+    }
 
     // Construct a new entry with given value
     // BB (adrianb) Do we need to default construct at all?
 
-    pAry.a[pAry.c] = t;
-    ++pAry.c;
+    pAry.a[pAry.c] = t
+    ++pAry.c
 }
 
-main :: ()
+/*
+Weekday :: enum 
 {
-    n : s32 = 5;
-    i := 0; // BB (adrianb) What's the right type for this? s64?
-    c := CLoop();
-    a :: 2;
-    b := 900;
+    Monday = iota
+    Tuesday
+    Wednesday
+    Thursday
+    Friday
+    Saturday
+    Sunday
+}
 
-    aVecF : [2] Vector2;
-    aSprite : [2] Sprite;
+IOFlags :: 
+enum
+{
+    Read = 1 << iota
+    Write
+    LittleEndian
 
-    aVec : [] Vector2 = aVecF;
+    Default = Read | LittleEndian
+}
+*/
 
-    aSprite[1].x = 5.5;
-    aSprite[1].y = 10.5;
-    aSprite[1].zip = 98004;
-    aSprite[0].aVec[1].y = 30.4;
+main :: () {
+    n : s32 = 5
+    i := 0 // BB (adrianb) What's the right type for this? s64?
+    c := CLoop()
+    a :: 2
+    b := 900
 
-    aG : [3] float;
+    aVecF : [2] Vector2
+    aSprite : [2] Sprite
 
-    aG[2] = 5.5;
+    aVec : [] Vector2 = aVecF
 
-    aVec[1].x = 9003;
-    aVec[0].y = 46;
+    aSprite[1].x = 5.5
+    aSprite[1].y = 10.5
+    aSprite[1].zip = 98004
+    aSprite[0].aVec[1].y = 30.4
 
-    pB := *b;
-    defer { printf("Leaving and pB = %d\n", << pB); }
-    << pB = 400;
+    aG : [3] float
 
-    vec2 : Vector2;
-    vec2p := *vec2;
-    vec2p.x = 50;
-    vec2p.y = 313;
+    aG[2] = 5.5
 
-    printf("vec = (%f, %f) dim %d\n", g_vec.x, g_vec.y, g_vec.dim);
-    printf("vec2 = (%f, %f)\n", vec2.x, vec2.y);
-    printf("aVec[%d] = [", aVec.c);
-    while i < aVec.c
-    {
-        printf(" (%f, %f),", aVec[i].x, aVec[i].y);
-        ++i;
+    aVec[1].x = 9003
+    aVec[0].y = 46
+
+    pB := *b
+    defer { printf("Leaving and pB = %d\n", << pB) }
+    << pB = 400
+
+    vec2 : Vector2
+    vec2p := *vec2
+    vec2p.x = 50
+    vec2p.y = 313
+
+    printf("vec = (%f, %f) dim %d\n", g_vec.x, g_vec.y, g_vec.dim)
+    printf("vec2 = (%f, %f)\n", vec2.x, vec2.y)
+    printf("aVec[%d] = [", aVec.c)
+    while i < aVec.c {
+        printf(" (%f, %f),", aVec[i].x, aVec[i].y)
+        ++i
     }
-    printf("]\n");
-    printf("aVecF[%p, %d] = [(%f, %f), (%f, %f)]\n", aVecF.a, aVecF.c, aVecF[0].x, aVec[0].y, aVec[1].x, aVec[1].y);
-    printf("aVec = [(%f, %f), (%f, %f)]\n", aVec[0].x, aVec[0].y, aVec[1].x, aVec[1].y);
+    printf("]\n")
+    printf("aVecF[%p, %d] = [(%f, %f), (%f, %f)]\n", aVecF.a, aVecF.c, aVecF[0].x, aVec[0].y, aVec[1].x, aVec[1].y)
+    printf("aVec = [(%f, %f), (%f, %f)]\n", aVec[0].x, aVec[0].y, aVec[1].x, aVec[1].y)
     printf("aSprite = [([(%f, %f), (%f, %f)], (%f, %f), %f, %lld), ([(%f, %f), (%f, %f)], (%f, %f), %f, %lld)]\n", 
            aSprite[0].aVec[0].x, aSprite[0].aVec[0].y, aSprite[0].aVec[1].x, aSprite[0].aVec[1].y, aSprite[0].x, 
                 aSprite[0].y, aSprite[0].g, aSprite[0].zip,
            aSprite[1].aVec[0].x, aSprite[1].aVec[0].y, aSprite[1].aVec[1].x, aSprite[1].aVec[1].y, aSprite[1].x, 
-                aSprite[1].y, aSprite[1].g, aSprite[1].zip);
-    printf("aG = [%f, %f, %f]\n", aG[0], aG[1], aG[2]);
-    printf("pi = %f\n", g_gPi);
-    g_gPi = 3;
-    printf("bad pi = %f\n", g_gPi);
-    printf("a = %d %d %d\n", a, a, a);
-    printf("Member ret = %f\n", VecXY(3.3, 4.4).x);
-    printf("Sizes %d, %d, %d, %d\n", sizeof(int), sizeof(aVec), sizeof(aSprite[0].x), sizeof(bool));
-    printf("Alignments %d, %d, %d, %d\n", alignof(int), alignof(aVec), alignof(aSprite[0].x), alignof(bool));
+                aSprite[1].y, aSprite[1].g, aSprite[1].zip)
+    printf("aG = [%f, %f, %f]\n", aG[0], aG[1], aG[2])
+    printf("pi = %f\n", g_gPi)
+    g_gPi = 3
+    printf("bad pi = %f\n", g_gPi)
+    printf("a = %d %d %d\n", a, a, a)
+    printf("Member ret = %f\n", VecXY(3.3, 4.4).x)
+    printf("Sizes %d, %d, %d, %d\n", sizeof(int), sizeof(aVec), sizeof(aSprite[0].x), sizeof(bool))
+    printf("Alignments %d, %d, %d, %d\n", alignof(int), alignof(aVec), alignof(aSprite[0].x), alignof(bool))
 
-    if VecXY(3, 4).x == 3.3
-    {
-        printf("Member match\n");
+    if VecXY(3, 4).x == 3.3 {
+        printf("Member match\n")
     }
 
-    using pos : Vector2;
-    x = 50.5;
-    y = 323.23;
+    using pos : Vector2
+    x = 50.5
+    y = 323.23
 
-    printf("pos local is %f, %f\n", x, y);
+    printf("pos local is %f, %f\n", x, y)
 
     // BB (adrianb) Should error on i < c because types don't match...?
 
-    i = 0;
-    while i < c
-    {
-        printf("\"i\" = %d\n", a + << pB + -i);
-        ++i;
+    i = 0
+    while i < c {
+        printf("\"i\" = %d\n", a + << pB + -i)
+        ++i
     }
 
-    printf("factorial(%ld) == %ld\n", CLoop(), Factorial(CLoop()));
+    printf("factorial(%ld) == %ld\n", CLoop(), Factorial(CLoop()))
 
-    //printf("Run gives %d\n", s_nFactorialResult);
-    //s_nFactorialArg :: 5;
-    //s_nFactorialResult :: #run Factorial(s_nFactorialArg);
+    //printf("Run gives %d\n", s_nFactorialResult)
+    //s_nFactorialArg :: 5
+    //s_nFactorialResult :: #run Factorial(s_nFactorialArg)
 
-    //printf("Run gives %d\n", s_nFactorialResult);
-    //s_nFactorialArg :: 5;
-    //s_factWrap :: () -> s64 { return #run Factorial(s_nFactorialArg); }
-    //s_nFactorialResult :: #run s_factWrap();
+    //printf("Run gives %d\n", s_nFactorialResult)
+    //s_nFactorialArg :: 5
+    //s_factWrap :: () -> s64 { return #run Factorial(s_nFactorialArg) }
+    //s_nFactorialResult :: #run s_factWrap()
 
-    p1 : *int = null;
-    p2 := p1 + 1;
-    p3 := p1 + 1;
-    if ((p2 != null) && ((p1 != null) || (p3 == null)))
-    {
-        << p1 = 3;
+    p1 : *int = null
+    p2 := p1 + 1
+    p3 := p1 + 1
+    if ((p2 != null) && ((p1 != null) || (p3 == null))) {
+        << p1 = 3
     }
 
-    str := "hello";
-    printf("string has %d characters %.*s\n", str.cCh, str.cCh, str.pCh);
+    str := "hello"
+    printf("string has %d characters %.*s\n", str.cCh, str.cCh, str.pCh)
 
-    strSet := "the quick  brown .  fox \t jumps.over\n the lazy dog";
+    strSet := "the quick  brown .  fox \t jumps.over\n the lazy dog"
     
-    printf("Tokenize \"%.*s\"\n", strSet.cCh, strSet.pCh);
-    while true
-    { 
-        strTok := StrTokenize(*strSet, " \t\r\n.");
-        if strTok.cCh == 0
-            break;
-        printf(" \"%.*s\"", strTok.cCh, strTok.pCh);
+    printf("Tokenize \"%.*s\"\n", strSet.cCh, strSet.pCh)
+    while true { 
+        strTok := StrTokenize(*strSet, " \t\r\n.")
+        if strTok.cCh == 0 {
+            break
+        }
+        printf(" \"%.*s\"", strTok.cCh, strTok.pCh)
     }
-    printf("\n\n");
+    printf("\n\n")
 
-    n8 : s8 = 7;
-    n16 : s16 = 1023;
-    n64 : s64 = 275;
+    n8 : s8 = 7
+    n16 : s16 = 1023
+    n64 : s64 = 275
 
-    PrintN(n8);
-    PrintN(n16);
-    PrintN(n64);
-    PrintN(n8, n8);
+    PrintN(n8)
+    PrintN(n16)
+    PrintN(n64)
+    PrintN(n8, n8)
 
-    //PrintN(5); // Need to choose closest matchif (matchk > matchkBest)
-    //PrintN(7653);
+    //PrintN(5) // Need to choose closest matchif (matchk > matchkBest)
+    //PrintN(7653)
 
     // Parametric procedures
 
-    aryNParStatic : [] s64;
+    aryNParStatic : [] s64
 
-    aryNPar : [..] s64;
-    AppendT(*aryNPar, 1);
-    AppendT(*aryNPar, 5);
-    AppendT(*aryNPar, 64000);
-    AppendT(*aryNPar, 0x12345678);
-    AppendT(*aryNPar, 0x1000000000);
+    aryNPar : [..] s64
+    AppendT(*aryNPar, 1)
+    AppendT(*aryNPar, 5)
+    AppendT(*aryNPar, 64000)
+    AppendT(*aryNPar, 0x12345678)
+    AppendT(*aryNPar, 0x1000000000)
 
-    PrintN(aryNPar.cMax);
+    printf("%d/%d: %ld %ld %ld %#lx %#lx\n", aryNPar.c, aryNPar.cMax, aryNPar[0], aryNPar[1], aryNPar[2], aryNPar[3], aryNPar[4])
 
-    printf("%d/%d: %ld %ld %ld %#lx %#lx\n", aryNPar.c, aryNPar.cMax, aryNPar[0], aryNPar[1], aryNPar[2], aryNPar[3], aryNPar[4]);
+    //printf("Enum: %d=%s and %d=%s", Weekday.Thursday, Str(Weekday.Thursday), IOFlags.Default, Str(IOFlags.Default))
 
-    fEarly := true; //false;
-    if (fEarly)
-    {
-        return;
+    fEarly := true //false
+    if fEarly {
+        return
     }
 
-    printf("Made it past early\n");
+    if false
 
-    b = 302;
+    {
+        printf("DO NOT PRINT!\n")
+    }
+
+    printf("Made it past early\n")
+
+    b = 302
 }

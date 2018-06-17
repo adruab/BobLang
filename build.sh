@@ -6,7 +6,7 @@ pushd build > /dev/null
 
 #LLVM_ROOT="/Users/adrianbentley/Documents/Projects/llvm-3.7.1"
 
-CL="/usr/bin/clang++"
+CL="/usr/local/opt/llvm/bin/clang++" #"/usr/bin/clang++" # Should use /usr/local/opt/llvm/bin/clang++ instead?
 COMPILE_OPTIONS_LLVM=`/usr/local/opt/llvm/bin/llvm-config --cxxflags --ldflags --system-libs --libs core native bitwriter`
 #COMPILE_OPTIONS_LLVM="-I/usr/local/Cellar/llvm/3.6.2/include -fPIC -fvisibility-inlines-hidden -Wall -W -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wmissing-field-initializers -pedantic -Wno-long-long -Wcovered-switch-default -Wnon-virtual-dtor -std=c++11 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -L/usr/local/Cellar/llvm/3.6.2/lib -Wl,-search_paths_first -Wl,-headerpad_max_install_names -lLLVMBitWriter -lLLVMX86Disassembler -lLLVMX86AsmParser -lLLVMX86CodeGen -lLLVMSelectionDAG -lLLVMAsmPrinter -lLLVMCodeGen -lLLVMScalarOpts -lLLVMProfileData -lLLVMInstCombine -lLLVMTransformUtils -lLLVMipa -lLLVMX86Desc -lLLVMMCDisassembler -lLLVMX86Info -lLLVMX86AsmPrinter -lLLVMX86Utils -lLLVMMCJIT -lLLVMExecutionEngine -lLLVMTarget -lLLVMAnalysis -lLLVMRuntimeDyld -lLLVMObject -lLLVMMCParser -lLLVMBitReader -lLLVMMC -lLLVMCore -lLLVMSupport -lcurses -lpthread -lz -lm"
 #COMPILE_OPTIONS_LLVM="-I/usr/local/Cellar/llvm/3.6.2/include  																								-fPIC -fvisibility-inlines-hidden -Wall -W -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wmissing-field-initializers -pedantic -Wno-long-long -Wcovered-switch-default -Wnon-virtual-dtor 							 -std=c++11   						  	-D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -L/usr/local/Cellar/llvm/3.6.2/lib 							  -Wl,-search_paths_first -Wl,-headerpad_max_install_names -lLLVMX86Disassembler -lLLVMX86AsmParser -lLLVMX86CodeGen -lLLVMSelectionDAG -lLLVMAsmPrinter -lLLVMCodeGen -lLLVMScalarOpts -lLLVMInstCombine 						-lLLVMProfileData -lLLVMTransformUtils -lLLVMBitWriter -lLLVMX86Desc -lLLVMMCDisassembler -lLLVMX86Info -lLLVMX86AsmPrinter -lLLVMX86Utils -lLLVMMCJIT -lLLVMExecutionEngine -lLLVMTarget -lLLVMAnalysis -lLLVMRuntimeDyld -lLLVMObject -lLLVMMCParser -lLLVMBitReader -lLLVMMC -lLLVMCore -lLLVMSupport -lLLVMipa -lcurses -lpthread -lz -lm"
@@ -16,6 +16,9 @@ COMPILE_OPTIONS_LLVM=`/usr/local/opt/llvm/bin/llvm-config --cxxflags --ldflags -
 COMPILE_DISABLE_WARNINGS="-Wno-nested-anon-types -Wno-missing-field-initializers"
 COMPILE_OPTIONS="-DPLATFORM_OSX=1 -g -Wall -Werror -O0 -std=c++0x" # -ftime-report" #-I/usr/local/opt/libffi/lib/libffi-3.0.13/include
 LD_FLAGS="-Wl,-no_compact_unwind"
+# LDFLAGS="-L/usr/local/opt/llvm/lib -Wl,-rpath,/usr/local/opt/llvm/lib"
+# LDFLAGS:  -L/usr/local/opt/llvm/lib
+# CPPFLAGS: -I/usr/local/opt/llvm/include
 $CL $COMPILE_OPTIONS $COMPILE_OPTIONS_LLVM $COMPILE_DISABLE_WARNINGS $LD_FLAGS ../bob.cpp -o bob # /usr/local/opt/libffi/lib/libffi.a
 echo "Done Building"
 

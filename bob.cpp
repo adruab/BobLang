@@ -232,7 +232,7 @@ char * PchzLoadWholeFile(const char * pChzFile)
 	FILE * pFile = fopen(pChzFile, "rb");
 	if (!pFile)
 	{
-		ShowErrRaw("Can't open file %s (err %d)", pChzFile, errno);
+		ShowErrRaw("Can't open file '%s' (err %d)", pChzFile, errno);
 		return nullptr;
 	}
 
@@ -264,6 +264,7 @@ enum TOKK
 {
 	TOKK_Invalid,
 	TOKK_EndOfFile,
+	TOKK_NewLine,
 
 	TOKK_Semicolon,
 	TOKK_OpenParen,
@@ -291,6 +292,7 @@ const char * PchzFromTokk(TOKK tokk)
 	{
 		"Invalid",
 		"EndOfFile",
+		"NewLine",
 
 		"Semicolon",
 		"OpenParen",
@@ -721,7 +723,7 @@ inline bool FIsPowerOfTwo(s64 n)
 
 struct SPagedAlloc
 {
-	SArray<uint8_t *> arypB;
+	SArray<u8 *> arypB;
 	u32 iB;
 	u32 cBPage;
 };
@@ -735,7 +737,7 @@ void Init(SPagedAlloc * pPagealloc, u32 cBPageDefault)
 
 void Destroy(SPagedAlloc * pPagealloc)
 {
-	for (auto pB : pPagealloc->arypB)
+	for (u8 * pB : pPagealloc->arypB)
 	{
 		free(pB);
 	}
@@ -812,7 +814,7 @@ void AddImpl(SSet<T> * pSet, u32 hv, const T & t)
 		}
 	}
 
-	auto pNode = &pSet->aNode[iNode];
+	SSetNode<T> * pNode = &pSet->aNode[iNode];
 	pNode->hv = hv;
 	pNode->fFull = true;
 	pNode->t = t;
@@ -828,7 +830,7 @@ void EnsureCount(SSet<T> * pSet, int c)
 		return;
 	
 	int cMax = pSet->cMax;
-	auto aNode = pSet->aNode;
+	SSetNode<T> * aNode = pSet->aNode;
 
 	pSet->c = 0;
 	pSet->cMax = cMax + 256;
@@ -871,7 +873,7 @@ const T * PtLookupImpl(SSet<T> * pSet, u32 hv, const TOther & t)
 	{
 		ASSERT(diNode < cMax);
 		int iNode = (iNodeBase + diNode) % cMax;
-		auto pNode = &pSet->aNode[iNode];
+		SSetNode<T> * pNode = &pSet->aNode[iNode];
 		if (!pNode->fFull)
 			return nullptr;
 
@@ -919,7 +921,7 @@ void AddImpl(SHash<K, E> * pHash, u32 hv, const K & k, const E & e)
 		}
 	}
 
-	auto pNode = &pHash->aNode[iNode];
+	SHashNode<K,E> * pNode = &pHash->aNode[iNode];
 	pNode->hv = hv;
 	pNode->fFull = true;
 	pNode->k = k;
@@ -936,7 +938,7 @@ void EnsureCount(SHash<K, E> * pHash, int c)
 		return;
 	
 	int cMax = pHash->cMax;
-	auto aNode = pHash->aNode;
+	SHashNode<K,E> * aNode = pHash->aNode;
 
 	pHash->c = 0;
 	pHash->cMax = cMax + 256;
@@ -972,7 +974,7 @@ E * PtLookupImpl(SHash<K, E> * pHash, u32 hv, const KOther & k)
 	{
 		ASSERT(diNode < cMax);
 		int iNode = (iNodeBase + diNode) % cMax;
-		auto pNode = &pHash->aNode[iNode];
+		SHashNode<K,E> * pNode = &pHash->aNode[iNode];
 		if (!pNode->fFull)
 			return nullptr;
 
@@ -1272,7 +1274,6 @@ struct SSymbolTable
 	SArray<SPolymorphicProc> aryPolyproc; // Polymorphic procedures
 
 	SAstProcedure * pAstproc; // Function for procedure symbol tables
-	STypeStruct * pTypestruct; // Function for procedure symbol tables
 };
 
 struct SWorkspace
@@ -1493,6 +1494,7 @@ void AdvanceChar(SWorkspace * pWork)
 	else if (ch == '\r')
 	{
 		// Don't count this as anything
+		// BB (adrianb) Mac (?) line endings can be \r only. Just eat \n \r or \r\n?
 	}
 	else if (ch == '\t')
 	{
@@ -1725,13 +1727,16 @@ void ParseToken(SWorkspace * pWork)
 
 	while (!FIsDone(pWork))
 	{
-		// Eat the rest of the line if we're a comment
-		
+		// Eat the rest of the line if we're a single line comment
 		if (pWork->pChzCurrent[0] == '/' && pWork->pChzCurrent[1] == '/')
 		{
 			while(!FIsDone(pWork) && Ch(pWork) != '\n')
 				AdvanceChar(pWork);
 		}
+
+		// Eat multi-line comment
+		// BB (adrianb) Maybe shouldn't bother supporting multiline comments like this.
+		//  Probably want some sort of preprocessing removal of tokens though.
 
 		if (pWork->pChzCurrent[0] == '/' && pWork->pChzCurrent[1] == '*')
 		{
@@ -1762,8 +1767,20 @@ void ParseToken(SWorkspace * pWork)
 		}
 
 		char ch = Ch(pWork);
+		
+		// Return newline token (\n \r or \r\n)
+		if (ch == '\r' || ch == '\n')
+		{
+			SToken * pTok = PtokStart(TOKK_NewLine, pWork);
+			AdvanceChar(pWork);
+			if (ch == '\r' && Ch(pWork) == '\n')
+				AdvanceChar(pWork);
+			EndToken(pTok, pWork);
+			return;
+		}
 
-		if (ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ')
+		// Skip whitespace
+		if (ch == '\t' || ch == ' ')
 			AdvanceChar(pWork);
 		else
 			break;
@@ -1948,6 +1965,49 @@ void ConsumeToken(SWorkspace * pWork, int c = 1)
 	pWork->cPeek = 0;
 }
 
+int ITok(SWorkspace * pWork, const SToken & tok)
+{
+	for (int i = 0; i < pWork->aryTokNext.c; ++i)
+	{
+		// BB (adrianb) Just memcmp the entire token struct?
+		const SToken & tokTry = pWork->aryTokNext[i];
+		if (tokTry.tokk == tok.tokk &&
+			tokTry.errinfo.pChzLine == tok.errinfo.pChzLine &&
+			tokTry.errinfo.iChMic == tok.errinfo.iChMic &&
+			tokTry.errinfo.iChMac == tok.errinfo.iChMac)
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+void ConsumeThroughToken(SWorkspace * pWork, const SToken & tok)
+{
+	int iTok = ITok(pWork, tok);
+	if (iTok >= 0)
+	{
+		RemoveFront(&pWork->aryTokNext, iTok + 1);
+		pWork->cPeek = 0;
+		return;
+	}
+
+	ShowErr(tok.errinfo, "Couldn't find token in peek list");
+}
+
+SToken TokPeekAfter(SWorkspace * pWork, const SToken & tok)
+{
+	int iTok = ITok(pWork, tok);
+	if (iTok >= 0)
+	{
+		return TokPeek(pWork, iTok + 1);
+	}
+
+	ShowErr(tok.errinfo, "Couldn't find token in peek list");
+	return {};
+}
+
 bool FTryConsumeToken(SWorkspace * pWork, TOKK tokk, SToken * pTok = nullptr)
 {
 	SToken tok = TokPeek(pWork);
@@ -1973,6 +2033,20 @@ void ConsumeExpectedToken(SWorkspace * pWork, TOKK tokk, SToken * pTok = nullptr
 
 	if (pTok)
 		*pTok = tok;
+}
+
+void TryConsumeTerminator(SWorkspace * pWork)
+{
+	SToken tok = TokPeek(pWork);
+	if (tok.tokk == TOKK_CloseBrace)
+		return;
+
+	if (tok.tokk != TOKK_Semicolon && tok.tokk != TOKK_NewLine)
+	{
+		ShowErr(tok.errinfo, "Expected terminator (; or \n) found %s", PchzFromTokk(tok.tokk));
+	}
+
+	ConsumeToken(pWork);
 }
 
 bool FTryConsumeLiteral(SWorkspace * pWork, LITK litk, SToken * pTok = nullptr)
@@ -2383,15 +2457,9 @@ struct SAstEnum : public SAst
 {
 	static const ASTK s_astk = ASTK_Enum;
 
-	struct SValue
-	{
-		const char * pChzName;
-		SAst * pAstValue;
-	};
-
 	const char * pChzName;
 	SAst * pAstTypeInternal;
-	SArray<SValue> aryValue;
+	SArray<SAst *> arypAstDecl;
 };
 
 struct SAstProcedure : public SAst
@@ -2485,7 +2553,7 @@ void Destroy(SAst * pAst)
 	case ASTK_DeclareMulti: Destroy(&PastCast<SAstDeclareMulti>(pAst)->aryName); break;
 	case ASTK_AssignMulti: Destroy(&PastCast<SAstAssignMulti>(pAst)->arypChzName); break;
 	case ASTK_Struct: Destroy(&PastCast<SAstStruct>(pAst)->arypAstDecl); break;
-	case ASTK_Enum: Destroy(&PastCast<SAstEnum>(pAst)->aryValue); break;
+	case ASTK_Enum: Destroy(&PastCast<SAstEnum>(pAst)->arypAstDecl); break;
 	case ASTK_Procedure:
 		Destroy(&PastCast<SAstProcedure>(pAst)->arypAstDeclArg);
 		Destroy(&PastCast<SAstProcedure>(pAst)->arypAstDeclRet);
@@ -2516,7 +2584,7 @@ T * PastCreate(SWorkspace * pWork, const SErrorInfo & errinfo)
 	return PastCreateManual<T>(pWork, T::s_astk, errinfo);
 }
 
-SAst * PastCreate(SWorkspace * pWork, const SToken & tok)
+SAstIdentifier * PastidentCreate(SWorkspace * pWork, const SToken & tok)
 {
 	switch (tok.tokk)
 	{
@@ -2690,13 +2758,20 @@ SAst * PastTryParsePrimary(SWorkspace * pWork)
 			pAstcall->pAstFunc = *ppAst;
 			*ppAst = pAstcall; // Function call has higher precidence so take the last thing and call on that
 
+			while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
 			if (TokPeek(pWork).tokk != TOKK_CloseParen)
 			{
 				for (;;)
 				{
 					Append(&pAstcall->arypAstArgs, PastParseExpression(pWork));
+
+					while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
 					if (!FTryConsumeToken(pWork, TOKK_Comma))
 						break;
+
+					while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
 				}
 			}
 
@@ -2747,6 +2822,10 @@ SAst * PastTryParseBinaryOperator(SWorkspace * pWork, int iOperator)
 
 	for (;;)
 	{
+		// Eat newlines when we're expecting another expression
+		if (cTokOperator > 0)
+			while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
 		ASSERT(cpAst < DIM(apAst));
 		apAst[cpAst++] = PastTryParsePrimary(pWork);
 
@@ -2856,7 +2935,7 @@ void ParseReturnValues(SWorkspace * pWork, SArray<SAst *> * parypAstDecl)
 	
 	for (;;)
 	{
-		auto pAstdecl = PastdeclParseOptionalName(pWork);
+		SAstDeclareSingle * pAstdecl = PastdeclParseOptionalName(pWork);
 		if (pAstdecl->pChzName != nullptr)
 			ShowErr(pAstdecl->errinfo, "Return values should be type only.");
 		Append(parypAstDecl, pAstdecl);
@@ -3109,7 +3188,7 @@ SAst * PastParseMultiDeclarationOrAssign(SWorkspace * pWork)
 		for (int iTok : IterCount(cTokIdent))
 		{
 			const SToken & tokIdent = aTokIdent[iTok];
-			auto pName = PtAppendNew(&pAstdecmul->aryName);
+			SAstDeclareMulti::SName * pName = PtAppendNew(&pAstdecmul->aryName);
 			pName->pChzName = tokIdent.ident.pChz;
 			pName->errinfo = tokIdent.errinfo;
 		}
@@ -3206,6 +3285,57 @@ SAst * PastTryParseDeclaration(SWorkspace * pWork)
 		return nullptr;
 }
 
+template <class T>
+T * PastDup(SWorkspace * pWork, T * pT)
+{
+	T * pTNew = PastCreate<T>(pWork, pT->errinfo);
+	*pTNew = *pT;
+	return pTNew;
+}
+
+SAst * PastDupForEnumValue(SWorkspace * pWork, SAst * pAst, int cEnumRow)
+{
+	if (!pAst)
+		return nullptr;
+
+	switch (pAst->astk)
+	{
+	case ASTK_Literal:
+		return PastDup(pWork, PastCast<SAstLiteral>(pAst));
+
+	case ASTK_Identifier:
+		{
+			auto pAstident = PastCast<SAstIdentifier>(pAst);
+			if (cEnumRow >= 0 && strcmp(pAstident->pChz, "iota") == 0)
+			{
+				auto pAstlit = PastCreate<SAstLiteral>(pWork, pAst->errinfo);
+				pAstlit->lit.litk = LITK_Int;
+				pAstlit->lit.n = cEnumRow;
+			}
+			
+			return PastDup(pWork, pAstident);
+		}
+
+	case ASTK_Operator:
+		{
+			auto pAstop = PastCast<SAstOperator>(pAst);
+			auto pAstopNew = PastDup(pWork, pAstop);
+
+			// Don't substitute inside external declarations
+			if (strcmp(pAstop->pChzOp, ".") == 0)
+				cEnumRow = -1;
+
+			pAstopNew->pAstLeft = PastDupForEnumValue(pWork, pAstop->pAstLeft, cEnumRow);
+			pAstopNew->pAstRight = PastDupForEnumValue(pWork, pAstop->pAstRight, cEnumRow);
+			return pAstopNew;
+		}
+
+	default:
+		ShowErr(pAst->errinfo, "Enum values only support operators and literals");
+		return nullptr;
+	}
+}
+
 SAst * PastTryParseStructOrProcedureDeclaration(SWorkspace * pWork)
 {
 	// TODO support using a procedure?
@@ -3213,174 +3343,246 @@ SAst * PastTryParseStructOrProcedureDeclaration(SWorkspace * pWork)
 	SToken tokIdent = TokPeek(pWork);
 	SToken tokDefineOp = TokPeek(pWork, 1);
 
-	if (tokIdent.tokk == TOKK_Identifier && tokDefineOp.tokk == TOKK_Operator)
+	if (tokIdent.tokk != TOKK_Identifier || tokDefineOp.tokk != TOKK_Operator)
+		return nullptr;
+
+	if (strcmp(tokDefineOp.op.pChz, "::") != 0)
+		return nullptr;
+	
+	// BB (adrianb) Set these up as declarations too? Naming for procedures is special though in 
+	//  that overloading is allowed.
+
+	// ident :: declare-value
+	
+	// BB (adrianb) Determining if its a procedure seems messy.
+	//  Couldn't we have a :: (5 + 3); or b := (5 + 3);  They wouldn't be easily distinguishable from
+	//  a procedure definition without looking at the contents or for a block after the close paren.
+	//  I suppose we could do that but ew.  Plus there's a #modify and other junk that can go in between.
+	//  Requiring a keyword like struct would work but would be heavy.
+
+	int iTok = 2;
+	while (TokPeek(pWork, iTok).tokk == TOKK_NewLine)
+	{ 
+		++iTok;
+	}
+
+	SToken tokValue = TokPeek(pWork, iTok);
+	
+	bool fInline = (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Inline);
+	if (tokValue.tokk == TOKK_OpenParen || (fInline && TokPeek(pWork, iTok + 1).tokk == TOKK_OpenParen)) // procedure
 	{
-		if (strcmp(tokDefineOp.op.pChz, "::") == 0)
+		ConsumeThroughToken(pWork, tokValue);
+		if (fInline)
+			ConsumeExpectedToken(pWork, TOKK_OpenParen);
+
+		auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
+
+		auto pAstproc = PastCreate<SAstProcedure>(pWork, tokIdent.errinfo);
+		pAstproc->pChzName = tokIdent.ident.pChz;
+		pAstproc->fIsInline = fInline;
+		pAstproc->iModuleOwner = pWork->iModuleParse;
+
+		pAstdecl->pChzName = pAstproc->pChzName;
+		// BB (adrianb) Only need this if we aren't creating asts for all declarations
+		pAstdecl->pAstValue = pAstproc;
+		// BB (adrianb) Todo:
+		// pAstdecl->fUsing
+		pAstdecl->fIsConstant = true; // BB (adrianb) Support lambda case.
+
+		if (TokPeek(pWork).tokk != TOKK_CloseParen)
 		{
-			// BB (adrianb) Set these up as declarations too? Naming for procedures is special though in 
-			//  that overloading is allowed.
-
-			// ident :: declare-value
-			
-			// BB (adrianb) Determining if its a procedure seems messy.
-			//  Couldn't we have a :: (5 + 3); or b := (5 + 3);  They wouldn't be easily distinguishable from
-			//  a procedure definition without looking at the contents or for a block after the close paren.
-			//  I suppose we could do that but ew.  Plus there's a #modify and other junk that can go in between.
-			//  Requiring a keyword like struct would work but would be heavy.
-
-			SToken tokValue = TokPeek(pWork, 2);
-			bool fInline = (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Inline);
-			if (tokValue.tokk == TOKK_OpenParen || (fInline  && TokPeek(pWork, 3).tokk == TOKK_OpenParen)) // procedure
+			for (;;)
 			{
-				ConsumeToken(pWork, 3);
-				if (fInline)
-					ConsumeExpectedToken(pWork, TOKK_OpenParen);
+				Append(&pAstproc->arypAstDeclArg, PastdeclParseOptionalName(pWork));
+				if (!FTryConsumeToken(pWork, TOKK_Comma))
+					break;
+			}
+		}
 
-				auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
+		ConsumeExpectedToken(pWork, TOKK_CloseParen);
 
-				auto pAstproc = PastCreate<SAstProcedure>(pWork, tokIdent.errinfo);
-				pAstproc->pChzName = tokIdent.ident.pChz;
-				pAstproc->fIsInline = fInline;
-				pAstproc->iModuleOwner = pWork->iModuleParse;
+		if (FTryConsumeOperator(pWork, "->"))
+		{
+			ParseReturnValues(pWork, &pAstproc->arypAstDeclRet);
+		}
 
-				pAstdecl->pChzName = pAstproc->pChzName;
-				// BB (adrianb) Only need this if we aren't creating asts for all declarations
-				pAstdecl->pAstValue = pAstproc;
-				// BB (adrianb) Todo:
-				// pAstdecl->fUsing
-				pAstdecl->fIsConstant = true; // BB (adrianb) Support lambda case.
+		// Track if procedure is polymorphic
+		for (SAst * pAst : pAstproc->arypAstDeclArg)
+		{
+			SAst * pAstType = (pAst->astk == ASTK_DeclareSingle) ? PastCast<SAstDeclareSingle>(pAst)->pAstType : pAst;
+			if (FHasPolymorphicType(pAstType))
+			{
+				pAstproc->fIsPolymorphic = true;
+				break;
+			}
+		}
 
-				if (TokPeek(pWork).tokk != TOKK_CloseParen)
+		if (FTryConsumeKeyword(pWork, KEYWORD_ForeignDirective))
+		{
+			pAstproc->fIsForeign = true;
+
+			SToken tokStr = {};
+			if (FTryConsumeLiteral(pWork, LITK_String, &tokStr))
+				pAstproc->pChzForeign = tokStr.lit.pChz;
+
+			// Require terminating token, can't put this inside a scope without a newline
+			SToken tok = TokPeek(pWork);
+			if (tok.tokk == TOKK_Semicolon || tok.tokk == TOKK_NewLine)
+				ConsumeToken(pWork);
+			else
+				ShowErr(TokPeek(pWork).errinfo, "Expected \n or ; after foreign keyword found %s", PchzFromTokk(tok.tokk));
+		}
+		else
+		{
+			// BB (adrianb) Can we just have a statement follow or is there always a block?
+			pAstproc->pAstblock = PastParseBlock(pWork);
+
+			for (SAst * pAst : pAstproc->arypAstDeclArg)
+			{
+				auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
+				if (pAstdecl->pChzName == nullptr)
 				{
-					for (;;)
-					{
-						Append(&pAstproc->arypAstDeclArg, PastdeclParseOptionalName(pWork));
-						if (!FTryConsumeToken(pWork, TOKK_Comma))
-							break;
-					}
+					ShowErr(pAstdecl->errinfo, "No name given to register argument");
 				}
+			}
+		}
 
-				ConsumeExpectedToken(pWork, TOKK_CloseParen);
+		return pAstdecl;
+	}
+	else if (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Struct)
+	{
+		ConsumeThroughToken(pWork, tokValue);
 
-				if (FTryConsumeOperator(pWork, "->"))
+		auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
+		auto pAststruct = PastCreate<SAstStruct>(pWork, tokIdent.errinfo);
+		pAststruct->pChzName = tokIdent.ident.pChz;
+
+		pAstdecl->pChzName = pAststruct->pChzName;
+		pAstdecl->pAstValue = pAststruct;
+		pAstdecl->fIsConstant = true;
+
+		// TODO: AOS, SOA.
+
+		ConsumeExpectedToken(pWork, TOKK_OpenBrace);
+
+		while (FTryConsumeToken(pWork, TOKK_NewLine)){}
+
+		while (!FTryConsumeToken(pWork, TOKK_CloseBrace))
+		{
+			SAst * pAst = PastTryParseStructOrProcedureDeclaration(pWork);
+			if (!pAst)
+			{
+				pAst = PastTryParseDeclaration(pWork);
+				if (pAst)
 				{
-					ParseReturnValues(pWork, &pAstproc->arypAstDeclRet);
-				}
-
-				// Track if procedure is polymorphic
-				for (auto pAst : pAstproc->arypAstDeclArg)
-				{
-					SAst * pAstType = (pAst->astk == ASTK_DeclareSingle) ? PastCast<SAstDeclareSingle>(pAst)->pAstType : pAst;
-					if (FHasPolymorphicType(pAstType))
-					{
-						pAstproc->fIsPolymorphic = true;
-						break;
-					}
-				}
-
-				if (FTryConsumeKeyword(pWork, KEYWORD_ForeignDirective))
-				{
-					pAstproc->fIsForeign = true;
-
-					SToken tokStr = {};
-					if (FTryConsumeLiteral(pWork, LITK_String, &tokStr))
-						pAstproc->pChzForeign = tokStr.lit.pChz;
-
-					ConsumeExpectedToken(pWork, TOKK_Semicolon);
+					TryConsumeTerminator(pWork);
 				}
 				else
 				{
-					// BB (adrianb) Can we just have a statement follow or is there always a block?
-					pAstproc->pAstblock = PastParseBlock(pWork);
-
-					for (SAst * pAst : pAstproc->arypAstDeclArg)
-					{
-						auto pAstdecl = PastCast<SAstDeclareSingle>(pAst);
-						if (pAstdecl->pChzName == nullptr)
-						{
-							ShowErr(pAstdecl->errinfo, "No name given to register argument");
-						}
-					}
+					ShowErr(TokPeek(pWork).errinfo, "Expected declaration");
 				}
-
-				return pAstdecl;
 			}
-			else if (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Struct)
-			{
-				ConsumeToken(pWork, 3);
+			
+			Append(&pAststruct->arypAstDecl, pAst);
 
-				auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
-				auto pAststruct = PastCreate<SAstStruct>(pWork, tokIdent.errinfo);
-				pAststruct->pChzName = tokIdent.ident.pChz;
-
-				pAstdecl->pChzName = pAststruct->pChzName;
-				pAstdecl->pAstValue = pAststruct;
-				pAstdecl->fIsConstant = true;
-
-				// TODO: AOS, SOA.
-
-				ConsumeExpectedToken(pWork, TOKK_OpenBrace);
-
-				while (!FTryConsumeToken(pWork, TOKK_CloseBrace))
-				{
-					SAst * pAst = PastTryParseStructOrProcedureDeclaration(pWork);
-					if (!pAst)
-					{
-						pAst = PastTryParseDeclaration(pWork);
-						if (pAst)
-						{
-							ConsumeExpectedToken(pWork, TOKK_Semicolon);
-						}
-						else
-						{
-							ShowErr(TokPeek(pWork).errinfo, "Expected declaration");
-						}
-					}
-					
-					Append(&pAststruct->arypAstDecl, pAst);
-				}
-
-				return pAstdecl;
-			}
-			else if (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Enum)
-			{
-				ConsumeToken(pWork, 3);
-
-				auto pAstenum = PastCreate<SAstEnum>(pWork, tokIdent.errinfo);
-				pAstenum->pChzName = tokIdent.ident.pChz;
-
-				SToken tokType = TokPeek(pWork);
-				if (tokType.tokk != TOKK_OpenBrace)
-				{
-					pAstenum->pAstTypeInternal = PastParseType(pWork);
-				}
-
-				ConsumeExpectedToken(pWork, TOKK_OpenBrace);
-
-				while (TokPeek(pWork).tokk != TOKK_CloseBrace)
-				{
-					SToken tokIdent;
-					ConsumeExpectedToken(pWork, TOKK_Identifier, &tokIdent);
-
-					auto pValue = PtAppendNew(&pAstenum->aryValue);
-					pValue->pChzName = tokIdent.ident.pChz;
-
-					if (FTryConsumeOperator(pWork, ":"))
-					{
-						pValue->pAstValue = PastParseExpression(pWork);
-					}
-
-					if (!FTryConsumeToken(pWork, TOKK_Comma))
-						break;
-				}
-
-				ConsumeExpectedToken(pWork, TOKK_CloseBrace);
-
-				// BB (adrianb) Require a semicolon?
-
-				return pAstenum;
-			}
+			while (FTryConsumeToken(pWork, TOKK_NewLine)){}
 		}
+
+		return pAstdecl;
+	}
+	else if (tokValue.tokk == TOKK_Keyword && tokValue.keyword == KEYWORD_Enum)
+	{
+		ConsumeThroughToken(pWork, tokValue);
+
+		// Construct the declaration, the enum and its struct representation
+
+		auto pAstdecl = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
+		auto pAstenum = PastCreate<SAstEnum>(pWork, tokIdent.errinfo);
+		pAstenum->pChzName = tokIdent.ident.pChz;
+		
+		pAstdecl->pChzName = pAstenum->pChzName;
+		pAstdecl->pAstValue = pAstenum;
+		pAstdecl->fIsConstant = true;
+
+		(void) FTryConsumeToken(pWork, TOKK_NewLine);
+
+		SToken tokType = TokPeek(pWork);
+		if (tokType.tokk != TOKK_OpenBrace)
+		{
+			pAstenum->pAstTypeInternal = PastParseType(pWork);
+		}
+
+		ConsumeExpectedToken(pWork, TOKK_OpenBrace);
+
+		SFixArray<SToken, 8> aryTokIdent = {};
+		SFixArray<SAst *, 8> arypAstValueLast = {};
+		int cEnumRow = 0;
+
+		for (; TokPeek(pWork).tokk != TOKK_CloseBrace; ++cEnumRow)
+		{
+			while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
+			// Syntax ident(, ident)* (= exp(, exp)*)? term
+			// BB (adrianb) Up to 8.
+	
+			aryTokIdent.c = 0;
+			ConsumeExpectedToken(pWork, TOKK_Identifier, PtAppendNew(&aryTokIdent));
+
+			while (FTryConsumeToken(pWork, TOKK_Comma, &tokIdent))
+			{
+				ConsumeExpectedToken(pWork, TOKK_Identifier, PtAppendNew(&aryTokIdent));
+			}
+
+			if (FTryConsumeOperator(pWork, "="))
+			{
+				arypAstValueLast.c = 0;
+				
+				for (int i : IterCount(aryTokIdent.c))
+				{
+					if (i != 0)
+						ConsumeExpectedToken(pWork, TOKK_Comma);
+
+					Append(&arypAstValueLast, PastParseExpression(pWork));
+				}
+			}
+			
+			if (aryTokIdent.c != arypAstValueLast.c || arypAstValueLast.c == 0)
+				ShowErr(aryTokIdent[0].errinfo, "Enum needs same number of values as identifiers.");
+
+			// Deduplicate with identifier iota swapped for literal 
+			// BB (adrianb) Use i or iter instead?
+
+			for (int i : IterCount(aryTokIdent.c))
+			{
+				const SToken & tokIdent = aryTokIdent[i];
+				if (strcmp("_", tokIdent.ident.pChz) == 0)
+					continue;
+
+				SAstDeclareSingle * pAstdeclVal = PastCreate<SAstDeclareSingle>(pWork, tokIdent.errinfo);
+				pAstdeclVal->pChzName = tokIdent.ident.pChz;
+				pAstdeclVal->fIsConstant = true;
+
+				if (arypAstValueLast.c > 0)
+				{
+					pAstdeclVal->pAstValue = PastDupForEnumValue(pWork, arypAstValueLast[i], cEnumRow);
+				}
+				else
+				{
+					SAstLiteral * pAstlit = PastCreate<SAstLiteral>(pWork, tokIdent.errinfo);
+					pAstlit->lit.litk = LITK_Int;
+					pAstlit->lit.n = cEnumRow;
+					pAstdeclVal->pAstValue = pAstlit;
+				}
+
+				Append(&pAstenum->arypAstDecl, pAstdeclVal);
+			}
+
+			TryConsumeTerminator(pWork);
+		}
+
+		ConsumeExpectedToken(pWork, TOKK_CloseBrace);
+
+		return pAstdecl;
 	}
 
 	return nullptr;
@@ -3389,6 +3591,8 @@ SAst * PastTryParseStructOrProcedureDeclaration(SWorkspace * pWork)
 SAst * PastTryParseStatement(SWorkspace * pWork)
 {
 	SToken tok = TokPeek(pWork);
+
+	// BB (adrianb) Consume newlines?
 	
 	if (tok.tokk == TOKK_OpenBrace)
 	{
@@ -3405,6 +3609,8 @@ SAst * PastTryParseStatement(SWorkspace * pWork)
 		(void) FTryConsumeKeyword(pWork, KEYWORD_Then);
 
 		pAstif->pAstPass = PastParseStatement(pWork);
+
+		while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
 
 		if (FTryConsumeKeyword(pWork, KEYWORD_Else, &tok))
 		{
@@ -3431,7 +3637,7 @@ SAst * PastTryParseStatement(SWorkspace * pWork)
 		if (tokIdent.tokk == TOKK_Identifier && FIsOperator(tokColon, ":"))
 		{
 			ConsumeToken(pWork, 2);
-			pAstfor->pAstIter = PastCreate(pWork, tokIdent);
+			pAstfor->pAstIter = PastidentCreate(pWork, tokIdent);
 		}
 
 		pAstfor->pAstIterRight = PastParseExpression(pWork);
@@ -3456,7 +3662,7 @@ SAst * PastTryParseStatement(SWorkspace * pWork)
 			}
 		}
 		
-		ConsumeExpectedToken(pWork, TOKK_Semicolon);
+		TryConsumeTerminator(pWork);
 
 		return pAstret;
 	}
@@ -3482,7 +3688,7 @@ SAst * PastTryParseStatement(SWorkspace * pWork)
 
 	SAst * pAst = PastTryParseStructOrProcedureDeclaration(pWork);
 	if (pAst)
-		return pAst; // No semicolon needed
+		return pAst;
 
 	pAst = PastTryParseDeclaration(pWork);
 
@@ -3499,11 +3705,11 @@ SAst * PastTryParseStatement(SWorkspace * pWork)
 
 	if (pAst)
 	{
-		ConsumeExpectedToken(pWork, TOKK_Semicolon);
+		TryConsumeTerminator(pWork);
 		return pAst;
 	}
 	
-	if (FTryConsumeToken(pWork, TOKK_Semicolon, &tok))
+	if (FTryConsumeToken(pWork, TOKK_Semicolon, &tok) || FTryConsumeToken(pWork, TOKK_NewLine, &tok))
 	{
 		return PastCreateManual<SAst>(pWork, ASTK_EmptyStatement, tok.errinfo);
 	}
@@ -3513,6 +3719,9 @@ SAst * PastTryParseStatement(SWorkspace * pWork)
 
 SAst * PastParseStatement(SWorkspace * pWork)
 {
+	// BB (adrianb) Ok to strip front because erroring if no statement?
+	while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
 	SToken tok = TokPeek(pWork);
 	SAst * pAstStmt = PastTryParseStatement(pWork);
 	if (!pAstStmt)
@@ -3522,6 +3731,9 @@ SAst * PastParseStatement(SWorkspace * pWork)
 
 SAstBlock * PastParseBlock(SWorkspace * pWork)
 {
+	// BB (adrianb) Ok to strip front because erroring if no brace?
+	while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
 	SToken tokOpen;
 	ConsumeExpectedToken(pWork, TOKK_OpenBrace, &tokOpen);
 
@@ -3529,6 +3741,8 @@ SAstBlock * PastParseBlock(SWorkspace * pWork)
 
 	for (;;)
 	{
+		while (FTryConsumeToken(pWork, TOKK_NewLine)) {}
+
 		SToken tok = TokPeek(pWork);
 		if (tok.tokk == TOKK_CloseBrace)
 			break;
@@ -3555,7 +3769,7 @@ SAstBlock * PastblockParseRoot(SWorkspace * pWork)
 			auto pAstimport = PastCreate<SAstImportDirective>(pWork, tokScope.errinfo);
 			SToken tokString;
 			ConsumeExpectedLiteral(pWork, LITK_String, &tokString);
-			//ConsumeExpectedToken(pWork, TOKK_Semicolon);
+			TryConsumeTerminator(pWork);
 
 			pAstimport->pChzImport = tokString.lit.pChz;
 			
@@ -3583,7 +3797,7 @@ SAstBlock * PastblockParseRoot(SWorkspace * pWork)
 		}
 
 		SAst * pAst = PastTryParseStatement(pWork);
-		if (!pAst && !FTryConsumeToken(pWork, TOKK_Semicolon))
+		if (!pAst)
 			break;
 
 		Append(&pAstblock->arypAst, pAst);
@@ -4055,19 +4269,11 @@ LNested:
 			if (fPrintAst)
 				print(" %s", pAstenum->pChzName);
 			if (pAstenum->pAstTypeInternal)
-			{
 				PrintSchemeAst(pAcx, pAstenum->pAstTypeInternal);
-			}
 			
-			if (fPrintAst)
+			for (auto pAst : pAstenum->arypAstDecl)
 			{
-				for (auto value : pAstenum->aryValue)
-				{
-					print(" (%s", value.pChzName);
-					if (value.pAstValue)
-						PrintSchemeAst(pAcx, value.pAstValue);
-					print(")");
-				}
+				PrintSchemeAst(pAcx, pAst);
 			}
 		}
 		break;
@@ -4381,8 +4587,9 @@ struct STypeString : public SType
 struct STypeEnum : public SType
 {
 	static const TYPEK s_typek = TYPEK_Enum;
+	const char * pChzName;
 	STypeId tidInternal;
-	STypeId tidStructForEnum;
+	STypeStruct * pTypestruct;
 };
 
 struct STypeTypeOf : public SType
@@ -4407,31 +4614,27 @@ const T * PtypeCast(const SType * pType)
 	return static_cast<const T *>(pType);
 }
 
-bool FHasStruct(SType * pType)
-{
-	auto typek = pType->typek;
-	return (typek == TYPEK_Struct || typek == TYPEK_String || typek == TYPEK_Array);
-}
-
 const STypeStruct * Ptypestruct(const SType * pType)
 {
 	switch (pType->typek)
 	{
 	case TYPEK_String: return PtypeCast<STypeString>(pType)->pTypestruct;
 	case TYPEK_Array: return PtypeCast<STypeArray>(pType)->pTypestruct;
+	case TYPEK_Enum: return PtypeCast<STypeEnum>(pType)->pTypestruct;
 	default:
 		return PtypeCast<STypeStruct>(pType);
 	}
 }
 
-inline u64 HvMem(const char * aB, u32 cB)
-{
-	// Implementation of FNV 1a per https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function#FNV-1a_hash
-	// Recommended by https://aras-p.info/blog/2016/08/09/More-Hash-Function-Tests/ but YMMV
+// Implementation of FNV 1a per https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function#FNV-1a_hash
+// Recommended by https://aras-p.info/blog/2016/08/09/More-Hash-Function-Tests/ but YMMV
+// If this doesn't inline might try CityHash64?
 
-	static const u64 s_nFNVOffsetBasis = 0xcbf29ce484222325ull;
-	static const u64 s_nFNVPrime = 0x100000001b3ull;
-	u64 hv = s_nFNVOffsetBasis;
+static const u64 s_nFNVOffsetBasis = 0xcbf29ce484222325ull;
+static const u64 s_nFNVPrime = 0x100000001b3ull;
+
+inline u64 HvAccum(u64 hv, const char * aB, u32 cB)
+{
 	for (u32 iB = 0; iB < cB; ++iB)
 	{
 		hv = hv ^ u64(u8(aB[iB]));
@@ -4441,10 +4644,23 @@ inline u64 HvMem(const char * aB, u32 cB)
 	return hv;
 }
 
+inline u64 HvMem(const char * aB, u32 cB)
+{
+	u64 hv = s_nFNVOffsetBasis;
+	return HvAccum(hv, aB, cB);
+}
+
+
 template <class T>
 inline u64 HvMem(const T & t)
 {
 	return HvMem(reinterpret_cast<const char *>(&t), sizeof(t));
+}
+
+template <class T>
+inline u64 HvAccum(u64 hv, const T & t)
+{
+	return HvAccum(hv, reinterpret_cast<const char *>(&t), sizeof(t));
 }
 
 inline u32 HvFromKey(u64 n)
@@ -4715,7 +4931,7 @@ void PrintFriendlyTypeRecursive(const SType * pType, SStringBuilder * pStrb)
 
 	case TYPEK_Enum:
 		{
-			PrintFriendlyTypeRecursive(PtypeCast<STypeEnum>(pType)->tidStructForEnum.pType, pStrb);
+			Print(pStrb, "%s", PtypeCast<STypeEnum>(pType)->pChzName);
 			return;
 		}
 
@@ -4828,7 +5044,7 @@ void PrintSchemeType(SAstCtx * pAcx, const SType * pType)
 			// BB (adrianb) Is this the right place to get the name of the enum?
 
 			auto pTypeenum = static_cast<const STypeEnum *>(pType);
-			print("%s", static_cast<const STypeStruct *>(pTypeenum->tidStructForEnum.pType)->pChzName);
+			print("%s", pTypeenum->pChzName);
 		}
 		break;
 
@@ -4997,12 +5213,11 @@ bool FAreSameType(const SType * pType0, const SType * pType1)
 		{
 			auto pTypeenum0 = static_cast<const STypeEnum *>(pType0);
 			auto pTypeenum1 = static_cast<const STypeEnum *>(pType1);
-			
-			if (pTypeenum0->tidInternal != pTypeenum1->tidInternal)
+
+			if (strcmp(pTypeenum0->pChzName, pTypeenum1->pChzName) != 0)
 				return false;
 
-			if (pTypeenum0->tidStructForEnum != pTypeenum1->tidStructForEnum)
-				return false;
+			ASSERT(pTypeenum0->tidInternal == pTypeenum1->tidInternal);
 
 			return true;
 		}
@@ -5037,11 +5252,10 @@ T * PtClone(SPagedAlloc * pPagealloc, const T * aTIn, int cT = 1)
 	return aT;
 }
 
-// BB (adrianb) Use 64 bit hash function?
-
-u32 HvFromType(const SType & type)
+u64 HvFromType(const SType & type)
 {
-	u32 hv = type.typek;
+	// BB (adrianb) Sanity check hash for collisions and speed.
+	u64 hv = HvMem(type.typek);
 
 	// BB (adrianb) If internal types are already unique we could just hash their pointers (inconsistent hash order across runs).
 	// BB (adrianb) Better hash mechanism?
@@ -5054,18 +5268,18 @@ u32 HvFromType(const SType & type)
 	case TYPEK_Pointer:
 		{
 			auto pTypepointer = static_cast<const STypePointer *>(&type);
-			hv = hv * 7901 + pTypepointer->fSoa;
-			hv = hv * 7901 + HvFromKey(pTypepointer->tidPointedTo);
+			hv = HvAccum(hv, pTypepointer->fSoa);
+			hv = HvAccum(hv, pTypepointer->tidPointedTo);
 		}
 		break;
 
 	case TYPEK_Array:
 		{
 			auto pTypearray = static_cast<const STypeArray *>(&type);
-			hv = hv * 7901 + pTypearray->fDynamicallySized;
-			hv = hv * 7901 + pTypearray->cSizeFixed;
-			hv = hv * 7901 + pTypearray->fSoa;
-			hv = hv * 7901 + HvFromKey(pTypearray->tidElement);
+			hv = HvAccum(hv, pTypearray->fDynamicallySized);
+			hv = HvAccum(hv, pTypearray->cSizeFixed);
+			hv = HvAccum(hv, pTypearray->fSoa);
+			hv = HvAccum(hv, pTypearray->tidElement);
 		}
 		break;
 
@@ -5073,19 +5287,19 @@ u32 HvFromType(const SType & type)
 		{
 			auto pTypeproc = static_cast<const STypeProcedure *>(&type);
 			
-			hv = hv * 7901 + pTypeproc->fUsesCVararg;
-			hv = hv * 7901 + pTypeproc->cTidArg;
+			hv = HvAccum(hv, pTypeproc->fUsesCVararg);
+			hv = HvAccum(hv, pTypeproc->cTidArg);
 
 			for (int iTid = 0; iTid < pTypeproc->cTidArg; ++iTid)
 			{
-				hv = hv * 7901 + HvFromKey(pTypeproc->aTidArg[iTid]);
+				hv = HvAccum(hv, pTypeproc->aTidArg[iTid]);
 			}
 
-			hv = hv * 7901 + pTypeproc->cTidRet;
+			hv = HvAccum(hv, pTypeproc->cTidRet);
 
 			for (int iTid = 0; iTid < pTypeproc->cTidRet; ++iTid)
 			{
-				hv = hv * 7901 + HvFromKey(pTypeproc->aTidRet[iTid]);
+				hv = HvAccum(hv, pTypeproc->aTidRet[iTid]);
 			}
 		}
 		break;
@@ -5095,7 +5309,7 @@ u32 HvFromType(const SType & type)
 			auto pTypestruct = static_cast<const STypeStruct *>(&type);
 			
 			// BB (adrianb) Not required? Or should this be the ONLY thing required?
-			hv = hv * 7901 + HvFromKey(pTypestruct->pChzName, INT_MAX);
+			hv = HvAccum(hv, pTypestruct->pChzName, strlen(pTypestruct->pChzName));
 		}
 		break;
 
@@ -5103,14 +5317,13 @@ u32 HvFromType(const SType & type)
 		{
 			auto pTypeenum = static_cast<const STypeEnum *>(&type);
 			
-			hv = hv * 7901 + HvFromKey(pTypeenum->tidInternal);
-			hv = hv * 7901 + HvFromKey(pTypeenum->tidStructForEnum);
+			hv = HvAccum(hv, pTypeenum->pChzName, strlen(pTypeenum->pChzName));
 		}
 		break;
 
 	case TYPEK_TypeOf:
 		{
-			hv = hv * 7901 + HvFromKey(static_cast<const STypeTypeOf *>(&type)->tid);
+			hv = HvAccum(hv, static_cast<const STypeTypeOf *>(&type)->tid);
 		}
 		break;
 
@@ -5797,7 +6010,6 @@ void InitWorkspace(SWorkspace * pWork, GRFWINIT grfwinit)
 	{
 		SSymbolTable * pSymtString = PsymtCreate(SYMTBLK_Struct, pWork, nullptr);
 		auto pTypestructString = PtAlloc<STypeStruct>(&pWork->pagealloc);
-        pSymtString->pTypestruct = pTypestructString;
 		pTypestructString->typek = TYPEK_Struct;
 		pTypestructString->pChzName = "_string";
 		pTypestructString->aMember = PtAlloc<STypeStruct::SMember>(&pWork->pagealloc, 2);
@@ -6323,8 +6535,37 @@ void RecurseTypeCheck(const SRecurseCtx & recx, SAst ** ppAst)
 		}
 
 	case ASTK_Enum:
-		ASSERT(false);
-		break;
+		{
+			ASSERT(false);
+			auto pAstenum = PastPrepare<SAstEnum>(recx, ppAst);
+
+			if (pAstenum->pAstTypeInternal)
+				RecurseTypeCheck(recx, &pAstenum->pAstTypeInternal);
+
+			// BB (adrianb) Register enum/struct to jump through namespace, but not for direct member access
+			// BB (adrianb) Nuke any polymorphism here? Maybe can polymorph in a constant which is used in an enum?
+
+			SSymbolTable * pSymtMembers = PsymtCreate(SYMTBLK_Struct, recx.pWork, recx.pSymtParent);
+			SRecurseCtx recxStruct = recx;
+			recxStruct.pSymtParent = pSymtMembers;
+
+			// Type check the enum right away, will create type but not fill it in
+			//  Passing the pSymtMembers to the struct so it can register its type against it.
+			//  Also, in addition to normal struct initialization the enum typecheck will fill 
+			//  the type in for all the elements and register them all as constants.
+			// BB (adrianb) Better way to do this? If we made explicitly phased recursion rather than unrolling
+			//  we could do arbitrary stuff in between.
+			
+			AppendAst(recxStruct, ppAst);
+
+			Prepare(recxStruct, &pAstenum->arypAstDecl);
+			for (SAst ** ppAstDecl : IterPointer(pAstenum->arypAstDecl))
+			{
+				RecurseTypeCheck(recxStruct, ppAstDecl);
+			}
+
+			return;
+		}
 
 	case ASTK_Procedure:
 		{
@@ -7439,13 +7680,16 @@ void TypeCheck(SWorkspace * pWork, STypeRecurse * pTrec, STypeCheckSwitch * pTcs
 							tidStruct = TidUnwrap(pAstop->errinfo, tidStruct);
 							fConstantOnly = true;
 						}
+						else if (tidStruct.pType->typek == TYPEK_Enum)
+						{
+							ShowErr(pAstop->errinfo, "Can't get member of enum variable, use enum name instead");
+						}
 
 						// Resolve string to builtin structure type
 						// BB (adrianb) Do something similar with enums? Arrays or just manually handle those?
 						
 						auto pAstident = PastCast<SAstIdentifier>(pAstop->pAstRight);
 						SSymbolTable * pSymtStruct = PsymtStructLookup(pWork, tidStruct);
-						ASSERT(pSymtStruct);
 						
 						// Resolve under existing symbol table
 
@@ -7900,13 +8144,31 @@ LOperatorDone:
 
 			// Assuming struct is immediately inside a constant declaration
 
-			pTrec->pSymtParent->pTypestruct = pTypestruct;
-
 			RegisterStruct(pWork, tidStruct, pTrec->pSymtParent);
 		}
 		break;
 
-	// case ASTK_Enum
+	case ASTK_Enum:
+		{
+			auto pAstenum = PastCast<SAstEnum>(pAst);
+
+			auto pTypeenum = PtAlloc<STypeEnum>(&pWork->pagealloc);
+			pTypeenum->typek = TYPEK_Enum;
+			pTypeenum->pChzName = pAstenum->pChzName;
+			pTypeenum->tidInternal = (pAstenum->pAstTypeInternal) ? pAstenum->pAstTypeInternal->tid : pWork->tidS64;
+
+			STypeId tidEnum = { pTypeenum };
+
+			pAstenum->tid = TidWrap(pWork, tidEnum);
+
+			// BB (adrianb) Fill in the types of all the declarations so we don't have to type check those? Or something?
+
+			// Assuming struct is immediately inside a constant declaration
+
+			RegisterStruct(pWork, tidEnum, pTrec->pSymtParent);
+		}
+		break;
+
 	case ASTK_Procedure:
 		{
 			// BB (adrianb) Need this one for lambdas?
@@ -8089,11 +8351,6 @@ LOperatorDone:
 
 			pTypearray->pTypestruct = pTypestruct;
 			
-			// Assuming struct is immediately inside a constant declaration
-			// BB (adrianb) Need this?
-
-			pSymtArray->pTypestruct = pTypestruct;
-
 			// Manually RegisterStruct without adding it to list of global structs (anonymous)
 
 			Add(&pWork->hashTidPsymtStruct, HvFromKey(tidArray), tidArray, pSymtArray);
@@ -8350,10 +8607,17 @@ LStruct:
 		}
 		break;
 
-	//case TYPEK_Array: return 1;
 	//case TYPEK_Procedure: return 1;
 	//case TYPEK_Any: return 1;
-	//case TYPEK_Enum: return 1;
+	
+	case TYPEK_Enum: 
+		{
+			auto pTypeenum = PtypeCast<STypeEnum>(pType);
+			pType->cBAlign = CbAlignOf(pTypeenum->tidInternal);
+			pType->cB = CbSizeOf(pTypeenum->tidInternal);
+		}
+		break;
+	
 	//case TYPEK_TypeOf: return 1;
 	//case TYPEK_Vararg: return 1;
 
@@ -8742,13 +9006,18 @@ void EvalDefaultValue(SWorkspace * pWork, STypeId tid, u8 * pBRet)
 			}
 		}
 		break;
+	
+	case TYPEK_Procedure:
+	case TYPEK_Enum:
+		memset(pBRet, 0, CbSizeOf(tid));
+		break;
 
-	// TYPEK_Any
-	// TYPEK_Enum
-	// TYPEK_TypeOf
-	// TYPEK_Vararg
-
-	default:
+	case TYPEK_Void:
+	case TYPEK_Any:
+	case TYPEK_TypeOf:
+	case TYPEK_Vararg:
+	case TYPEK_Max:
+	// default:
 		ASSERTCHZ(false, "Can't set default value for %s(%d)", PchzFromTypek(typek), typek);
 		memset(pBRet, 0, CbSizeOf(tid));
 		break;
@@ -8823,7 +9092,7 @@ void EvalCode(SEvalCtx * pEval, SAst * pAst, void * pVRet)
 			return;
 		}
 
-	// BB (adrianb) 90% of this is the same as normal generation. Generalize somehow?
+	// BB (adrianb) 90% of this is the same as normal generation. Generalize somehow? Byte code? Probably doesn't help.
 
 	case ASTK_Identifier:
 		{
@@ -9253,7 +9522,6 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 	case TYPEK_U64: return LLVMInt64TypeInContext(pLctx);
 	case TYPEK_Float: return LLVMFloatTypeInContext(pLctx);
 	case TYPEK_Double: return LLVMDoubleTypeInContext(pLctx);
-	//case TYPEK_String: return PltypeGenerate(pGenx, STypeId{pWork->pTypestructString});
 
 	case TYPEK_Pointer: 
 		{
@@ -9264,9 +9532,9 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 			return LLVMPointerType(PltypeGenerate(pGenx, pTypeptr->tidPointedTo), 0);
 		}
             
-        case TYPEK_String:
-        case TYPEK_Struct:
-            return PltypeLookupStruct(pGenx, Ptypestruct(pType));
+	case TYPEK_String:
+	case TYPEK_Struct:
+		return PltypeLookupStruct(pGenx, Ptypestruct(pType));
 
 	case TYPEK_Array:
 		{
@@ -9315,14 +9583,14 @@ LLVMOpaqueType * PltypeGenerate(SGenerateCtx * pGenx, STypeId tid)
 			return LLVMFunctionType(PltypeGenerate(pGenx, tidRet), aTyperefArg, cArg, pTypeproc->fUsesCVararg);
 		}
 
-#if 0
-	TYPEK_Any,
-	TYPEK_Enum,
-	TYPEK_TypeOf,
-	TYPEK_Vararg,
-#endif
+	case TYPEK_Enum:
+		return PltypeGenerate(pGenx, PtypeCast<STypeEnum>(pType)->tidInternal);
 
-	default:
+	case TYPEK_Any:
+	case TYPEK_TypeOf:
+	case TYPEK_Vararg:
+	case TYPEK_Max:
+	// default:
 		ASSERTCHZ(false, "Type generation for %s(%d) NYI", PchzFromTypek(typek), typek);
 		return LLVMTypeRef{};
 	}
@@ -9822,8 +10090,6 @@ LLVMOpaqueValue * PlvalConst(SGenerateCtx * pGenx, STypeId tid, const void * pV)
 	case TYPEK_U64: return LLVMConstInt(pLtype, *static_cast<const u64 *>(pV), false);
 	case TYPEK_Float: return LLVMConstReal(pLtype, *static_cast<const float *>(pV));
 	case TYPEK_Double: return LLVMConstReal(pLtype, *static_cast<const double *>(pV));
-
-	// case TYPEK_String: return PlvalConstStruct(pGenx, pGenx->pWork->pTypestructString, pLtype, pB);
 	
 	case TYPEK_Pointer:
 		if (PtypeCast<STypePointer>(tid.pType)->tidPointedTo.pType->typek == TYPEK_U8)
@@ -9853,19 +10119,22 @@ LLVMOpaqueValue * PlvalConst(SGenerateCtx * pGenx, STypeId tid, const void * pV)
 		}
 		break;
 
-	// case TYPEK_Procedure:
-
 	case TYPEK_String:	
 	case TYPEK_Struct:
 LStruct:
 		return PlvalConstStruct(pGenx, Ptypestruct(tid.pType), pLtype, pB);
 
-	// case TYPEK_Any:
-	// case TYPEK_Enum:
-	// case TYPEK_TypeOf:
-	// case TYPEK_Vararg:
+	case TYPEK_Enum:
+		return PlvalConst(pGenx, PtypeCast<STypeEnum>(tid.pType)->tidInternal, pB);
+
+	case TYPEK_Any:
+	case TYPEK_Void:
+	case TYPEK_Procedure:
+	case TYPEK_TypeOf:
+	case TYPEK_Vararg:
+	case TYPEK_Max:
 	
-	default:
+	//default:
 		ASSERTCHZ(false, "Can't build constant for %s", StrPrintType(tid).Pchz());
 		return nullptr;
 	}
@@ -11153,7 +11422,7 @@ int main(int cpChzArg, const char * apChzArg[])
 	- Example program to test? Eventually Crystalis game.
 		- GL drawing (OSX window wrapper goo? or just use glew?). Or buy a new laptop?
 	- Example program to test? Path tracer. How to set pixels in OSX?
-	- Alternate syntax. type, proc, struct, const, let, var etc.? No semicolons?
+	- Alternate syntax. type, proc, struct, const, let, var etc.?
 
 	- Destructors. Dynamic array, auto free pointers, implicit dtor for structs, general dtor for structs?
 	- Dll loading.
